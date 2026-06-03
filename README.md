@@ -159,6 +159,29 @@ Dex Retargeting 优化器 → 夹爪开合 + 夹爪位姿
 │   ├── hawor_guide.md          # 操作步骤指南
 │   ├── changelog.md            # 修改记录
 │   └── question.md             # Q&A 文档
+├── libs/                       # 本地依赖库
+│   ├── dex_retargeting/        # 手部到机器人映射 (来自 dex-retargeting)
+│   │   ├── constants.py        #   机器人名称、手型、重定向类型
+│   │   ├── retargeting_config.py # 重定向配置加载
+│   │   ├── seq_retarget.py     #   序列重定向优化器
+│   │   ├── optimizer.py        #   NLopt 优化器
+│   │   ├── optimizer_utils.py  #   低通滤波等工具
+│   │   ├── yourdfpy.py         #   URDF 解析
+│   │   ├── kinematics_adaptor.py # 运动学适配
+│   │   ├── robot_wrapper.py    #   机器人封装
+│   │   └── configs/            #   机器人配置文件 (YAML)
+│   ├── galaxea_sim/            # Galaxea 仿真框架 (来自 GalaxeaManipSim)
+│   │   ├── controllers/utils/
+│   │   │   ├── relaxed_ik_solver.py  # RelaxedIK 求解器
+│   │   │   ├── relaxed_ik.py         # RelaxedIK 核心
+│   │   │   ├── kinematics.py         # 运动学工具
+│   │   │   └── librelaxed_ik_lib.so  # RelaxedIK 预编译库
+│   │   └── assets/r1/          #   R1 机器人模型资源
+│   │       ├── configs/urdfs/  #     URDF 文件
+│   │       └── meshes/         #     网格和纹理
+│   └── position_retargeting/   # 位置重定向辅助 (来自 dex-retargeting/example)
+│       ├── mano_layer.py       #   MANO 手部模型层
+│       └── hand_robot_viewer.py #  机器人手部查看器
 ├── output/                     # 管线输出
 │   ├── alignment/              # 对齐参数和报告
 │   ├── alignment_analysis/     # 对齐分析结果
@@ -167,12 +190,26 @@ Dex Retargeting 优化器 → 夹爪开合 + 夹爪位姿
 └── test/                       # 调试和测试脚本
 ```
 
-## 依赖项目
+## 依赖说明
 
-- [SAPIEN](https://sapien.ucsd.edu/) — 仿真渲染引擎
-- [HaWoR](https://github.com/ubc-vision/HaWoR) — 手部重建
-- [ReplicateAnyScene](https://github.com/ubc-vision/ReplicateAnyScene) — 场景重建
-- [dex-retargeting](https://github.com/dexsuite/dex-retargeting) — 手部到机器人映射
-- [RelaxedIK](https://github.com/uwgraphics/RelaxedIK) — 逆运动学求解
-- [pytransform3d](https://github.com/rock-learning/pytransform3d) — 3D 变换
-- [trimesh](https://github.com/mikedh/trimesh) — 网格处理
+### 本地依赖 (已包含在 `libs/` 目录)
+
+| 库 | 来源 | 用途 |
+|------|------|------|
+| `dex_retargeting` | [dexsuite/dex-retargeting](https://github.com/dexsuite/dex-retargeting) | 手部到机器人夹爪映射 (3约束点优化) |
+| `galaxea_sim` | [OpenGalaxea/GalaxeaManipSim](https://github.com/OpenGalaxea/GalaxeaManipSim) | RelaxedIK 逆运动学求解 + R1 机器人模型 |
+| `position_retargeting` | dex-retargeting/example | MANO 手部模型层 |
+
+### pip 安装的第三方库
+
+```bash
+pip install numpy opencv-python sapien torch joblib pytransform3d tqdm trimesh scipy natsort matplotlib imageio-ffmpeg
+```
+
+### 上游数据依赖 (需单独安装)
+
+| 项目 | 用途 | 安装方式 |
+|------|------|---------|
+| [HaWoR](https://github.com/ubc-vision/HaWoR) | 手部重建 | 按官方文档安装 |
+| [ReplicateAnyScene](https://github.com/ubc-vision/ReplicateAnyScene) | 场景重建 | 按官方文档安装 |
+| MANO 模型文件 | 手部网格生成 | 从 [MANO官网](https://mano.is.tue.mpg.com/) 下载
