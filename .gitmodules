@@ -1,0 +1,3 @@
+[submodule "ReplicateAnyScene"]
+	path = ReplicateAnyScene
+	url = git@github.com:ananansmall/Ego-centric-Video-to-Simulation.git
