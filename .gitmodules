@@ -3,4 +3,4 @@
 	url = git@github.com:ananansmall/Ego-centric-Video-to-Simulation.git
 [submodule "HaWoR"]
 	path = HaWoR
-	url = https://github.com/ThunderVVV/HaWoR.git
+	url = git@github.com:ananansmall/HaWoR.git
