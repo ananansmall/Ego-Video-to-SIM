@@ -5,3 +5,23 @@ __pycache__/
 dist/
 build/
 .eggs/
+
+# Logs and output
+*.log
+output/
+runs/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Large data files
+*.mp4
+*.avi
+*.glb
+*.ply
+*.pth
+*.pkl
+*.ckpt

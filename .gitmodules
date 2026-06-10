@@ -4,3 +4,12 @@
 [submodule "HaWoR"]
 	path = HaWoR
 	url = git@github.com:ananansmall/HaWoR.git
+[submodule "libs/dex_retargeting"]
+	path = libs/dex_retargeting
+	url = https://github.com/dexsuite/dex-retargeting.git
+[submodule "libs/galaxea_sim"]
+	path = libs/galaxea_sim
+	url = https://github.com/OpenGalaxea/GalaxeaManipSim.git
+[submodule "libs/position_retargeting"]
+	path = libs/position_retargeting
+	url = https://github.com/dexsuite/dex-retargeting.git
