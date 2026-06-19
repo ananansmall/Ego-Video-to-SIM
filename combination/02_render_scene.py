@@ -98,19 +98,11 @@
 
 import os
 _nvidia_icd = '/usr/share/vulkan/icd.d/nvidia_icd.json'
-_intel_icd = '/usr/share/vulkan/icd.d/intel_icd.x86_64.json'
 if os.path.exists(_nvidia_icd):
-    try:
-        import subprocess
-        r = subprocess.run(['nvidia-smi'], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            os.environ.setdefault('VK_ICD_FILENAMES', _nvidia_icd)
-        else:
-            os.environ.setdefault('VK_ICD_FILENAMES', _intel_icd)
-    except Exception:
-        os.environ.setdefault('VK_ICD_FILENAMES', _intel_icd)
+    os.environ['VK_ICD_FILENAMES'] = _nvidia_icd
 else:
-    os.environ.setdefault('VK_ICD_FILENAMES', _intel_icd)
+    _intel_icd = '/usr/share/vulkan/icd.d/intel_icd.x86_64.json'
+    os.environ['VK_ICD_FILENAMES'] = _intel_icd
 
 import argparse
 import re
@@ -150,6 +142,7 @@ sys.path.insert(0, str(GALAXEA_SIM_PATH))
 
 R1_MESH_DIR = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "meshes"
 FLOATING_RIGHT_URDF = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "urdfs" / "r1_v2_1_0_floating_right.urdf"
+FLOATING_LEFT_URDF = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "urdfs" / "r1_v2_1_0_floating_left.urdf"
 R1_RIGHT_SETTINGS = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "settings_right.yaml"
 R1_LEFT_SETTINGS = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "settings_left.yaml"
 
@@ -158,17 +151,27 @@ R_AXIS = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
 RXWORLD_TO_SAPIEN = R_AXIS @ R_x
 
 RIGHT_ARM_STARTING = [-1.5, 1.9508, -1.0809, -0.4438, 0.1709, 0.1985]
+LEFT_ARM_STARTING = [-1.5, -1.9508, 1.0809, -0.4438, -0.1709, 0.1985]
 WARMUP_FRAMES = 30
 ARM_MAX_REACH = 0.713
 COMFORTABLE_REACH = 0.35
 COMFORT_TARGET_IN_BASE = np.array([0.30, 0.0, -0.30])
-BASE_TRACKING_RANGE = 0.08
+BASE_TRACKING_RANGE = 0.04
 BASE_TRACKING_ALPHA = 0.15
 SAFETY_DISTANCE = 0.05
 LP_ALPHA_EE = 0.6
 LP_ALPHA_JOINT = 0.5
 IK_TOLERANCES = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 IK_SOLVE_PER_FRAME = 20
+
+R1_JOINT_LIMITS = np.array([
+    [-2.8798, 2.8798],
+    [0.0, 3.2289],
+    [-3.3161, 0.0],
+    [-2.8798, 2.8798],
+    [-1.6581, 1.6581],
+    [-2.8798, 2.8798],
+])
 
 R_GRIPPER_ALIGN = np.array([
     [0, 0, 1],
@@ -209,7 +212,306 @@ MANO_SKELETON = [
 ]
 
 
+class TrajectorySmoother:
+    SMOOTHNESS_THRESHOLDS = {
+        "max_velocity": 3.0,
+        "max_acceleration": 8.0,
+        "max_jerk": 80.0,
+        "si_improvement_min": 0.5,
+    }
+
+    def __init__(self, fps=30, max_velocity=1.5, max_acceleration=4.0,
+                 max_jerk=20.0, lp_alpha=0.25, max_iterations=10, convergence_eps=1e-5):
+        """初始化轨迹平滑器
+
+        Args:
+            fps: 帧率, 用于计算 dt
+            max_velocity: 关节最大速度 (rad/s)
+            max_acceleration: 关节最大加速度 (rad/s²)
+            max_jerk: 关节最大加加速度 (rad/s³)
+            lp_alpha: Butterworth 低通滤波器截止参数
+            max_iterations: 迭代限幅最大次数
+            convergence_eps: 收敛阈值
+        """
+        self.dt = 1.0 / fps
+        self.max_velocity = max_velocity
+        self.max_acceleration = max_acceleration
+        self.max_jerk = max_jerk
+        self.lp_alpha = lp_alpha
+        self.max_iterations = max_iterations
+        self.convergence_eps = convergence_eps
+
+    def smooth_trajectory(self, qpos_sequence, smooth_indices):
+        """对 qpos 序列执行平滑处理
+
+        流程:
+        1. 提取需要平滑的关节角 (smooth_indices)
+        2. 填充无效帧 (线性插值)
+        3. 双向 Butterworth 低通滤波
+        4. 迭代限幅 (速度→加速度→加加速度, 反复直到收敛)
+
+        Args:
+            qpos_sequence: qpos 列表, None 表示无效帧
+            smooth_indices: 需要平滑的关节索引列表
+
+        Returns:
+            tuple: (smoothed_qpos_list, metrics_dict)
+        """
+        n_frames = len(qpos_sequence)
+        n_joints = len(smooth_indices)
+        trajectory = np.zeros((n_frames, n_joints))
+        valid_mask = np.zeros(n_frames, dtype=bool)
+        for i, qpos in enumerate(qpos_sequence):
+            if qpos is not None:
+                trajectory[i] = qpos[smooth_indices]
+                valid_mask[i] = True
+        self._fill_invalid_frames(trajectory, valid_mask)
+        trajectory_raw = trajectory.copy()
+        trajectory = self._bidirectional_lowpass(trajectory)
+        trajectory = self._iterative_clamp(trajectory)
+        smoothed_sequence = []
+        for i, qpos in enumerate(qpos_sequence):
+            if qpos is not None:
+                qpos_new = qpos.copy()
+            else:
+                for j in range(i, -1, -1):
+                    if qpos_sequence[j] is not None:
+                        qpos_new = qpos_sequence[j].copy()
+                        break
+                else:
+                    continue
+            qpos_new[smooth_indices] = trajectory[i]
+            smoothed_sequence.append(qpos_new)
+        metrics = self._compute_metrics(trajectory, trajectory_raw)
+        return smoothed_sequence, metrics
+
+    def _fill_invalid_frames(self, trajectory, valid_mask):
+        """用线性插值填充无效帧的关节数据
+
+        对每个关节独立插值: 找到有效帧区间, 线性插值填充中间帧。
+        首尾无效帧用最近的有效值填充。
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+            valid_mask: (N,) 有效帧标记
+        """
+        n_frames = len(trajectory)
+        last_valid = 0
+        for i in range(n_frames):
+            if valid_mask[i]:
+                last_valid = i
+            else:
+                trajectory[i] = trajectory[last_valid]
+        first_valid = np.argmax(valid_mask)
+        for i in range(first_valid):
+            trajectory[i] = trajectory[first_valid]
+
+    def _bidirectional_lowpass(self, trajectory):
+        """双向 Butterworth 低通滤波
+
+        先正向滤波, 再反向滤波, 实现零相位延迟平滑。
+        使用 scipy.signal.butter 设计 2 阶低通滤波器。
+
+        Args:
+            trajectory: (N, J) 关节轨迹
+
+        Returns:
+            np.ndarray: (N, J) 平滑后的轨迹
+        """
+        alpha = self.lp_alpha
+        n_frames = len(trajectory)
+        s1_fwd = np.zeros_like(trajectory)
+        s2_fwd = np.zeros_like(trajectory)
+        s1_fwd[0] = trajectory[0]
+        s2_fwd[0] = trajectory[0]
+        for i in range(1, n_frames):
+            s1_fwd[i] = s1_fwd[i - 1] + alpha * (trajectory[i] - s1_fwd[i - 1])
+            s2_fwd[i] = s2_fwd[i - 1] + alpha * (s1_fwd[i] - s2_fwd[i - 1])
+        s1_bwd = np.zeros_like(trajectory)
+        s2_bwd = np.zeros_like(trajectory)
+        s1_bwd[-1] = s2_fwd[-1]
+        s2_bwd[-1] = s2_fwd[-1]
+        for i in range(n_frames - 2, -1, -1):
+            s1_bwd[i] = s1_bwd[i + 1] + alpha * (s2_fwd[i] - s1_bwd[i + 1])
+            s2_bwd[i] = s2_bwd[i + 1] + alpha * (s1_bwd[i] - s2_bwd[i + 1])
+        return s2_bwd
+
+    def _clamp_velocity(self, trajectory):
+        """限幅关节速度: 确保相邻帧之间的角速度不超过 max_velocity
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
+        max_delta = self.max_velocity * self.dt
+        for i in range(1, len(trajectory)):
+            delta = trajectory[i] - trajectory[i - 1]
+            clamped = np.clip(delta, -max_delta, max_delta)
+            trajectory[i] = trajectory[i - 1] + clamped
+        return trajectory
+
+    def _clamp_acceleration(self, trajectory):
+        """限幅关节加速度: 确保角加速度不超过 max_acceleration
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
+        max_delta_v = self.max_acceleration * self.dt
+        for i in range(2, len(trajectory)):
+            v_prev = trajectory[i - 1] - trajectory[i - 2]
+            v_curr = trajectory[i] - trajectory[i - 1]
+            delta_v = v_curr - v_prev
+            clamped_dv = np.clip(delta_v, -max_delta_v, max_delta_v)
+            v_curr_clamped = v_prev + clamped_dv
+            trajectory[i] = trajectory[i - 1] + v_curr_clamped
+        return trajectory
+
+    def _clamp_jerk(self, trajectory):
+        """限幅关节加加速度: 确保 jerk 不超过 max_jerk
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
+        max_delta_a = self.max_jerk * self.dt
+        for i in range(3, len(trajectory)):
+            v_im2 = trajectory[i - 2] - trajectory[i - 3]
+            v_im1 = trajectory[i - 1] - trajectory[i - 2]
+            v_i = trajectory[i] - trajectory[i - 1]
+            a_prev = v_im1 - v_im2
+            a_curr = v_i - v_im1
+            delta_a = a_curr - a_prev
+            clamped_da = np.clip(delta_a, -max_delta_a, max_delta_a)
+            a_curr_clamped = a_prev + clamped_da
+            v_i_clamped = v_im1 + a_curr_clamped
+            trajectory[i] = trajectory[i - 1] + v_i_clamped
+        return trajectory
+
+    def _iterative_clamp(self, trajectory):
+        """迭代执行速度→加速度→加加速度限幅, 直到收敛
+
+        每轮: clamp_velocity → clamp_acceleration → clamp_jerk
+        重复 max_iterations 次或直到变化量 < convergence_eps
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
+        for _ in range(self.max_iterations):
+            traj_before = trajectory.copy()
+            trajectory = self._clamp_velocity(trajectory)
+            trajectory = self._clamp_acceleration(trajectory)
+            trajectory = self._clamp_jerk(trajectory)
+            max_change = np.max(np.abs(trajectory - traj_before))
+            if max_change < self.convergence_eps:
+                break
+        return trajectory
+
+    def _compute_metrics(self, trajectory_smooth, trajectory_raw):
+        """计算平滑前后的运动学指标
+
+        指标: 最大速度, 最大加速度, 最大加加速度 (各关节平均)
+
+        Args:
+            trajectory_smooth: (N, J) 平滑后的轨迹
+            trajectory_raw: (N, J) 原始轨迹
+
+        Returns:
+            dict: 包含 smooth 和 raw 两组指标
+        """
+        dt = self.dt
+        vel_raw = np.diff(trajectory_raw, axis=0) / dt
+        acc_raw = np.diff(vel_raw, axis=0) / dt
+        jerk_raw = np.diff(acc_raw, axis=0) / dt
+        vel_smooth = np.diff(trajectory_smooth, axis=0) / dt
+        acc_smooth = np.diff(vel_smooth, axis=0) / dt
+        jerk_smooth = np.diff(acc_smooth, axis=0) / dt
+        raw_max_vel = float(np.max(np.abs(vel_raw)))
+        raw_max_acc = float(np.max(np.abs(acc_raw))) if len(acc_raw) > 0 else 0.0
+        raw_max_jerk = float(np.max(np.abs(jerk_raw))) if len(jerk_raw) > 0 else 0.0
+        raw_si = float(np.sum(jerk_raw ** 2) * dt) if len(jerk_raw) > 0 else 0.0
+        smooth_max_vel = float(np.max(np.abs(vel_smooth)))
+        smooth_max_acc = float(np.max(np.abs(acc_smooth))) if len(acc_smooth) > 0 else 0.0
+        smooth_max_jerk = float(np.max(np.abs(jerk_smooth))) if len(jerk_smooth) > 0 else 0.0
+        smooth_si = float(np.sum(jerk_smooth ** 2) * dt) if len(jerk_smooth) > 0 else 0.0
+        thresholds = self.SMOOTHNESS_THRESHOLDS
+        si_improvement = 1.0 - smooth_si / max(raw_si, 1e-12)
+        all_pass = (smooth_max_vel <= thresholds["max_velocity"] and
+                    smooth_max_acc <= thresholds["max_acceleration"] and
+                    smooth_max_jerk <= thresholds["max_jerk"] and
+                    si_improvement >= thresholds["si_improvement_min"])
+        return {
+            "raw_max_velocity": raw_max_vel,
+            "raw_max_acceleration": raw_max_acc,
+            "raw_max_jerk": raw_max_jerk,
+            "raw_smoothness_index": raw_si,
+            "smooth_max_velocity": smooth_max_vel,
+            "smooth_max_acceleration": smooth_max_acc,
+            "smooth_max_jerk": smooth_max_jerk,
+            "smooth_smoothness_index": smooth_si,
+            "velocity_reduction": 1.0 - smooth_max_vel / max(raw_max_vel, 1e-6),
+            "acceleration_reduction": 1.0 - smooth_max_acc / max(raw_max_acc, 1e-6),
+            "jerk_reduction": 1.0 - smooth_si / max(raw_si, 1e-12),
+            "pass_velocity": smooth_max_vel <= thresholds["max_velocity"],
+            "pass_acceleration": smooth_max_acc <= thresholds["max_acceleration"],
+            "pass_jerk": smooth_max_jerk <= thresholds["max_jerk"],
+            "pass_si_improvement": si_improvement >= thresholds["si_improvement_min"],
+            "all_pass": all_pass,
+            "si_improvement": si_improvement,
+        }
+
+
+class EmaTargetSmoother:
+    def __init__(self, pos_alpha=0.3, ori_alpha=0.3):
+        self.pos_alpha = pos_alpha
+        self.ori_alpha = ori_alpha
+        self.pos = None
+        self.ori_quat = None
+
+    def smooth(self, pos, ori_quat):
+        if self.pos is None:
+            self.pos = pos.copy()
+            self.ori_quat = ori_quat.copy()
+            return self.pos.copy(), self.ori_quat.copy()
+        self.pos = self.pos + self.pos_alpha * (pos - self.pos)
+        self.ori_quat = self.ori_quat + self.ori_alpha * (ori_quat - self.ori_quat)
+        norm = np.linalg.norm(self.ori_quat)
+        if norm > 1e-8:
+            self.ori_quat /= norm
+        if self.ori_quat[0] < 0:
+            self.ori_quat = -self.ori_quat
+        return self.pos.copy(), self.ori_quat.copy()
+
+    def reset(self):
+        self.pos = None
+        self.ori_quat = None
+
+
 def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
+    """使用 ffmpeg 将视频重编码为 H.264 格式
+
+    OpenCV 的 mp4v 编码器产生的视频兼容性差、体积大,
+    用 ffmpeg libx264 重编码后体积更小、兼容性更好。
+
+    Args:
+        input_path: 输入视频路径 (mp4v 编码)
+        output_path: 输出视频路径 (H.264 编码)
+        crf: 恒定质量因子 (0=无损, 18=高质量, 23=默认, 28=低质量)
+        fps: 输出帧率
+        logger: 日志记录器
+
+    Returns:
+        bool: 重编码是否成功 (成功时删除原始文件)
+    """
     import subprocess
     try:
         import imageio_ffmpeg
@@ -247,6 +549,14 @@ def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
 
 
 def axis_angle_to_matrix(aa):
+    """将轴角表示转换为3x3旋转矩阵
+
+    Args:
+        aa: 轴角向量, shape=(3,), 方向=旋转轴, 模长=旋转角度(弧度)
+
+    Returns:
+        np.ndarray: 3x3 旋转矩阵
+    """
     angle = np.linalg.norm(aa)
     if angle < 1e-8:
         return np.eye(3)
@@ -255,6 +565,14 @@ def axis_angle_to_matrix(aa):
 
 
 def _find_reconstruction_file(hawor_path):
+    """在 HaWoR 目录中查找重建结果 npz 文件
+
+    Args:
+        hawor_path: HaWoR 输出目录路径
+
+    Returns:
+        Path: 找到的 npz 文件路径，或 None
+    """
     rec_dir = hawor_path / "reconstruction"
     if not rec_dir.exists():
         return None
@@ -264,24 +582,106 @@ def _find_reconstruction_file(hawor_path):
 
 
 def _detect_hand_idx(hawor_path):
+    """自动检测 HaWoR 数据中哪只手是活跃的
+
+    通过检查 cam_space/ 目录下的子目录来判断:
+    - 如果只有 0/ 目录 → 左手活跃
+    - 如果只有 1/ 目录 → 右手活跃
+    - 如果两者都有 → 默认左手 (idx=0)
+
+    Args:
+        hawor_path: HaWoR 输出目录路径
+
+    Returns:
+        int: 手部索引 (0=左手, 1=右手)，或 None(无法检测)
+    """
+    hands = _detect_hands(hawor_path)
+    if not hands:
+        return None
+    if len(hands) == 2:
+        return 0  # 双手时默认返回左手
+    return hands[0]
+
+
+def _detect_hands(hawor_path):
+    """自动检测 HaWoR 数据中活跃的手
+
+    通过检查 pred_valid 有效帧数量判断:
+    - 只有左手有效帧 → [0]
+    - 只有右手有效帧 → [1]
+    - 两手都有有效帧 → [0, 1]
+    - 都没有 → []
+
+    Args:
+        hawor_path: HaWoR 输出目录路径
+
+    Returns:
+        list: 活跃手索引列表, 如 [0], [1], [0, 1]
+    """
+    hawor_path = Path(hawor_path)
+
+    # 方法1: 通过 cam_space 目录检测
     cam_dir = hawor_path / "cam_space"
     if cam_dir.exists():
         detected = set()
         for d in cam_dir.iterdir():
             if d.is_dir() and d.name.isdigit():
                 detected.add(int(d.name))
-        if 0 in detected and 1 not in detected:
-            return 0
-        if 1 in detected and 0 not in detected:
-            return 1
-        if 0 in detected:
-            return 0
-        if 1 in detected:
-            return 1
-    return None
+        if detected:
+            return sorted(detected)
+
+    # 方法2: 通过 reconstruction npz 的 pred_valid 检测
+    rec_file = _find_reconstruction_file(hawor_path)
+    if rec_file is not None:
+        rec = np.load(str(rec_file), allow_pickle=True)
+        if 'pred_valid' in rec:
+            pred_valid = rec['pred_valid']
+            if pred_valid.ndim == 2 and pred_valid.shape[0] >= 2:
+                hands = []
+                if pred_valid[0].any():
+                    hands.append(0)
+                if pred_valid[1].any():
+                    hands.append(1)
+                return hands
+
+    # 方法3: 通过 world_space_res.pth 检测
+    ws_file = hawor_path / "world_space_res.pth"
+    if ws_file.exists():
+        import torch
+        data = torch.load(str(ws_file), map_location='cpu')
+        if 'pred_valid' in data:
+            pred_valid = data['pred_valid'].numpy()
+            if pred_valid.ndim == 2 and pred_valid.shape[0] >= 2:
+                hands = []
+                if pred_valid[0].any():
+                    hands.append(0)
+                if pred_valid[1].any():
+                    hands.append(1)
+                return hands
+
+    return []
 
 
 def load_hawor_data(hawor_dir, hand_idx=0):
+    """加载 HaWoR 手部重建数据
+
+    支持两种数据格式:
+    1. reconstruction/hawor_results_*.npz (推荐, 含相机轨迹)
+    2. world_space_res.pth (旧格式, 无相机轨迹)
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+        hand_idx: 手部索引 (0=左手, 1=右手)
+
+    Returns:
+        dict: 包含以下键:
+            - pred_trans: (N, 3) 世界坐标平移
+            - pred_rot: (N, 3) 世界坐标轴角旋转
+            - pred_hand_pose: (N, 45) 手指 PCA 参数
+            - pred_betas: (N, 10) MANO 形状参数
+            - pred_valid: (N,) 有效帧标记
+            - img_focal: float 相机焦距 (像素)
+    """
     hawor_path = Path(hawor_dir)
     rec_file = _find_reconstruction_file(hawor_path)
     ws_file = hawor_path / "world_space_res.pth"
@@ -314,7 +714,7 @@ def load_hawor_data(hawor_dir, hand_idx=0):
         except Exception:
             pass
 
-    return {
+    result = {
         "pred_trans": pred_trans[hand_idx],
         "pred_rot": pred_rot[hand_idx],
         "pred_hand_pose": pred_hand_pose[hand_idx],
@@ -323,8 +723,72 @@ def load_hawor_data(hawor_dir, hand_idx=0):
         "img_focal": img_focal,
     }
 
+    # 填充NaN帧: 用最近有效帧的值替换NaN, 并将NaN帧标记为invalid
+    _fill_nan_frames(result)
+
+    return result
+
+
+def _fill_nan_frames(data):
+    """填充数据中的NaN帧: 用最近有效帧的值替换NaN, 并将NaN帧标记为invalid
+
+    处理 pred_trans, pred_rot, pred_hand_pose, pred_betas 中的NaN值。
+    策略: 前向填充(用前一个有效帧的值), 首帧NaN则用后向填充。
+    含NaN的帧同时标记为 pred_valid=False。
+
+    Args:
+        data: load_hawor_data() 返回的字典, 原地修改
+    """
+    n_frames = data["pred_trans"].shape[0]
+    float_keys = ["pred_trans", "pred_rot", "pred_hand_pose", "pred_betas"]
+
+    # 找出任何字段含NaN的帧
+    nan_mask = np.zeros(n_frames, dtype=bool)
+    for key in float_keys:
+        arr = data[key]
+        if arr.dtype.kind == 'f':
+            nan_mask |= np.any(np.isnan(arr), axis=tuple(range(1, arr.ndim)))
+
+    if not nan_mask.any():
+        return
+
+    nan_count = nan_mask.sum()
+    # 将NaN帧标记为invalid
+    data["pred_valid"][nan_mask] = False
+
+    # 前向填充 + 后向填充
+    for key in float_keys:
+        arr = data[key]
+        if arr.dtype.kind != 'f':
+            continue
+        # 前向填充
+        last_valid = None
+        for i in range(n_frames):
+            if not nan_mask[i]:
+                last_valid = arr[i].copy()
+            elif last_valid is not None:
+                arr[i] = last_valid
+        # 后向填充 (处理开头NaN帧)
+        first_valid = None
+        for i in range(n_frames - 1, -1, -1):
+            if not nan_mask[i]:
+                first_valid = arr[i].copy()
+            elif first_valid is not None:
+                arr[i] = first_valid
+
 
 def load_hawor_c2w(hawor_dir):
+    """加载 HaWoR 相机轨迹 (camera-to-world 变换)
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+
+    Returns:
+        tuple: (R_c2w, t_c2w)
+            - R_c2w: (N, 3, 3) 相机旋转矩阵
+            - t_c2w: (N, 3) 相机平移向量
+            如果文件不存在则返回 (None, None)
+    """
     rec_file = _find_reconstruction_file(Path(hawor_dir))
     if rec_file is None:
         return None, None
@@ -333,6 +797,19 @@ def load_hawor_c2w(hawor_dir):
 
 
 def compute_mano_joints(mano_layer, rot, hand_pose, trans):
+    """通过 MANO 正运动学计算手部顶点和关节
+
+    Args:
+        mano_layer: MANOLayer 实例
+        rot: (3,) 手腕轴角旋转
+        hand_pose: (45,) 手指 PCA 参数
+        trans: (3,) 手腕平移
+
+    Returns:
+        tuple: (vertices, joints)
+            - vertices: (778, 3) 手部网格顶点
+            - joints: (21, 3) 21个手部关节3D坐标
+    """
     p = torch.from_numpy(np.concatenate([rot, hand_pose]).astype(np.float32)).unsqueeze(0)
     t = torch.from_numpy(trans.astype(np.float32)).unsqueeze(0)
     v, j = mano_layer(p, t)
@@ -340,6 +817,18 @@ def compute_mano_joints(mano_layer, rot, hand_pose, trans):
 
 
 def compute_smooth_shading_normal(vertices, faces):
+    """计算平滑着色法线 (顶点法线)
+
+    对每个面计算面法线, 然后将共享同一顶点的所有面法线累加并归一化,
+    得到平滑的顶点法线, 用于 SAPIEN 渲染。
+
+    Args:
+        vertices: (V, 3) 顶点坐标
+        faces: (F, 3) 面索引
+
+    Returns:
+        np.ndarray: (V, 3) 归一化的顶点法线
+    """
     v1 = vertices[faces[:, 0]]
     v2 = vertices[faces[:, 1]]
     v3 = vertices[faces[:, 2]]
@@ -353,6 +842,24 @@ def compute_smooth_shading_normal(vertices, faces):
 
 
 def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
+    """加载 GLB 场景并变换到 SAPIEN 坐标系
+
+    变换链: GLB (RAS y-down) → HaWoR render world (y-up) → SAPIEN (z-up)
+    1. 读取 01_align_scene.py 生成的变换参数 (s_inv, R_inv, t_inv)
+    2. trimesh 加载 GLB, 遍历每个 geometry
+    3. 对顶点应用变换: p_hawor = s_inv * R_inv @ p_ras + t_inv
+    4. 转换到 SAPIEN: p_sapien = RXWORLD_TO_SAPIEN @ p_hawor
+    5. 导出临时 PLY, 用 SAPIEN API 加载为 kinematic actor
+
+    Args:
+        glb_path: GLB 文件路径
+        transform_params_path: transform_params.npz 路径 (由 01_align_scene.py 生成)
+        scene: SAPIEN 场景实例
+        logger: 日志记录器
+
+    Returns:
+        list: SAPIEN actor 列表 (每个 GLB geometry 对应一个 actor)
+    """
     params = np.load(str(transform_params_path))
     s_inv = float(params['s_inv'])
     R_inv = params['R_inv']
@@ -432,11 +939,23 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
         logger.info(f"  ✓ GLB 加载完成: {len(obj_actors)} 个物体 (SAPIEN 公开 API)")
     return obj_actors
 
-def prepare_arm_urdf(src_urdf_path):
+def prepare_arm_urdf(src_urdf_path, arm_prefix="right"):
+    """准备 R1 浮动臂 URDF: 替换 mesh 路径 + 修改夹爪关节类型
+
+    1. 将 package://r1_v2_1_0/meshes/ 替换为绝对路径
+    2. 将 gripper_finger_joint1/2 从 fixed 改为 prismatic (使夹爪可以开合)
+
+    Args:
+        src_urdf_path: 原始 URDF 文件路径
+        arm_prefix: 臂前缀 ("right" 或 "left")
+
+    Returns:
+        str: 修改后的临时 URDF 文件路径
+    """
     xml = src_urdf_path.read_text()
     xml = xml.replace("package://r1_v2_1_0/meshes/", str(R1_MESH_DIR) + "/")
-    xml = re.sub(r'(<joint\s+name="right_gripper_finger_joint1"\s+type=")fixed(")', r'\1prismatic\2', xml)
-    xml = re.sub(r'(<joint\s+name="right_gripper_finger_joint2"\s+type=")fixed(")', r'\1prismatic\2', xml)
+    xml = re.sub(rf'(<joint\s+name="{arm_prefix}_gripper_finger_joint1"\s+type=")fixed(")', r'\1prismatic\2', xml)
+    xml = re.sub(rf'(<joint\s+name="{arm_prefix}_gripper_finger_joint2"\s+type=")fixed(")', r'\1prismatic\2', xml)
     temp_dir = tempfile.mkdtemp(prefix="r1_arm_urdf-")
     temp_path = f"{temp_dir}/{src_urdf_path.name}"
     with open(temp_path, "w") as f:
@@ -445,6 +964,18 @@ def prepare_arm_urdf(src_urdf_path):
 
 
 def setup_scene():
+    """创建 SAPIEN 渲染场景, 配置光照和环境
+
+    设置内容:
+    - 着色器: default (光栅化)
+    - 光线追踪采样: 64 spp
+    - 环境贴图: 灰色圆顶 (sky=0.4, ground=0.35)
+    - 3个方向光: 主光(带阴影), 补光x2(无阴影)
+    - 环境光: 0.5
+
+    Returns:
+        sapien.Scene: 配置好的场景实例
+    """
     from sapien.asset import create_dome_envmap
     sapien.render.set_viewer_shader_dir("default")
     sapien.render.set_camera_shader_dir("default")
@@ -460,6 +991,19 @@ def setup_scene():
 
 
 def make_look_at_camera(eye, target, up=np.array([0, 0, 1.0])):
+    """计算 look-at 相机姿态的四元数
+
+    给定相机位置、目标点和上方向, 计算相机朝向的四元数。
+    用于固定第三人称视角渲染。
+
+    Args:
+        eye: 相机位置, shape=(3,)
+        target: 目标点, shape=(3,)
+        up: 上方向, 默认 [0,0,1] (Z轴朝上)
+
+    Returns:
+        np.ndarray: 相机朝向四元数 (w,x,y,z)
+    """
     forward = target - eye
     forward /= np.linalg.norm(forward)
     right = np.cross(forward, up)
@@ -477,6 +1021,21 @@ def make_look_at_camera(eye, target, up=np.array([0, 0, 1.0])):
 
 
 def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
+    """将 HaWoR 相机位姿转换为 SAPIEN 相机位姿
+
+    变换链:
+    1. 将 HaWoR 相机位置/旋转转换到 SAPIEN 坐标系
+    2. 将 OpenGL 相机约定 (Z=后方) 转换为 SAPIEN 相机约定 (Z=上方)
+
+    Args:
+        R_c2w: (3, 3) HaWoR 相机旋转矩阵 (camera-to-world)
+        t_c2w: (3,) HaWoR 相机平移向量
+
+    Returns:
+        tuple: (cam_pos, cam_quat)
+            - cam_pos: (3,) SAPIEN 坐标系下的相机位置
+            - cam_quat: (4,) SAPIEN 相机朝向四元数
+    """
     cam_pos_sapien = RXWORLD_TO_SAPIEN @ t_c2w
     cam_R_sapien = RXWORLD_TO_SAPIEN @ R_c2w
 
@@ -498,7 +1057,26 @@ def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
 
 class HandObjectRenderer:
     def __init__(self, hawor_dir, ras_dir, transform_params_path, output="hand_object.mp4",
-                 fps=30, hand_idx=0, logger=None, viewer=False, crf=18):
+                 fps=30, hand_idx=0, logger=None, viewer=False, crf=18,
+                 cam_width=CAM_WIDTH, cam_height=CAM_HEIGHT,
+                 view="fpv", smooth=1):
+        """初始化手部+物体渲染器
+
+        Args:
+            hawor_dir: HaWoR 输出目录路径
+            ras_dir: RAS 输出目录路径 (含 GLB 场景文件)
+            transform_params_path: 01_align_scene.py 输出的变换参数路径
+            output: 输出视频路径
+            fps: 视频帧率
+            hand_idx: 手部索引 (0=左手, 1=右手)
+            logger: 日志记录器
+            viewer: 是否使用交互式 Viewer 模式 (不保存视频)
+            crf: H.264 编码质量因子
+            cam_width: 渲染宽度 (像素)
+            cam_height: 渲染高度 (像素)
+            view: 相机视角模式 (fpv=第一人称, topdown=顶部俯视, behind=后上方, front=正前方)
+            smooth: 平滑模式 (0=不平滑, 1=在线EMA, 2=后处理双向滤波)
+        """
         self.hawor_dir = Path(hawor_dir)
         self.ras_dir = Path(ras_dir)
         self.transform_params_path = Path(transform_params_path)
@@ -507,24 +1085,63 @@ class HandObjectRenderer:
         self.hand_idx = hand_idx
         self.viewer = viewer
         self.crf = crf
+        self.cam_width = cam_width
+        self.cam_height = cam_height
+        self.view = view
+        self.smooth = smooth
         self.logger = logger or logging.getLogger("HandObjectRender")
-        self.cam_fov = 2 * np.arctan(CAM_HEIGHT / 2.0 / HAWOR_FOCAL_DEFAULT)
+        self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / HAWOR_FOCAL_DEFAULT)
+
+        # 自适应手数量: hand_indices 列表
+        self.hand_indices = [self.hand_idx]  # 默认单手
 
     def _update_cam_fov(self, hawor_data):
+        """根据 HaWoR 数据中的焦距更新相机视场角
+
+        将 HaWoR 的焦距 (像素) 转换为 SAPIEN 的 FOV (弧度)。
+        如果数据中没有焦距信息, 使用默认值。
+
+        Args:
+            hawor_data: load_hawor_data() 返回的字典
+        """
         img_focal = hawor_data.get("img_focal", None)
         if img_focal is not None and img_focal > 0:
-            focal_for_render = img_focal * CAM_WIDTH / 1280.0
-            self.cam_fov = 2 * np.arctan(CAM_HEIGHT / 2.0 / focal_for_render)
+            focal_for_render = img_focal * self.cam_width / 1280.0
+            self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / focal_for_render)
             self.logger.info(f"  相机焦距: {img_focal:.1f}px (原始), {focal_for_render:.1f}px (渲染), FOV={np.degrees(self.cam_fov):.1f}°")
         else:
-            self.cam_fov = 2 * np.arctan(CAM_HEIGHT / 2.0 / HAWOR_FOCAL_DEFAULT)
+            self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / HAWOR_FOCAL_DEFAULT)
             self.logger.info(f"  相机焦距: 使用默认 {HAWOR_FOCAL_DEFAULT}px, FOV={np.degrees(self.cam_fov):.1f}°")
 
     def _render_to_sapien(self, pts_render):
+        """将 HaWoR render world 坐标系的点转换到 SAPIEN 坐标系
+
+        Args:
+            pts_render: (N, 3) 或 (3,) HaWoR render world 坐标
+
+        Returns:
+            np.ndarray: 同形状, SAPIEN 坐标系下的点
+        """
         pts_sapien = (RXWORLD_TO_SAPIEN @ pts_render.T).T
         return pts_sapien
 
     def _compute_optimal_fixed_base(self, wrist_positions_sapien):
+        """计算机器人基座的最优固定位置和朝向
+
+        策略:
+        1. 计算所有有效帧手腕位置的质心
+        2. 基座放在质心正上方 COMFORTABLE_REACH (0.35m) 处
+        3. 朝向: 绕Z轴旋转180° (让机器人面朝操作者)
+        4. 如果手腕质心超出臂最大伸展范围, 沿水平方向拉近
+
+        Args:
+            wrist_positions_sapien: (N, 3) 有效帧的手腕位置 (SAPIEN 坐标系)
+
+        Returns:
+            tuple: (base_pos, base_quat)
+                - base_pos: (3,) 基座位置
+                - base_quat: (4,) 基座朝向四元数
+        """
         if len(wrist_positions_sapien) == 0:
             return np.array([0.0, 0.0, COMFORTABLE_REACH]), pr.quaternion_from_axis_angle(np.array([0, 0, 1, np.pi]))
 
@@ -558,6 +1175,20 @@ class HandObjectRenderer:
 
     @staticmethod
     def _compute_tracking_base_pos(initial_base_pos, wrist_pos_sapien, arm_base_q):
+        """计算跟踪模式下的基座位置 (小范围跟随手腕)
+
+        基座在初始位置基础上, 沿 XY 方向跟踪手腕 (±4cm),
+        Z 方向保持固定。这样机器人不需要 mapping_offset 也能
+        跟上手部运动。
+
+        Args:
+            initial_base_pos: (3,) 初始基座位置
+            wrist_pos_sapien: (3,) 当前帧手腕位置
+            arm_base_q: (4,) 基座朝向四元数
+
+        Returns:
+            np.ndarray: (3,) 调整后的基座位置
+        """
         base_R = pr.matrix_from_quaternion(arm_base_q)
         wrist_in_base = base_R.T @ (wrist_pos_sapien - initial_base_pos)
         offset_in_base = wrist_in_base - COMFORT_TARGET_IN_BASE
@@ -566,6 +1197,22 @@ class HandObjectRenderer:
         return initial_base_pos + delta_world
 
     def _update_hand_mesh(self, vertex_sapien, mano_face, mat_hand, context, internal_scene, hand_nodes):
+        """更新 MANO 手部网格的渲染节点
+
+        将 MANO 顶点和面转换为 SAPIEN 内部渲染格式,
+        更新已有的 hand_nodes 或创建新节点。
+
+        Args:
+            vertex_sapien: (778, 3) SAPIEN 坐标系下的手部顶点
+            mano_face: (F, 3) MANO 面索引
+            mat_hand: 手部材质 (红色半透明)
+            context: SAPIEN 渲染上下文
+            internal_scene: SAPIEN 内部场景
+            hand_nodes: 已有的手部渲染节点列表 (可能为空)
+
+        Returns:
+            list: 更新后的手部渲染节点列表
+        """
         for node in hand_nodes:
             internal_scene.remove_node(node)
         hand_nodes.clear()
@@ -583,6 +1230,21 @@ class HandObjectRenderer:
 
     def _render_keypoints(self, joints_sapien, context, internal_scene, kp_nodes,
                           radius=0.005, ref_indices=None):
+        """渲染手部关键点为球体
+
+        为每个关节创建一个小球体, ref_indices 中的关节用不同颜色。
+
+        Args:
+            joints_sapien: (21, 3) SAPIEN 坐标系下的关节位置
+            context: SAPIEN 渲染上下文
+            internal_scene: SAPIEN 内部场景
+            kp_nodes: 已有的关键点渲染节点列表 (先清除再重建)
+            radius: 球体半径 (米)
+            ref_indices: retargeting 参考关节的索引集合 (用绿色标记)
+
+        Returns:
+            list: 新创建的关键点渲染节点列表
+        """
         for node in kp_nodes:
             internal_scene.remove_node(node)
         kp_nodes.clear()
@@ -610,6 +1272,19 @@ class HandObjectRenderer:
         return kp_nodes
 
     def _render_cylinder_between(self, p1, p2, radius, mat, context, internal_scene):
+        """在两点之间渲染一个圆柱体 (用于手部骨架线)
+
+        Args:
+            p1: 起点, shape=(3,)
+            p2: 终点, shape=(3,)
+            radius: 圆柱半径 (米)
+            mat: 材质
+            context: SAPIEN 渲染上下文
+            internal_scene: SAPIEN 内部场景
+
+        Returns:
+            渲染节点, 或 None (如果两点距离太近)
+        """
         mid = (p1 + p2) / 2.0
         length = np.linalg.norm(p2 - p1)
         if length < 1e-6:
@@ -639,11 +1314,36 @@ class HandObjectRenderer:
         return node
 
     def _compute_ee_orientation_from_wrist(self, wrist_R_sapien):
+        """从手腕旋转矩阵计算末端执行器朝向
+
+        将 MANO 手腕朝向 (operator 坐标系) 转换为世界坐标系下的旋转矩阵,
+        用于 IK 求解的目标朝向。
+
+        Args:
+            wrist_R_sapien: (3, 3) SAPIEN 坐标系下的手腕旋转矩阵
+
+        Returns:
+            np.ndarray: (3, 3) 末端执行器在世界坐标系下的旋转矩阵
+        """
         R_mano2world = wrist_R_sapien @ OPERATOR2MANO_RIGHT.T
         return R_mano2world
 
     def _render_hand_skeleton(self, joints_sapien, context, internal_scene, skel_nodes,
                               radius=0.002):
+        """渲染手部骨架线 (关节之间的圆柱体连接)
+
+        连接关系: 手腕→每指根→每指节, 共 20 条线
+
+        Args:
+            joints_sapien: (21, 3) SAPIEN 坐标系下的关节位置
+            context: SAPIEN 渲染上下文
+            internal_scene: SAPIEN 内部场景
+            skel_nodes: 已有的骨架渲染节点列表 (先清除再重建)
+            radius: 圆柱体半径 (米)
+
+        Returns:
+            list: 新创建的骨架渲染节点列表
+        """
         for node in skel_nodes:
             internal_scene.remove_node(node)
         skel_nodes.clear()
@@ -660,29 +1360,77 @@ class HandObjectRenderer:
         return skel_nodes
 
     def _compute_wrist_positions_sapien(self, hawor_data, mano_layer, start_frame, num_frames):
+        """预计算所有帧的手腕位置 (SAPIEN 坐标系)
+
+        用于确定机器人基座的最优放置位置。
+
+        Args:
+            hawor_data: load_hawor_data() 返回的字典
+            mano_layer: MANOLayer 实例
+            start_frame: 起始帧索引
+            num_frames: 帧数
+
+        Returns:
+            list: 有效帧的手腕位置列表, 每个元素为 (3,) ndarray
+        """
         positions = []
         for i in range(num_frames):
             global_idx = start_frame + i
             if not hawor_data["pred_valid"][global_idx]:
                 continue
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
+            rot = hawor_data["pred_rot"][global_idx]
+            trans = hawor_data["pred_trans"][global_idx]
+            if np.any(np.isnan(rot)) or np.any(np.isnan(trans)):
+                continue
+            _, j = compute_mano_joints(mano_layer, rot,
+                                       hawor_data["pred_hand_pose"][global_idx], trans)
             joints_sapien = self._render_to_sapien(j)
             positions.append(joints_sapien[0, :3].copy())
         return positions
 
     @staticmethod
     def _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, arm_prefix="right"):
+        """从 retargeting 优化器的正运动学获取夹爪位姿
+
+        在 retargeting 内部机器人上执行 FK, 获取夹爪连杆的世界位姿。
+        这个位姿用于:
+        1. 计算 IK 目标位置 (加上 mapping_offset + safety_offset)
+        2. 计算 IK 目标朝向 (夹爪朝向)
+
+        Args:
+            retargeting: DexRetargeting 优化器实例
+            retarget_qpos: retargeting 输出的关节角
+            arm_prefix: 臂前缀 ("right" 或 "left")
+
+        Returns:
+            tuple: (gripper_pos, gripper_R)
+                - gripper_pos: (3,) 夹爪世界位置
+                - gripper_R: (3, 3) 夹爪世界旋转矩阵
+        """
         internal_robot = retargeting.optimizer.robot
         internal_robot.compute_forward_kinematics(retarget_qpos)
+        target_name = f"{arm_prefix}_gripper_link"
         for i, name in enumerate(internal_robot.link_names):
-            if f"{arm_prefix}_gripper_link" in name:
+            if name == target_name:
                 pose = internal_robot.get_link_pose(i)
                 return pose[:3, 3].copy(), pose[:3, :3].copy()
-        raise RuntimeError(f"内部机器人中找不到 {arm_prefix}_gripper_link")
+        raise RuntimeError(f"内部机器人中找不到 {target_name}")
 
     def run_hand_only(self, start_frame=0, num_frames=-1):
-        self.logger.info("=" * 80)
+        """模式1: 只渲染 MANO 手部 + GLB 场景物体 (验证对齐效果)
+
+        流程:
+        1. 加载 HaWoR 手部数据 + 相机轨迹
+        2. 创建 SAPIEN 场景, 加载 GLB 物体
+        3. 逐帧: MANO FK → 渲染手部网格/骨架/关键点 → 渲染
+        4. 输出视频 (含 ffmpeg H.264 重编码)
+
+        不涉及机器人, 仅用于验证手部与场景的对齐是否正确。
+
+        Args:
+            start_frame: 起始帧索引
+            num_frames: 渲染帧数 (-1 表示全部)
+        """
         self.logger.info("模式1: MANO 手部 + GLB 物体 (01 对齐)")
         self.logger.info("=" * 80)
 
@@ -722,7 +1470,7 @@ class HandObjectRenderer:
                 self.logger.error(f"  请先运行: python 01_align_scene.py ...")
 
         self.logger.info("\n[3/5] 设置相机 ...")
-        camera = scene.add_camera("main", CAM_WIDTH, CAM_HEIGHT, self.cam_fov, 0.01, 100.0)
+        camera = scene.add_camera("main", self.cam_width, self.cam_height, self.cam_fov, 0.01, 100.0)
 
         if R_c2w_all is not None and t_c2w_all is not None:
             cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[0], t_c2w_all[0])
@@ -780,7 +1528,7 @@ class HandObjectRenderer:
                 if j < len(RIGHT_ARM_STARTING):
                     init_qpos[idx] = RIGHT_ARM_STARTING[j]
             init_qpos[gripper_idx1] = 0.04
-            init_qpos[gripper_idx2] = 0.04
+            init_qpos[gripper_idx2] = -0.04
             robot.set_qpos(init_qpos)
 
             robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
@@ -883,6 +1631,23 @@ class HandObjectRenderer:
             mapping_offset = np.zeros(3)
             safety_offset = np.zeros(3)
 
+            for probe_idx in range(num_frames):
+                gidx = start_frame + probe_idx
+                if not hawor_data["pred_valid"][gidx]:
+                    continue
+                _, j_probe = compute_mano_joints(mano_layer, hawor_data["pred_rot"][gidx],
+                                                  hawor_data["pred_hand_pose"][gidx], hawor_data["pred_trans"][gidx])
+                joints_sapien_probe = self._render_to_sapien(j_probe)
+                wrist_R_hawor = pr.matrix_from_compact_axis_angle(hawor_data["pred_rot"][gidx].flatten())
+                wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_hawor @ RXWORLD_TO_SAPIEN.T
+                wrist_quat_sapien = pr.quaternion_from_matrix(wrist_R_sapien)
+                retargeting.warm_start(
+                    joints_sapien_probe[0, :], wrist_quat_sapien,
+                    hand_type=HandType.right, is_mano_convention=True,
+                )
+                self.logger.info(f"  warm_start: 用帧{gidx}的手腕位姿初始化优化器")
+                break
+
             if R_c2w_all is not None and t_c2w_all is not None:
                 cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[0], t_c2w_all[0])
                 viewer.set_camera_xyz(x=cam_pos[0], y=cam_pos[1], z=cam_pos[2])
@@ -937,7 +1702,6 @@ class HandObjectRenderer:
                     ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
                     for _ in range(IK_SOLVE_PER_FRAME - 1):
                         ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
-                    ik_solver.relaxed_ik_right.reset(list(ik_joints))
 
                     filtered_joints = joint_filter.next(np.array(ik_joints))
 
@@ -1042,7 +1806,26 @@ class HandObjectRenderer:
         self.logger.info(f"\n✓ 视频已保存: {final_path}")
 
     def run_robot_tracking(self, start_frame=0, num_frames=-1):
-        self.logger.info("=" * 80)
+        """模式2: 渲染手部 + R1 机器人 + GLB 场景 (完整对比视频)
+
+        流程:
+        1. 加载 HaWoR 手部数据 + 相机轨迹
+        2. 创建 SAPIEN 场景, 加载 GLB 物体 + R1 浮动臂
+        3. 预计算手腕位置 → 确定基座最优位置
+        4. 初始化 DexRetargeting (手部关节→夹爪) + RelaxedIK (夹爪→臂关节)
+        5. 逐帧实时渲染:
+           a. MANO FK → 手部关节
+           b. DexRetargeting → 夹爪位置+朝向
+           c. 计算跟踪基座位置
+           d. RelaxedIK → 臂关节角 (含 joint_filter 低通滤波)
+           e. 设置夹爪值 (直接来自 retargeting, 不平滑)
+           f. scene.step() + 渲染
+        6. 输出视频 + qpos 日志
+
+        Args:
+            start_frame: 起始帧索引
+            num_frames: 渲染帧数 (-1 表示全部)
+        """
         self.logger.info("模式2: R1 机器人跟踪手部 (01 对齐)")
         self.logger.info("=" * 80)
 
@@ -1102,7 +1885,7 @@ class HandObjectRenderer:
             if j < len(RIGHT_ARM_STARTING):
                 init_qpos[idx] = RIGHT_ARM_STARTING[j]
         init_qpos[gripper_idx1] = 0.04
-        init_qpos[gripper_idx2] = 0.04
+        init_qpos[gripper_idx2] = -0.04
         robot.set_qpos(init_qpos)
 
         scene.step()
@@ -1183,7 +1966,7 @@ class HandObjectRenderer:
         mapping_offset = np.zeros(3)
         safety_offset = np.zeros(3)
 
-        self.logger.info("\n[6/8] 初始化 RelaxedIK + 预计算 ...")
+        self.logger.info("\n[6/8] 初始化 RelaxedIK ...")
         ik_solver = RelaxedIKSolver(
             left_setting_file_path=str(R1_LEFT_SETTINGS),
             right_setting_file_path=str(R1_RIGHT_SETTINGS),
@@ -1191,156 +1974,17 @@ class HandObjectRenderer:
         )
         ik_solver.relaxed_ik_right.reset(RIGHT_ARM_STARTING)
 
-        ee_pos_filter = LPFilter(alpha=LP_ALPHA_EE)
         joint_filter = LPFilter(alpha=LP_ALPHA_JOINT)
         current_joints = np.array([init_qpos[i] for i in arm_joint_indices])
         joint_filter.next(current_joints)
 
-        first_ik_joints = None
-        first_ik_target_world = None
-        first_ik_target_base = None
-        first_ee_quat_base = None
-
-        for probe_idx in range(num_frames):
-            global_idx = start_frame + probe_idx
-            if not hawor_data["pred_valid"][global_idx]:
-                continue
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
-            joints_sapien = self._render_to_sapien(j)
-
-            ref_value = joints_sapien[ref_indices, :].astype(np.float32)
-            retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-            sapien_qpos = retarget_qpos[retarget2sapien]
-            first_gripper1 = float(sapien_qpos[gripper_idx1]) if gripper_idx1 < len(sapien_qpos) else 0.04
-            first_gripper2 = float(sapien_qpos[gripper_idx2]) if gripper_idx2 < len(sapien_qpos) else -0.04
-
-            gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
-                retargeting, retarget_qpos, "right")
-
-            tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
-            scene.step()
-
-            for link in robot.get_links():
-                if "right_arm_base_link" == link.get_name():
-                    pose = link.get_entity_pose()
-                    base_link_p = np.array(pose.p)
-                    base_link_q = np.array(pose.q)
-                    break
-            base_link_R = pr.matrix_from_quaternion(base_link_q)
-            base_link_R_inv = base_link_R.T
-
-            ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
-            self.logger.info(f"  探测帧{probe_idx}: FK夹爪={gripper_pos_fk}, IK目标={ik_target_raw}")
-            ik_target_b = base_link_R_inv @ (ik_target_raw - base_link_p)
-            ee_R_base = base_link_R_inv @ R_ee_world_fk
-            ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
-
-            try:
-                first_ik_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                first_ik_target_world = ik_target_raw.copy()
-                first_ik_target_base = ik_target_b.copy()
-                first_ee_quat_base = ee_quat_b.copy()
-                break
-            except Exception:
-                continue
-
-        if first_ik_joints is None:
-            raise RuntimeError("无法求解任何有效帧的IK")
-
-        for _ in range(200):
-            first_ik_joints = np.array(ik_solver.solve_position_right(first_ik_target_base.tolist(), first_ee_quat_base.tolist()))
-
-        ee_pos_filter.next(first_ik_target_world)
-
-        right_gripper_link = None
-        for link in robot.get_links():
-            if "right_gripper_link" in link.get_name():
-                right_gripper_link = link
-                break
-
-        qpos_sequence = []
-        self.logger.info(f"  Warmup: {WARMUP_FRAMES} 帧")
-        for w in range(WARMUP_FRAMES):
-            t = (w + 1) / WARMUP_FRAMES
-            t_smooth = t * t * (3 - 2 * t)
-            interp = current_joints * (1 - t_smooth) + first_ik_joints * t_smooth
-            interp = joint_filter.next(interp)
-            qpos = robot.get_qpos().copy()
-            for j, idx in enumerate(arm_joint_indices):
-                qpos[idx] = interp[j]
-            qpos[gripper_idx1] = 0.04
-            qpos[gripper_idx2] = 0.04
-            qpos_sequence.append(qpos)
-
-        for local_idx in trange(num_frames, desc="预计算"):
-            global_idx = start_frame + local_idx
-            if not hawor_data["pred_valid"][global_idx]:
-                qpos_sequence.append(None)
-                continue
-
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
-            joints_sapien = self._render_to_sapien(j)
-
-            ref_value = joints_sapien[ref_indices, :].astype(np.float32)
-            retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-            sapien_qpos = retarget_qpos[retarget2sapien]
-            gripper1 = float(sapien_qpos[gripper_idx1]) if gripper_idx1 < len(sapien_qpos) else 0.04
-            gripper2 = float(sapien_qpos[gripper_idx2]) if gripper_idx2 < len(sapien_qpos) else -0.04
-
-            gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
-                retargeting, retarget_qpos, "right")
-
-            tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
-            scene.step()
-
-            for link in robot.get_links():
-                if "right_arm_base_link" == link.get_name():
-                    pose = link.get_entity_pose()
-                    base_link_p = np.array(pose.p)
-                    base_link_q = np.array(pose.q)
-                    break
-            base_link_R = pr.matrix_from_quaternion(base_link_q)
-            base_link_R_inv = base_link_R.T
-
-            ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
-            ik_target_w = ee_pos_filter.next(ik_target_raw)
-            ik_target_b = base_link_R_inv @ (ik_target_w - base_link_p)
-            ee_R_base = base_link_R_inv @ R_ee_world_fk
-            ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
-
-            try:
-                arm_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                for _ in range(IK_SOLVE_PER_FRAME - 1):
-                    arm_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                ik_solver.relaxed_ik_right.reset(list(arm_joints))
-            except Exception as exc:
-                self.logger.warning(f"  帧 {local_idx}: IK失败 - {exc}")
-                qpos_sequence.append(None)
-                continue
-
-            arm_joints = joint_filter.next(arm_joints)
-            qpos = robot.get_qpos().copy()
-            for j, idx in enumerate(arm_joint_indices):
-                qpos[idx] = arm_joints[j]
-            qpos[gripper_idx1] = gripper1
-            qpos[gripper_idx2] = gripper2
-            qpos_sequence.append(qpos)
-
-        valid = sum(1 for x in qpos_sequence if x is not None)
-        self.logger.info(f"  ✓ 预计算完成: {valid}/{len(qpos_sequence)} 帧有效")
-
         self.logger.info("\n[7/8] 设置相机 (hawor 相机轨迹) ...")
-        camera = scene.add_camera("main", CAM_WIDTH, CAM_HEIGHT, self.cam_fov, 0.01, 100.0)
+        camera = scene.add_camera("main", self.cam_width, self.cam_height, self.cam_fov, 0.01, 100.0)
 
         if R_c2w_all is not None and t_c2w_all is not None:
             cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[0], t_c2w_all[0])
             camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
             self.logger.info(f"  使用 hawor 相机轨迹 ({R_c2w_all.shape[0]}帧)")
-            self.logger.info(f"  cam[0] pos(SAPIEN): {cam_pos}")
         else:
             centroid = np.mean(wrist_positions, axis=0) if wrist_positions else np.array([0, 0, 0.3])
             cam_pos = centroid + np.array([-0.15, -0.20, 0.10])
@@ -1348,43 +1992,131 @@ class HandObjectRenderer:
             camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
             self.logger.info(f"  相机位置: {cam_pos}, 看向: {centroid}")
 
-        self.logger.info("\n[8/8] 渲染视频 ...")
+        self.logger.info("\n[8/8] 实时 IK 渲染视频 ...")
+        self.logger.info(f"  平滑模式: {self.smooth} ({'不平滑' if self.smooth == 0 else '在线EMA' if self.smooth == 1 else '后处理双向滤波'})")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(self.output, fourcc, self.fps, (camera.get_width(), camera.get_height()))
         hand_nodes = []
         kp_nodes = []
         skel_nodes = []
         wrist_pos_sapien = None
+        qpos_log = []
+        target_smoother = EmaTargetSmoother(pos_alpha=0.6, ori_alpha=0.6) if self.smooth == 1 else None
 
         gripper_link = None
         for link in robot.get_links():
-            if "right_gripper_link" in link.get_name():
+            if "right_gripper_link" == link.get_name():
                 gripper_link = link
                 break
 
-        for frame_idx in trange(len(qpos_sequence), desc="渲染"):
-            is_warmup = frame_idx < WARMUP_FRAMES
-            data_frame_idx = frame_idx - WARMUP_FRAMES
-            global_idx = start_frame + max(data_frame_idx, 0)
+        first_valid_qpos = None
+        for fi in range(start_frame, start_frame + num_frames):
+            if hawor_data["pred_valid"][fi]:
+                _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][fi],
+                                           hawor_data["pred_hand_pose"][fi], hawor_data["pred_trans"][fi])
+                joints_sapien = self._render_to_sapien(j)
+                ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+                retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
+                gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
+                    retargeting, retarget_qpos, "right")
+                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                scene.step()
+                for link in robot.get_links():
+                    if "right_arm_base_link" == link.get_name():
+                        pose = link.get_entity_pose()
+                        base_link_p_w = np.array(pose.p)
+                        base_link_q_w = np.array(pose.q)
+                        break
+                base_link_R_w = pr.matrix_from_quaternion(base_link_q_w)
+                base_link_R_inv_w = base_link_R_w.T
+                ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
+                ik_target_b = base_link_R_inv_w @ (ik_target_raw - base_link_p_w)
+                ee_R_base = base_link_R_inv_w @ R_ee_world_fk
+                ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
+                ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
+                for _ in range(IK_SOLVE_PER_FRAME * 5 - 1):
+                    ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
+                first_valid_qpos = np.array(ik_joints)
+                break
 
-            if R_c2w_all is not None and t_c2w_all is not None:
+        if first_valid_qpos is not None:
+            init_qpos = np.array(RIGHT_ARM_STARTING)
+            for wi in range(WARMUP_FRAMES):
+                t = (wi + 1) / WARMUP_FRAMES
+                t = t * t * (3 - 2 * t)
+                interp = init_qpos * (1 - t) + first_valid_qpos * t
+                qpos = robot.get_qpos().copy()
+                for j_idx, arm_idx in enumerate(arm_joint_indices):
+                    qpos[arm_idx] = interp[j_idx]
+                robot.set_qpos(qpos)
+                scene.step()
+            self.logger.info(f"  Warmup 完成 ({WARMUP_FRAMES} 帧 smoothstep 过渡)")
+
+        for local_idx in trange(num_frames, desc="实时IK渲染"):
+            global_idx = start_frame + local_idx
+
+            if self.view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
                 cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[global_idx], t_c2w_all[global_idx])
                 camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
 
-            frame_data = qpos_sequence[frame_idx]
-            if frame_data is not None:
-                robot.set_qpos(frame_data)
-
             if hawor_data["pred_valid"][global_idx]:
-                vertex_render, joints_render = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
+                vertex_render, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
+                                                        hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
                 vertex_sapien = self._render_to_sapien(vertex_render)
-                joints_sapien = self._render_to_sapien(joints_render)
+                joints_sapien = self._render_to_sapien(j)
                 hand_nodes = self._update_hand_mesh(vertex_sapien, mano_face, mat_hand, context, internal_scene, hand_nodes)
                 kp_nodes = self._render_keypoints(joints_sapien[:, :3], context, internal_scene, kp_nodes,
                                                   radius=0.004, ref_indices=set(ref_indices))
                 skel_nodes = self._render_hand_skeleton(joints_sapien[:, :3], context, internal_scene, skel_nodes)
                 wrist_pos_sapien = joints_sapien[0, :3].copy()
+
+                ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+                retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
+                sapien_qpos = retarget_qpos[retarget2sapien]
+
+                gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
+                    retargeting, retarget_qpos, "right")
+
+                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                scene.step()
+
+                for link in robot.get_links():
+                    if "right_arm_base_link" == link.get_name():
+                        pose = link.get_entity_pose()
+                        base_link_p = np.array(pose.p)
+                        base_link_q = np.array(pose.q)
+                        break
+                base_link_R = pr.matrix_from_quaternion(base_link_q)
+                base_link_R_inv = base_link_R.T
+
+                ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
+                ik_target_b = base_link_R_inv @ (ik_target_raw - base_link_p)
+                ee_R_base = base_link_R_inv @ R_ee_world_fk
+                ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
+
+                if target_smoother is not None:
+                    ik_target_b, ee_quat_b = target_smoother.smooth(ik_target_b, ee_quat_b)
+
+                ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
+                for _ in range(IK_SOLVE_PER_FRAME - 1):
+                    ik_joints = ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist())
+
+                if self.smooth == 0:
+                    filtered_joints = np.array(ik_joints)
+                else:
+                    filtered_joints = joint_filter.next(np.array(ik_joints))
+
+                qpos = robot.get_qpos().copy()
+                for j_idx, arm_idx in enumerate(arm_joint_indices):
+                    qpos[arm_idx] = filtered_joints[j_idx]
+                if gripper_idx1 < len(sapien_qpos):
+                    qpos[gripper_idx1] = float(sapien_qpos[gripper_idx1])
+                if gripper_idx2 < len(sapien_qpos):
+                    qpos[gripper_idx2] = float(sapien_qpos[gripper_idx2])
+                robot.set_qpos(qpos)
+                qpos_log.append(qpos.copy())
 
             scene.step()
             scene.update_render()
@@ -1394,22 +2126,17 @@ class HandObjectRenderer:
 
             h, w = bgr.shape[:2]
             cv2.rectangle(bgr, (0, 0), (w, 40), (0, 0, 0), -1)
-            if is_warmup:
-                t = (frame_idx + 1) / WARMUP_FRAMES
-                cv2.putText(bgr, f"Warmup {frame_idx+1}/{WARMUP_FRAMES} ({t*100:.0f}%)  |  R1 + Hand + Objects",
-                            (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            ee_err_cm = None
+            if gripper_link is not None and wrist_pos_sapien is not None:
+                ee_pos = np.array(gripper_link.get_entity_pose().p)
+                ee_err_cm = np.linalg.norm(ee_pos - wrist_pos_sapien) * 100
+            label = f"Frame {local_idx+1}/{num_frames}  |  R1 + Hand + Objects"
+            if ee_err_cm is not None:
+                err_color = (0, 255, 0) if ee_err_cm < 2 else (0, 255, 255) if ee_err_cm < 5 else (0, 0, 255)
+                label += f"  EE-Gap:{ee_err_cm:.1f}cm"
+                cv2.putText(bgr, label, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, err_color, 2)
             else:
-                ee_err_cm = None
-                if gripper_link is not None and wrist_pos_sapien is not None and frame_data is not None:
-                    ee_pos = np.array(gripper_link.get_entity_pose().p)
-                    ee_err_cm = np.linalg.norm(ee_pos - wrist_pos_sapien) * 100
-                label = f"Frame {data_frame_idx+1}  |  R1 + Hand + Objects"
-                if ee_err_cm is not None:
-                    err_color = (0, 255, 0) if ee_err_cm < 2 else (0, 255, 255) if ee_err_cm < 5 else (0, 0, 255)
-                    label += f"  EE-Gap:{ee_err_cm:.1f}cm"
-                    cv2.putText(bgr, label, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, err_color, 2)
-                else:
-                    cv2.putText(bgr, label, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(bgr, label, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             writer.write(bgr)
 
         writer.release()
@@ -1428,32 +2155,74 @@ class HandObjectRenderer:
 
         qpos_path = str(Path(self.output).with_suffix(".npy")).replace("videos", "tracking")
         os.makedirs(os.path.dirname(qpos_path), exist_ok=True)
-        valid_qpos = [q for q in qpos_sequence if q is not None]
-        if valid_qpos:
-            np.save(qpos_path, np.array(valid_qpos))
-            self.logger.info(f"  ✓ qpos 已保存: {qpos_path} ({len(valid_qpos)} 帧)")
+        if qpos_log:
+            qpos_arr = np.array(qpos_log)
+            if self.smooth == 2 and len(qpos_arr) > 3:
+                self.logger.info("  后处理平滑 (双向Butterworth + 迭代限幅) ...")
+                smoother = TrajectorySmoother(fps=self.fps)
+                smooth_indices = list(range(len(arm_joint_indices)))
+                smoothed, metrics = smoother.smooth_trajectory(qpos_log, smooth_indices)
+                qpos_arr = np.array(smoothed)
+                self.logger.info(f"    速度降低: {metrics['velocity_reduction']:.1%}, "
+                                 f"加速度降低: {metrics['acceleration_reduction']:.1%}, "
+                                 f"Jerk降低: {metrics['jerk_reduction']:.1%}")
+            np.save(qpos_path, qpos_arr)
+            self.logger.info(f"  ✓ qpos 已保存: {qpos_path} ({len(qpos_arr)} 帧)")
 
         self.logger.info(f"\n✓ 视频已保存: {final_path}")
 
     def run_robot_only(self, start_frame=0, num_frames=-1):
-        self.logger.info("=" * 80)
-        self.logger.info("模式3: R1 机器人手部替代 MANO 手 + GLB 物体")
+        """模式3: 只渲染 R1 机器人 + GLB 场景物体 (不渲染人手)
+
+        支持自适应单臂/双臂渲染:
+        - 单臂: 根据 self.hand_indices 渲染左手或右手
+        - 双臂: 同时渲染左右两个 R1 臂
+
+        与 run_robot_tracking 类似, 但不渲染 MANO 手部网格/骨架/关键点,
+        只显示机器人跟踪手部运动。适合生成"机器人操作"视频。
+
+        Args:
+            start_frame: 起始帧索引
+            num_frames: 渲染帧数 (-1 表示全部)
+        """
+        hand_count = len(self.hand_indices)
+        mode_label = "双臂" if hand_count == 2 else "单臂"
+        self.logger.info(f"模式3: R1 机器人手部替代 MANO 手 + GLB 物体 ({mode_label})")
         self.logger.info("=" * 80)
 
         from galaxea_sim.controllers.utils.relaxed_ik_solver import RelaxedIKSolver
 
         self.logger.info("\n[1/7] 加载数据 ...")
-        hawor_data = load_hawor_data(self.hawor_dir, self.hand_idx)
-        total_frames = hawor_data["pred_trans"].shape[0]
+        # 加载所有手的数据, 取最小帧数
+        all_hawor_data = {}
+        total_frames = None
+        for hi in self.hand_indices:
+            hd = load_hawor_data(self.hawor_dir, hand_idx=hi)
+            all_hawor_data[hi] = hd
+            n = hd["pred_trans"].shape[0]
+            if total_frames is None or n < total_frames:
+                total_frames = n
         if num_frames < 0 or num_frames > total_frames - start_frame:
             num_frames = total_frames - start_frame
         R_c2w_all, t_c2w_all = load_hawor_c2w(self.hawor_dir)
 
-        betas_mean = hawor_data["pred_betas"][start_frame].astype(np.float32)
-        mano_side = "left" if self.hand_idx == 0 else "right"
-        mano_layer = MANOLayer(mano_side, betas_mean)
-
-        self._update_cam_fov(hawor_data)
+        # 更新相机 FOV: 双手时取非 None 的焦距
+        if hand_count == 2:
+            focal_values = [all_hawor_data[hi].get("img_focal") for hi in self.hand_indices]
+            focal = None
+            for fv in focal_values:
+                if fv is not None and fv > 0:
+                    focal = fv
+                    break
+            if focal is not None:
+                focal_for_render = focal * self.cam_width / 1280.0
+                self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / focal_for_render)
+                self.logger.info(f"  相机焦距: {focal:.1f}px (原始), {focal_for_render:.1f}px (渲染), FOV={np.degrees(self.cam_fov):.1f}°")
+            else:
+                self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / HAWOR_FOCAL_DEFAULT)
+                self.logger.info(f"  相机焦距: 使用默认 {HAWOR_FOCAL_DEFAULT}px, FOV={np.degrees(self.cam_fov):.1f}°")
+        else:
+            self._update_cam_fov(all_hawor_data[self.hand_indices[0]])
 
         self.logger.info("\n[2/7] 创建 SAPIEN 场景 + 加载 GLB ...")
         scene = setup_scene()
@@ -1474,299 +2243,324 @@ class HandObjectRenderer:
             if not self.transform_params_path.exists():
                 self.logger.error(f"  ✗ 变换参数不存在: {self.transform_params_path}")
 
-        self.logger.info("\n[3/7] 初始化 R1 单臂机器人 ...")
-        arm_urdf_path = prepare_arm_urdf(FLOATING_RIGHT_URDF)
-        loader = scene.create_urdf_loader()
-        loader.fix_root_link = True
-        loader.load_multiple_collisions_from_file = True
-        robot = loader.load(arm_urdf_path)
-
-        joint_names = [j.name for j in robot.get_active_joints()]
-        arm_joint_indices = [i for i, n in enumerate(joint_names) if "right_arm_joint" in n]
-        gripper_idx1 = joint_names.index("right_gripper_finger_joint1")
-        gripper_idx2 = joint_names.index("right_gripper_finger_joint2")
-
-        for joint in robot.get_active_joints():
-            joint.set_drive_property(stiffness=100000.0, damping=10000.0)
-
-        init_qpos = robot.get_qpos().copy()
-        for j, idx in enumerate(arm_joint_indices):
-            if j < len(RIGHT_ARM_STARTING):
-                init_qpos[idx] = RIGHT_ARM_STARTING[j]
-        init_qpos[gripper_idx1] = 0.04
-        init_qpos[gripper_idx2] = 0.04
-        robot.set_qpos(init_qpos)
-
-        scene.step()
-        scene.update_render()
-        self.logger.info(f"  ✓ 单臂机器人已加载")
-
-        self.logger.info("\n[4/7] 初始化 Dex Retargeting + RelaxedIK ...")
+        self.logger.info(f"\n[3/7] 初始化 R1 机器人 ({hand_count}个臂) ...")
         robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
         RetargetingConfig.set_default_urdf_dir(str(robot_dir))
-        config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, HandType.right)
-        override = dict(
-            add_dummy_free_joint=True,
-            normal_delta=1e-5,
-            huber_delta=0.01,
-            target_link_names=[
-                "right_gripper_finger_link1",
-                "right_gripper_finger_link2",
-                "right_gripper_link",
-            ],
-            target_link_human_indices=np.array([4, 8, 0]),
-        )
-        config = RetargetingConfig.load_from_file(config_path, override=override)
-        retargeting = config.build()
-        ref_indices = retargeting.optimizer.target_link_human_indices
-        fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
 
-        retarget2sapien = np.array(
-            [retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names]
-        ).astype(int)
-        sapien2retarget = {}
-        for sapien_i, retarget_i in enumerate(retarget2sapien):
-            sapien2retarget[retarget_i] = sapien_i
-        fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
-        for i, retarget_idx in enumerate(fixed_retarget_indices):
-            if retarget_idx in sapien2retarget:
-                fixed_qpos[i] = init_qpos[sapien2retarget[retarget_idx]]
+        arm_states = []
+        for hi in self.hand_indices:
+            prefix = "left" if hi == 0 else "right"
+            urdf_path = FLOATING_LEFT_URDF if hi == 0 else FLOATING_RIGHT_URDF
+            arm_starting = LEFT_ARM_STARTING if hi == 0 else RIGHT_ARM_STARTING
 
-        ik_solver = RelaxedIKSolver(
-            left_setting_file_path=str(R1_LEFT_SETTINGS),
-            right_setting_file_path=str(R1_RIGHT_SETTINGS),
-            tolerances=IK_TOLERANCES,
-        )
-        ik_solver.relaxed_ik_right.reset(RIGHT_ARM_STARTING)
+            arm_urdf_path = prepare_arm_urdf(urdf_path, arm_prefix=prefix)
+            loader = scene.create_urdf_loader()
+            loader.fix_root_link = True
+            loader.load_multiple_collisions_from_file = True
+            robot = loader.load(arm_urdf_path)
 
-        for probe_idx in range(num_frames):
-            g_idx = start_frame + probe_idx
-            if not hawor_data["pred_valid"][g_idx]:
-                continue
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][g_idx],
-                                       hawor_data["pred_hand_pose"][g_idx], hawor_data["pred_trans"][g_idx])
-            joints_sapien = self._render_to_sapien(j)
-            wrist_R_render = pr.matrix_from_compact_axis_angle(hawor_data["pred_rot"][g_idx])
-            wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
-            wrist_quat = pr.quaternion_from_matrix(wrist_R_sapien)
-            retargeting.warm_start(
-                joints_sapien[0, :3], wrist_quat,
-                hand_type=HandType.right, is_mano_convention=True,
+            joint_names = [j.name for j in robot.get_active_joints()]
+            arm_joint_indices = [i for i, n in enumerate(joint_names) if f"{prefix}_arm_joint" in n]
+            gripper_idx1 = joint_names.index(f"{prefix}_gripper_finger_joint1")
+            gripper_idx2 = joint_names.index(f"{prefix}_gripper_finger_joint2")
+
+            for joint in robot.get_active_joints():
+                joint.set_drive_property(stiffness=100000.0, damping=10000.0)
+
+            init_qpos = robot.get_qpos().copy()
+            for j, idx in enumerate(arm_joint_indices):
+                if j < len(arm_starting):
+                    init_qpos[idx] = arm_starting[j]
+            init_qpos[gripper_idx1] = 0.04
+            init_qpos[gripper_idx2] = -0.04
+            robot.set_qpos(init_qpos)
+            scene.step()
+            scene.update_render()
+
+            # Retargeting
+            hand_type = HandType.left if hi == 0 else HandType.right
+            config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, hand_type)
+            override = dict(
+                add_dummy_free_joint=True,
+                normal_delta=1e-5,
+                huber_delta=0.01,
+                target_link_names=[
+                    f"{prefix}_gripper_finger_link1",
+                    f"{prefix}_gripper_finger_link2",
+                    f"{prefix}_gripper_link",
+                ],
+                target_link_human_indices=np.array([4, 8, 0]),
             )
-            self.logger.info(f"  ✓ Warm start 完成 (帧 {g_idx})")
-            break
+            config = RetargetingConfig.load_from_file(config_path, override=override)
+            retargeting = config.build()
+            ref_indices = retargeting.optimizer.target_link_human_indices
+            fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
 
-        self.logger.info("\n[5/7] 放置机器人 + 预计算 ...")
-        wrist_positions = self._compute_wrist_positions_sapien(hawor_data, mano_layer, start_frame, num_frames)
-        if not wrist_positions:
+            retarget2sapien = np.array(
+                [retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names]
+            ).astype(int)
+            sapien2retarget = {}
+            for sapien_i, retarget_i in enumerate(retarget2sapien):
+                sapien2retarget[retarget_i] = sapien_i
+            fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
+            for i, retarget_idx in enumerate(fixed_retarget_indices):
+                if retarget_idx in sapien2retarget:
+                    fixed_qpos[i] = init_qpos[sapien2retarget[retarget_idx]]
+
+            # IK solver
+            ik_solver = RelaxedIKSolver(
+                left_setting_file_path=str(R1_LEFT_SETTINGS),
+                right_setting_file_path=str(R1_RIGHT_SETTINGS),
+                tolerances=IK_TOLERANCES,
+            )
+            if hi == 0:
+                ik_solver.relaxed_ik_left.reset(LEFT_ARM_STARTING)
+            else:
+                ik_solver.relaxed_ik_right.reset(RIGHT_ARM_STARTING)
+
+            # MANO layer
+            hawor_data = all_hawor_data[hi]
+            betas_mean = hawor_data["pred_betas"][start_frame].astype(np.float32)
+            mano_layer = MANOLayer(prefix, betas_mean)
+
+            arm_states.append({
+                "prefix": prefix,
+                "hand_idx": hi,
+                "robot": robot,
+                "arm_joint_indices": arm_joint_indices,
+                "gripper_idx1": gripper_idx1,
+                "gripper_idx2": gripper_idx2,
+                "retargeting": retargeting,
+                "ref_indices": ref_indices,
+                "fixed_qpos": fixed_qpos,
+                "retarget2sapien": retarget2sapien,
+                "sapien2retarget": sapien2retarget,
+                "ik_solver": ik_solver,
+                "joint_filter": LPFilter(alpha=LP_ALPHA_JOINT),
+                "target_smoother": EmaTargetSmoother(pos_alpha=0.6, ori_alpha=0.6) if self.smooth == 1 else None,
+                "first_valid_qpos": None,
+                "arm_starting": arm_starting,
+                "hawor_data": hawor_data,
+                "mano_layer": mano_layer,
+                "qpos_log": [],
+            })
+            self.logger.info(f"  ✓ {prefix} 臂已加载: {len(arm_joint_indices)}个臂关节 + 2个夹爪关节")
+
+        self.logger.info("\n[4/7] 初始化 Dex Retargeting + RelaxedIK ...")
+        # Warm start: 对每个臂分别执行
+        for arm in arm_states:
+            hawor_data = arm["hawor_data"]
+            mano_layer = arm["mano_layer"]
+            hand_type = HandType.left if arm["hand_idx"] == 0 else HandType.right
+            for probe_idx in range(num_frames):
+                g_idx = start_frame + probe_idx
+                if not hawor_data["pred_valid"][g_idx]:
+                    continue
+                # 跳过含NaN的帧
+                rot = hawor_data["pred_rot"][g_idx]
+                trans = hawor_data["pred_trans"][g_idx]
+                hand_pose = hawor_data["pred_hand_pose"][g_idx]
+                if np.any(np.isnan(rot)) or np.any(np.isnan(trans)) or np.any(np.isnan(hand_pose)):
+                    continue
+                _, j = compute_mano_joints(mano_layer, rot,
+                                           hawor_data["pred_hand_pose"][g_idx], trans)
+                joints_sapien = self._render_to_sapien(j)
+                wrist_R_render = pr.matrix_from_compact_axis_angle(rot)
+                wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
+                wrist_quat = pr.quaternion_from_matrix(wrist_R_sapien)
+                arm["retargeting"].warm_start(
+                    joints_sapien[0, :3], wrist_quat,
+                    hand_type=hand_type, is_mano_convention=True,
+                )
+                self.logger.info(f"  ✓ {arm['prefix']} Warm start 完成 (帧 {g_idx})")
+                break
+
+        self.logger.info("\n[5/7] 放置机器人 ...")
+        all_wrist_positions = []
+        for arm in arm_states:
+            wp = self._compute_wrist_positions_sapien(arm["hawor_data"], arm["mano_layer"], start_frame, num_frames)
+            all_wrist_positions.extend(wp)
+
+        if not all_wrist_positions:
             raise RuntimeError("无法提取有效手腕位置")
 
-        arm_base_pos, arm_base_q = self._compute_optimal_fixed_base(wrist_positions)
-        robot.set_root_pose(sapien.Pose(arm_base_pos.tolist(), arm_base_q.tolist()))
-        scene.step()
-        scene.update_render()
-
-        base_link_p, base_link_q = None, None
-        for link in robot.get_links():
-            if "right_arm_base_link" == link.get_name():
-                pose = link.get_entity_pose()
-                base_link_p = np.array(pose.p)
-                base_link_q = np.array(pose.q)
-                break
-        base_link_R = pr.matrix_from_quaternion(base_link_q)
-        base_link_R_inv = base_link_R.T
+        arm_base_pos, arm_base_q = self._compute_optimal_fixed_base(all_wrist_positions)
+        for arm in arm_states:
+            arm["robot"].set_root_pose(sapien.Pose(arm_base_pos.tolist(), arm_base_q.tolist()))
+            scene.step()
+            scene.update_render()
 
         self.logger.info(f"  初始基座: {arm_base_pos} (跟踪范围±{BASE_TRACKING_RANGE}m)")
 
         mapping_offset = np.zeros(3)
         safety_offset = np.zeros(3)
 
-        ee_pos_filter = LPFilter(alpha=LP_ALPHA_EE)
-        joint_filter = LPFilter(alpha=LP_ALPHA_JOINT)
-        current_joints = np.array([init_qpos[i] for i in arm_joint_indices])
-        joint_filter.next(current_joints)
+        # 初始化 joint_filter
+        for arm in arm_states:
+            init_qpos_arm = arm["robot"].get_qpos().copy()
+            current_joints = np.array([init_qpos_arm[i] for i in arm["arm_joint_indices"]])
+            arm["joint_filter"].next(current_joints)
 
-        first_ik_joints = None
-        first_ik_target_base = None
-        first_ee_quat_base = None
-        first_ik_target_world = None
-        for probe_idx in range(num_frames):
-            global_idx = start_frame + probe_idx
-            if not hawor_data["pred_valid"][global_idx]:
-                continue
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
-            joints_sapien = self._render_to_sapien(j)
-
-            ref_value = joints_sapien[ref_indices, :].astype(np.float32)
-            retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-
-            gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
-                retargeting, retarget_qpos, "right")
-
-            tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
-            scene.step()
-
-            for link in robot.get_links():
-                if "right_arm_base_link" == link.get_name():
-                    pose = link.get_entity_pose()
-                    base_link_p = np.array(pose.p)
-                    base_link_q = np.array(pose.q)
-                    break
-            base_link_R = pr.matrix_from_quaternion(base_link_q)
-            base_link_R_inv = base_link_R.T
-
-            ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
-            ik_target_b = base_link_R_inv @ (ik_target_raw - base_link_p)
-            ee_R_base = base_link_R_inv @ R_ee_world_fk
-            ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
-
-            try:
-                first_ik_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                first_ik_target_base = ik_target_b.copy()
-                first_ee_quat_base = ee_quat_b.copy()
-                first_ik_target_world = ik_target_raw.copy()
-                break
-            except Exception:
-                continue
-
-        if first_ik_joints is None:
-            raise RuntimeError("无法求解任何有效帧的IK")
-
-        for _ in range(200):
-            first_ik_joints = np.array(ik_solver.solve_position_right(first_ik_target_base.tolist(), first_ee_quat_base.tolist()))
-
-        ee_pos_filter.next(first_ik_target_world)
-
-        right_gripper_link = None
-        for link in robot.get_links():
-            if "right_gripper_link" in link.get_name():
-                right_gripper_link = link
+        # Warmup: 对每个臂分别做 smoothstep 过渡
+        for arm in arm_states:
+            first_valid_qpos = None
+            for fi in range(start_frame, start_frame + num_frames):
+                if not arm["hawor_data"]["pred_valid"][fi]:
+                    continue
+                rot = arm["hawor_data"]["pred_rot"][fi]
+                trans = arm["hawor_data"]["pred_trans"][fi]
+                hand_pose = arm["hawor_data"]["pred_hand_pose"][fi]
+                if np.any(np.isnan(rot)) or np.any(np.isnan(trans)) or np.any(np.isnan(hand_pose)):
+                    continue
+                _, j = compute_mano_joints(
+                    arm["mano_layer"], arm["hawor_data"]["pred_rot"][fi],
+                    arm["hawor_data"]["pred_hand_pose"][fi],
+                    arm["hawor_data"]["pred_trans"][fi])
+                joints_sapien = self._render_to_sapien(j)
+                ref_value = joints_sapien[arm["ref_indices"], :].astype(np.float32)
+                retarget_qpos = arm["retargeting"].retarget(ref_value, arm["fixed_qpos"])
+                sapien_qpos = retarget_qpos[arm["retarget2sapien"]]
+                gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
+                    arm["retargeting"], retarget_qpos, arm["prefix"])
+                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                scene.step()
+                for link in arm["robot"].get_links():
+                    if f"{arm['prefix']}_arm_base_link" == link.get_name():
+                        pose = link.get_entity_pose()
+                        base_link_p_w = np.array(pose.p)
+                        base_link_q_w = np.array(pose.q)
+                        break
+                base_link_R_w = pr.matrix_from_quaternion(base_link_q_w)
+                base_link_R_inv_w = base_link_R_w.T
+                ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
+                ik_target_b = base_link_R_inv_w @ (ik_target_raw - base_link_p_w)
+                ee_R_base = base_link_R_inv_w @ R_ee_world_fk
+                ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
+                solve_fn = arm["ik_solver"].solve_position_left if arm["prefix"] == "left" else arm["ik_solver"].solve_position_right
+                ik_joints = solve_fn(ik_target_b.tolist(), ee_quat_b.tolist())
+                for _ in range(IK_SOLVE_PER_FRAME * 5 - 1):
+                    ik_joints = solve_fn(ik_target_b.tolist(), ee_quat_b.tolist())
+                first_valid_qpos = np.array(ik_joints)
                 break
 
-        qpos_sequence = []
-        for w in range(WARMUP_FRAMES):
-            t = (w + 1) / WARMUP_FRAMES
-            t_smooth = t * t * (3 - 2 * t)
-            interp = current_joints * (1 - t_smooth) + first_ik_joints * t_smooth
-            interp = joint_filter.next(interp)
-            qpos = robot.get_qpos().copy()
-            for j, idx in enumerate(arm_joint_indices):
-                qpos[idx] = interp[j]
-            qpos[gripper_idx1] = 0.04
-            qpos[gripper_idx2] = 0.04
-            qpos_sequence.append(qpos)
-
-        for local_idx in trange(num_frames, desc="预计算"):
-            global_idx = start_frame + local_idx
-            if not hawor_data["pred_valid"][global_idx]:
-                qpos_sequence.append(None)
-                continue
-
-            _, j = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
-            joints_sapien = self._render_to_sapien(j)
-
-            ref_value = joints_sapien[ref_indices, :].astype(np.float32)
-            retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-            sapien_qpos = retarget_qpos[retarget2sapien]
-            gripper1 = float(sapien_qpos[gripper_idx1]) if gripper_idx1 < len(sapien_qpos) else 0.04
-            gripper2 = float(sapien_qpos[gripper_idx2]) if gripper_idx2 < len(sapien_qpos) else -0.04
-
-            gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
-                retargeting, retarget_qpos, "right")
-
-            tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
-            scene.step()
-
-            for link in robot.get_links():
-                if "right_arm_base_link" == link.get_name():
-                    pose = link.get_entity_pose()
-                    base_link_p = np.array(pose.p)
-                    base_link_q = np.array(pose.q)
-                    break
-            base_link_R = pr.matrix_from_quaternion(base_link_q)
-            base_link_R_inv = base_link_R.T
-
-            ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
-            ik_target_w = ee_pos_filter.next(ik_target_raw)
-            ik_target_b = base_link_R_inv @ (ik_target_w - base_link_p)
-            ee_R_base = base_link_R_inv @ R_ee_world_fk
-            ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
-
-            try:
-                arm_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                for _ in range(IK_SOLVE_PER_FRAME - 1):
-                    arm_joints = np.array(ik_solver.solve_position_right(ik_target_b.tolist(), ee_quat_b.tolist()))
-                ik_solver.relaxed_ik_right.reset(list(arm_joints))
-            except Exception:
-                qpos_sequence.append(None)
-                continue
-
-            arm_joints = joint_filter.next(arm_joints)
-            qpos = robot.get_qpos().copy()
-            for j, idx in enumerate(arm_joint_indices):
-                qpos[idx] = arm_joints[j]
-            qpos[gripper_idx1] = gripper1
-            qpos[gripper_idx2] = gripper2
-            qpos_sequence.append(qpos)
-
-        valid = sum(1 for x in qpos_sequence if x is not None)
-        self.logger.info(f"  ✓ 预计算完成: {valid}/{len(qpos_sequence)} 帧有效")
+            arm["first_valid_qpos"] = first_valid_qpos
+            if first_valid_qpos is not None:
+                init_qpos_arm = np.array(arm["arm_starting"])
+                for wi in range(WARMUP_FRAMES):
+                    t = (wi + 1) / WARMUP_FRAMES
+                    t = t * t * (3 - 2 * t)
+                    interp = init_qpos_arm * (1 - t) + first_valid_qpos * t
+                    qpos = arm["robot"].get_qpos().copy()
+                    for j_idx, arm_idx in enumerate(arm["arm_joint_indices"]):
+                        qpos[arm_idx] = interp[j_idx]
+                    arm["robot"].set_qpos(qpos)
+                    scene.step()
+                self.logger.info(f"  {arm['prefix']} Warmup 完成 ({WARMUP_FRAMES} 帧 smoothstep 过渡)")
 
         self.logger.info("\n[6/7] 设置相机 ...")
-        camera = scene.add_camera("main", CAM_WIDTH, CAM_HEIGHT, self.cam_fov, 0.01, 100.0)
+        camera = scene.add_camera("main", self.cam_width, self.cam_height, self.cam_fov, 0.01, 100.0)
 
-        if R_c2w_all is not None and t_c2w_all is not None:
+        if self.view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
             cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[0], t_c2w_all[0])
             camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
-            self.logger.info(f"  使用 hawor 相机轨迹")
+            self.logger.info(f"  使用 hawor 相机轨迹 (第一人称)")
         else:
-            centroid = np.mean(wrist_positions, axis=0) if wrist_positions else np.array([0, 0, 0.3])
-            cam_pos = centroid + np.array([-0.15, -0.20, 0.10])
-            cam_quat = make_look_at_camera(cam_pos, centroid)
+            centroid = np.mean(all_wrist_positions, axis=0) if all_wrist_positions else np.array([0, 0, 0.3])
+            robot_root = arm_base_pos.copy()
+            if self.view == "topdown":
+                cam_target = centroid if centroid is not None else robot_root
+                cam_pos = cam_target + np.array([0.0, 0.0, 1.2])
+                cam_quat = make_look_at_camera(cam_pos, cam_target, up=np.array([0, 1, 0]))
+                self.logger.info(f"  顶部俯视视角 (高度1.2m, 目标={cam_target})")
+            elif self.view == "behind":
+                cam_pos = robot_root + np.array([2.5, 0.0, 1.2])
+                cam_quat = np.array([0.0, 0.0, 1.0, 0.0])
+                self.logger.info(f"  后上方视角")
+            elif self.view == "front":
+                cam_pos = robot_root + np.array([-2.5, 0.0, 1.2])
+                cam_quat = np.array([1.0, 0.0, 0.0, 0.0])
+                self.logger.info(f"  正前方视角")
+            else:
+                cam_pos = centroid + np.array([-0.15, -0.20, 0.10])
+                cam_quat = make_look_at_camera(cam_pos, centroid)
             camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
 
-        self.logger.info("\n[7/7] 渲染视频 ...")
+        self.logger.info("\n[7/7] 实时 IK 渲染视频 ...")
+        self.logger.info(f"  平滑模式: {self.smooth} ({'不平滑' if self.smooth == 0 else '在线EMA' if self.smooth == 1 else '后处理双向滤波'})")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(self.output, fourcc, self.fps, (camera.get_width(), camera.get_height()))
         kp_nodes = []
-        skel_nodes = []
 
-        mano_face = mano_layer.f.cpu().numpy()
-        mat_hand = context.create_material(np.zeros(4), np.array([0.96, 0.75, 0.69, 0.3]), 0.0, 0.8, 0)
+        for local_idx in trange(num_frames, desc="实时IK渲染"):
+            global_idx = start_frame + local_idx
 
-        gripper_link = None
-        for link in robot.get_links():
-            if "right_gripper_link" in link.get_name():
-                gripper_link = link
-                break
-
-        hand_nodes = []
-        for frame_idx in trange(len(qpos_sequence), desc="渲染"):
-            is_warmup = frame_idx < WARMUP_FRAMES
-            data_frame_idx = frame_idx - WARMUP_FRAMES
-            global_idx = start_frame + max(data_frame_idx, 0)
-
-            if R_c2w_all is not None and t_c2w_all is not None:
+            # 更新相机
+            if self.view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
                 cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[global_idx], t_c2w_all[global_idx])
                 camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
 
-            frame_data = qpos_sequence[frame_idx]
-            if frame_data is not None:
-                robot.set_qpos(frame_data)
+            arm_valid_flags = []
+            for arm in arm_states:
+                hawor_data = arm["hawor_data"]
+                rot = hawor_data["pred_rot"][global_idx]
+                trans = hawor_data["pred_trans"][global_idx]
+                hand_pose = hawor_data["pred_hand_pose"][global_idx]
+                if hawor_data["pred_valid"][global_idx] and not (np.any(np.isnan(rot)) or np.any(np.isnan(trans)) or np.any(np.isnan(hand_pose))):
+                    _, j = compute_mano_joints(arm["mano_layer"], hawor_data["pred_rot"][global_idx],
+                                               hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
+                    joints_sapien = self._render_to_sapien(j)
 
-            if not is_warmup and hawor_data["pred_valid"][global_idx]:
-                vertex_render, joints_render = compute_mano_joints(mano_layer, hawor_data["pred_rot"][global_idx],
-                                                       hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
-                vertex_sapien = self._render_to_sapien(vertex_render)
-                joints_sapien = self._render_to_sapien(joints_render)
-                hand_nodes = self._update_hand_mesh(vertex_sapien, mano_face, mat_hand, context, internal_scene, hand_nodes)
-                kp_nodes = self._render_keypoints(joints_sapien[:, :3], context, internal_scene, kp_nodes,
-                                                  radius=0.006, ref_indices=set(ref_indices))
-                skel_nodes = self._render_hand_skeleton(joints_sapien[:, :3], context, internal_scene, skel_nodes)
+                    ref_value = joints_sapien[arm["ref_indices"], :].astype(np.float32)
+                    retarget_qpos = arm["retargeting"].retarget(ref_value, arm["fixed_qpos"])
+                    sapien_qpos = retarget_qpos[arm["retarget2sapien"]]
+
+                    gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
+                        arm["retargeting"], retarget_qpos, arm["prefix"])
+
+                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                    arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                    scene.step()
+
+                    for link in arm["robot"].get_links():
+                        if f"{arm['prefix']}_arm_base_link" == link.get_name():
+                            pose = link.get_entity_pose()
+                            base_link_p = np.array(pose.p)
+                            base_link_q = np.array(pose.q)
+                            break
+                    base_link_R = pr.matrix_from_quaternion(base_link_q)
+                    base_link_R_inv = base_link_R.T
+
+                    ik_target_raw = gripper_pos_fk + mapping_offset + safety_offset
+                    ik_target_b = base_link_R_inv @ (ik_target_raw - base_link_p)
+                    ee_R_base = base_link_R_inv @ R_ee_world_fk
+                    ee_quat_b = pr.quaternion_from_matrix(ee_R_base)
+
+                    if arm["target_smoother"] is not None:
+                        ik_target_b, ee_quat_b = arm["target_smoother"].smooth(ik_target_b, ee_quat_b)
+
+                    solve_fn = arm["ik_solver"].solve_position_left if arm["prefix"] == "left" else arm["ik_solver"].solve_position_right
+                    ik_joints = solve_fn(ik_target_b.tolist(), ee_quat_b.tolist())
+                    for _ in range(IK_SOLVE_PER_FRAME - 1):
+                        ik_joints = solve_fn(ik_target_b.tolist(), ee_quat_b.tolist())
+
+                    if self.smooth == 0:
+                        filtered_joints = np.array(ik_joints)
+                    else:
+                        filtered_joints = arm["joint_filter"].next(np.array(ik_joints))
+
+                    qpos = arm["robot"].get_qpos().copy()
+                    for j_idx, arm_idx in enumerate(arm["arm_joint_indices"]):
+                        qpos[arm_idx] = filtered_joints[j_idx]
+                    if arm["gripper_idx1"] < len(sapien_qpos):
+                        qpos[arm["gripper_idx1"]] = float(sapien_qpos[arm["gripper_idx1"]])
+                    if arm["gripper_idx2"] < len(sapien_qpos):
+                        qpos[arm["gripper_idx2"]] = float(sapien_qpos[arm["gripper_idx2"]])
+                    arm["robot"].set_qpos(qpos)
+                    arm["qpos_log"].append(qpos.copy())
+                    arm_valid_flags.append(True)
+                else:
+                    arm_valid_flags.append(False)
 
             scene.step()
             scene.update_render()
@@ -1776,17 +2570,18 @@ class HandObjectRenderer:
 
             h, w = bgr.shape[:2]
             cv2.rectangle(bgr, (0, 0), (w, 40), (0, 0, 0), -1)
-            if is_warmup:
-                t = (frame_idx + 1) / WARMUP_FRAMES
-                cv2.putText(bgr, f"Warmup {frame_idx+1}/{WARMUP_FRAMES} ({t*100:.0f}%)  |  R1 Robot + Objects",
-                            (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            if len(arm_states) == 2:
+                hand_info = f"L:{'✓' if arm_valid_flags[0] else '✗'} R:{'✓' if arm_valid_flags[1] else '✗'}"
+                cv2.putText(bgr, f"Frame {local_idx+1}/{num_frames}  |  Dual Arm  |  {hand_info}",
+                            (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             else:
-                cv2.putText(bgr, f"Frame {data_frame_idx+1}  |  R1 Robot + Objects",
+                prefix = arm_states[0]["prefix"]
+                cv2.putText(bgr, f"Frame {local_idx+1}/{num_frames}  |  R1 {prefix} Arm + Objects",
                             (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             writer.write(bgr)
 
         writer.release()
-        for node in kp_nodes + skel_nodes:
+        for node in kp_nodes:
             internal_scene.remove_node(node)
 
         final_path = self.output
@@ -1799,17 +2594,40 @@ class HandObjectRenderer:
                 if os.path.exists(tmp_path):
                     os.rename(tmp_path, final_path)
 
-        qpos_path = str(Path(self.output).with_suffix(".npy")).replace("videos", "tracking")
-        os.makedirs(os.path.dirname(qpos_path), exist_ok=True)
-        valid_qpos = [q for q in qpos_sequence if q is not None]
-        if valid_qpos:
-            np.save(qpos_path, np.array(valid_qpos))
-            self.logger.info(f"  ✓ qpos 已保存: {qpos_path} ({len(valid_qpos)} 帧)")
+        # qpos 保存: 对每个臂分别保存
+        for arm in arm_states:
+            qpos_path = str(Path(self.output).with_suffix(".npy")).replace("videos", "tracking")
+            qpos_path = qpos_path.replace(".npy", f"_{arm['prefix']}.npy")
+            os.makedirs(os.path.dirname(qpos_path), exist_ok=True)
+            if arm["qpos_log"]:
+                qpos_arr = np.array(arm["qpos_log"])
+                if self.smooth == 2 and len(qpos_arr) > 3:
+                    self.logger.info(f"  {arm['prefix']} 后处理平滑 (双向Butterworth + 迭代限幅) ...")
+                    smoother = TrajectorySmoother(fps=self.fps)
+                    smooth_indices = list(range(len(arm["arm_joint_indices"])))
+                    smoothed, metrics = smoother.smooth_trajectory(arm["qpos_log"], smooth_indices)
+                    qpos_arr = np.array(smoothed)
+                    self.logger.info(f"    速度降低: {metrics['velocity_reduction']:.1%}, "
+                                     f"加速度降低: {metrics['acceleration_reduction']:.1%}, "
+                                     f"Jerk降低: {metrics['jerk_reduction']:.1%}")
+                np.save(qpos_path, qpos_arr)
+                self.logger.info(f"  ✓ {arm['prefix']} qpos 已保存: {qpos_path} ({len(qpos_arr)} 帧)")
 
         self.logger.info(f"\n✓ 视频已保存: {final_path}")
 
 
 def main():
+    """命令行入口: 渲染 HaWoR 手部 + RAS 场景 + R1 机器人视频
+
+    支持三种模式:
+      hand_only:      只渲染 MANO 手部 + GLB 场景物体 (验证对齐效果)
+      robot_only:     只渲染 R1 机器人 + GLB 场景物体 (验证机器人跟踪)
+      robot_tracking: 渲染手部 + 机器人 + GLB 场景 (完整对比视频)
+
+    用法示例:
+      python 02_render_scene.py --mode hand_only --hawor-dir /path/to/hawor --ras-dir /path/to/ras
+      python 02_render_scene.py --mode robot_only --hawor-dir /path/to/hawor --ras-dir /path/to/ras --viewer
+    """
     parser = argparse.ArgumentParser(description="Hawor 手部 + RAS 物体 → SAPIEN 渲染")
     parser.add_argument("--mode", type=str, default="hand_only", choices=["hand_only", "robot_tracking", "robot_only"])
     parser.add_argument("--hawor-dir", type=str, required=True)
@@ -1817,29 +2635,57 @@ def main():
     parser.add_argument("--transform-params", type=str, default="./output/alignment/transform_params.npz",
                         help="01_align_scene.py 输出的 transform_params.npz 路径")
     parser.add_argument("--hand-idx", type=int, default=-1,
-                        help="手的索引: 0=左手, 1=右手, -1=自动检测")
+                        help="手的索引: 0=左手, 1=右手, -1=自动检测, -2=强制双手")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=-1)
     parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--crf", type=int, default=18,
-                        help="H.264 编码质量 (0=无损, 18=高质量, 23=默认, 28=低质量)")
+    parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument("--width", type=int, default=1920, help="渲染宽度 (像素)")
+    parser.add_argument("--height", type=int, default=1080, help="渲染高度 (像素)")
+    parser.add_argument("--crf", type=int, default=14,
+                        help="H.264 编码质量 (0=无损, 14=高质量(默认), 18=较好, 23=默认, 28=低质量)")
     parser.add_argument("--viewer", action="store_true", help="交互式Viewer渲染（不保存视频）")
+    parser.add_argument("--view", type=str, default="fpv",
+                        choices=["fpv", "topdown", "behind", "front"],
+                        help="相机视角: fpv=第一人称(默认), topdown=顶部俯视, behind=后上方, front=正前方")
+    parser.add_argument("--smooth", type=int, default=1,
+                        choices=[0, 1, 2],
+                        help="平滑模式: 0=不平滑, 1=在线EMA平滑(默认), 2=后处理双向滤波+限幅")
 
     args = parser.parse_args()
     if args.output is None:
         args.output = f"output/videos/hand_object_{args.mode}.mp4"
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    if args.hand_idx < 0:
-        detected = _detect_hand_idx(Path(args.hawor_dir))
-        if detected is not None:
-            args.hand_idx = detected
-            hand_label = "左手" if detected == 0 else "右手"
-            print(f"自动检测到手: {hand_label} (idx={detected})")
+    force_dual = False
+    if args.hand_idx < -1:
+        # -2 = 强制双手
+        force_dual = True
+        detected_hands = _detect_hands(Path(args.hawor_dir))
+        if len(detected_hands) == 2:
+            args.hand_idx = 0  # 默认左手作为 hand_idx
+            print(f"双手模式: 左手+右手")
+        else:
+            args.hand_idx = detected_hands[0] if detected_hands else 0
+            force_dual = False
+            print(f"数据中未检测到双手, 退回单手模式 (idx={args.hand_idx})")
+    elif args.hand_idx == -1:
+        # 自动检测
+        detected_hands = _detect_hands(Path(args.hawor_dir))
+        if len(detected_hands) == 2:
+            args.hand_idx = 0
+            force_dual = True
+            print(f"自动检测: 双手 (左手+右手)")
+        elif len(detected_hands) == 1:
+            args.hand_idx = detected_hands[0]
+            hand_label = "左手" if detected_hands[0] == 0 else "右手"
+            print(f"自动检测: {hand_label} (idx={detected_hands[0]})")
         else:
             args.hand_idx = 0
             print(f"无法自动检测手, 默认使用左手 (idx=0)")
+    else:
+        hand_label = "左手" if args.hand_idx == 0 else "右手"
+        print(f"指定手: {hand_label} (idx={args.hand_idx})")
 
     if not Path(args.transform_params).exists():
         raise FileNotFoundError(
@@ -1857,7 +2703,17 @@ def main():
     renderer = HandObjectRenderer(hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
                                   transform_params_path=args.transform_params,
                                   output=args.output, fps=args.fps, hand_idx=args.hand_idx, logger=logger,
-                                  viewer=args.viewer, crf=args.crf)
+                                  viewer=args.viewer, crf=args.crf,
+                                  cam_width=args.width, cam_height=args.height,
+                                  view=args.view, smooth=args.smooth)
+
+    # 设置 hand_indices: 根据检测结果决定单臂/双臂
+    if args.mode == "robot_only":
+        if force_dual:
+            renderer.hand_indices = [0, 1]
+        else:
+            renderer.hand_indices = [args.hand_idx]
+
     if args.mode == "hand_only":
         renderer.run_hand_only(start_frame=args.start_frame, num_frames=args.num_frames)
     elif args.mode == "robot_tracking":

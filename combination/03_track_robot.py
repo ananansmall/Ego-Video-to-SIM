@@ -111,6 +111,12 @@ R_HAWOR2SAPIEN = np.array([
 
 
 class TrajectorySmoother:
+    """轨迹平滑器: 双向低通滤波 + 迭代速度/加速度/加加速度限幅
+
+    用于预计算管线的后处理, 减少关节运动的抖动和突变。
+    不适用于实时渲染 (02_render_scene.py 不使用此类)。
+    """
+
     SMOOTHNESS_THRESHOLDS = {
         "max_velocity": 3.0,
         "max_acceleration": 8.0,
@@ -121,6 +127,18 @@ class TrajectorySmoother:
     def __init__(self, fps=30, max_velocity=1.5, max_acceleration=4.0,
                  max_jerk=20.0, lp_alpha=0.25, butterworth_order=2,
                  max_iterations=10, convergence_eps=1e-5):
+        """初始化轨迹平滑器
+
+        Args:
+            fps: 帧率, 用于计算 dt
+            max_velocity: 关节最大速度 (rad/s)
+            max_acceleration: 关节最大加速度 (rad/s²)
+            max_jerk: 关节最大加加速度 (rad/s³)
+            lp_alpha: 低通滤波器截止参数 (0~1, 越小越平滑)
+            butterworth_order: 低通滤波器阶数 (1 或 2)
+            max_iterations: 迭代限幅最大次数
+            convergence_eps: 收敛阈值
+        """
         self.dt = 1.0 / fps
         self.max_velocity = max_velocity
         self.max_acceleration = max_acceleration
@@ -131,6 +149,22 @@ class TrajectorySmoother:
         self.convergence_eps = convergence_eps
 
     def smooth_trajectory(self, qpos_sequence, smooth_indices):
+        """对 qpos 序列执行平滑处理
+
+        流程:
+        1. 提取需要平滑的关节角 (smooth_indices)
+        2. 填充无效帧 (线性插值)
+        3. 双向低通滤波 (1阶或2阶)
+        4. 迭代限幅 (速度→加速度→加加速度, 反复直到收敛)
+        5. 计算平滑前后指标
+
+        Args:
+            qpos_sequence: qpos 列表, None 表示无效帧
+            smooth_indices: 需要平滑的关节索引列表
+
+        Returns:
+            tuple: (smoothed_qpos_list, metrics_dict)
+        """
         n_frames = len(qpos_sequence)
         n_joints = len(smooth_indices)
         trajectory = np.zeros((n_frames, n_joints))
@@ -160,6 +194,12 @@ class TrajectorySmoother:
         return smoothed_sequence, metrics
 
     def _fill_invalid_frames(self, trajectory, valid_mask):
+        """用最近有效值填充无效帧 (前向填充 + 首帧修正)
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+            valid_mask: (N,) 有效帧标记
+        """
         n_frames = len(trajectory)
         last_valid = 0
         for i in range(n_frames):
@@ -172,11 +212,29 @@ class TrajectorySmoother:
             trajectory[i] = trajectory[first_valid]
 
     def _bidirectional_lowpass(self, trajectory):
+        """双向低通滤波: 根据阶数选择1阶或2阶
+
+        Args:
+            trajectory: (N, J) 关节轨迹
+
+        Returns:
+            np.ndarray: (N, J) 平滑后的轨迹
+        """
         if self.butterworth_order == 1:
             return self._bidirectional_lpf_order1(trajectory)
         return self._bidirectional_lpf_order2(trajectory)
 
     def _bidirectional_lpf_order1(self, trajectory):
+        """1阶双向低通滤波 (指数移动平均)
+
+        先正向 EMA, 再反向 EMA, 实现零相位延迟。
+
+        Args:
+            trajectory: (N, J) 关节轨迹
+
+        Returns:
+            np.ndarray: (N, J) 平滑后的轨迹
+        """
         alpha = self.lp_alpha
         forward = np.zeros_like(trajectory)
         forward[0] = trajectory[0]
@@ -189,6 +247,16 @@ class TrajectorySmoother:
         return backward
 
     def _bidirectional_lpf_order2(self, trajectory):
+        """2阶双向低通滤波 (级联两个1阶EMA)
+
+        先正向2级EMA, 再反向2级EMA, 比单阶更平滑。
+
+        Args:
+            trajectory: (N, J) 关节轨迹
+
+        Returns:
+            np.ndarray: (N, J) 平滑后的轨迹
+        """
         alpha = self.lp_alpha
         n_frames = len(trajectory)
         s1_fwd = np.zeros_like(trajectory)
@@ -208,6 +276,14 @@ class TrajectorySmoother:
         return s2_bwd
 
     def _clamp_velocity(self, trajectory):
+        """限幅关节速度: 确保相邻帧之间的角速度不超过 max_velocity
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
         max_delta = self.max_velocity * self.dt
         for i in range(1, len(trajectory)):
             delta = trajectory[i] - trajectory[i - 1]
@@ -216,6 +292,14 @@ class TrajectorySmoother:
         return trajectory
 
     def _clamp_acceleration(self, trajectory):
+        """限幅关节加速度: 确保角加速度不超过 max_acceleration
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
         max_delta_v = self.max_acceleration * self.dt
         for i in range(2, len(trajectory)):
             v_prev = trajectory[i - 1] - trajectory[i - 2]
@@ -227,6 +311,14 @@ class TrajectorySmoother:
         return trajectory
 
     def _clamp_jerk(self, trajectory):
+        """限幅关节加加速度: 确保 jerk 不超过 max_jerk
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
         max_delta_a = self.max_jerk * self.dt
         for i in range(3, len(trajectory)):
             v_im2 = trajectory[i - 2] - trajectory[i - 3]
@@ -242,6 +334,17 @@ class TrajectorySmoother:
         return trajectory
 
     def _iterative_clamp(self, trajectory):
+        """迭代执行速度→加速度→加加速度限幅, 直到收敛
+
+        每轮: clamp_velocity → clamp_acceleration → clamp_jerk
+        重复 max_iterations 次或直到变化量 < convergence_eps
+
+        Args:
+            trajectory: (N, J) 关节轨迹, 原地修改
+
+        Returns:
+            np.ndarray: 修改后的轨迹
+        """
         for iteration in range(self.max_iterations):
             traj_before = trajectory.copy()
             trajectory = self._clamp_velocity(trajectory)
@@ -253,6 +356,18 @@ class TrajectorySmoother:
         return trajectory
 
     def _compute_metrics(self, trajectory_smooth, trajectory_raw):
+        """计算平滑前后的运动学指标
+
+        指标: 最大速度, 最大加速度, 最大加加速度, 平滑度指数 (SI)
+        SI = ∫jerk² dt, 越小越平滑
+
+        Args:
+            trajectory_smooth: (N, J) 平滑后的轨迹
+            trajectory_raw: (N, J) 原始轨迹
+
+        Returns:
+            dict: 包含 smooth/raw 指标和通过/未通过判定
+        """
         dt = self.dt
         vel_raw = np.diff(trajectory_raw, axis=0) / dt
         acc_raw = np.diff(vel_raw, axis=0) / dt
@@ -296,6 +411,19 @@ class TrajectorySmoother:
 
 
 def load_hawor_data(hawor_dir, hand_idx=0):
+    """加载 HaWoR 手部重建数据
+
+    支持两种数据格式:
+    1. world_space_res.pth (旧格式, 世界坐标)
+    2. reconstruction/hawor_results_*.npz (新格式, 相机坐标, 需转换到世界坐标)
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+        hand_idx: 手部索引 (0=左手, 1=右手)
+
+    Returns:
+        dict: 包含 pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid
+    """
     hawor_path = Path(hawor_dir)
     ws_file = hawor_path / "world_space_res.pth"
     rec_file = hawor_path / "reconstruction" / "hawor_results_0_113.npz"
@@ -337,6 +465,19 @@ def load_hawor_data(hawor_dir, hand_idx=0):
 
 
 def compute_mano_joints(mano_layer, rot, hand_pose, trans):
+    """通过 MANO 正运动学计算手部顶点和关节
+
+    Args:
+        mano_layer: MANOLayer 实例
+        rot: (3,) 手腕轴角旋转
+        hand_pose: (45,) 手指 PCA 参数
+        trans: (3,) 手腕平移
+
+    Returns:
+        tuple: (vertices, joints)
+            - vertices: (778, 3) 手部网格顶点
+            - joints: (21, 3) 21个手部关节3D坐标
+    """
     p = torch.from_numpy(np.concatenate([rot, hand_pose]).astype(np.float32)).unsqueeze(0)
     t = torch.from_numpy(trans.astype(np.float32)).unsqueeze(0)
     v, j = mano_layer(p, t)
@@ -344,10 +485,33 @@ def compute_mano_joints(mano_layer, rot, hand_pose, trans):
 
 
 def transform_hawor_to_sapien(points, R_transform):
+    """使用旋转矩阵将点从一个坐标系变换到另一个
+
+    Args:
+        points: (N, 3) 或 (3,) 输入点
+        R_transform: (3, 3) 旋转矩阵 (如 R_HAWOR2SAPIEN)
+
+    Returns:
+        np.ndarray: 同形状, 变换后的点
+    """
     return (R_transform @ points.T).T
 
 
 class HaworR1Pipeline:
+    """HaWoR 手部 → R1 机器人映射管线
+
+    完整流程:
+    1. 加载 HaWoR 手部数据
+    2. 确定坐标系变换 (自动检测相机坐标系/Z-up坐标系)
+    3. 初始化 Dex Retargeting (手部关节→夹爪)
+    4. 分析手部轨迹 (质心、范围)
+    5. 放置 R1 机器人 (基座位置)
+    6. 计算工作空间映射 (mapping_offset + safety_offset)
+    7. 初始化 RelaxedIK (夹爪→臂关节)
+    8. 预计算所有帧 + 轨迹平滑
+    9. 渲染视频 (可选)
+    """
+
     def __init__(
         self,
         hawor_dir: str,
@@ -359,6 +523,18 @@ class HaworR1Pipeline:
         no_render: bool = False,
         logger: logging.Logger = None,
     ):
+        """初始化管线
+
+        Args:
+            hawor_dir: HaWoR 输出目录路径
+            hand_idx: 手部索引 (0=左手, 1=右手)
+            output_video: 输出视频路径
+            fps: 视频帧率
+            view: 视角模式 (behind/front/topdown)
+            coord_transform: 坐标变换模式 (auto/hawor2sapien/none)
+            no_render: 是否跳过视频渲染 (仅输出qpos)
+            logger: 日志记录器
+        """
         self.hawor_dir = Path(hawor_dir)
         self.hand_idx = hand_idx
         self.output_video = output_video
@@ -370,6 +546,22 @@ class HaworR1Pipeline:
         self.logger = logger or logging.getLogger("HaworR1")
 
     def run(self, start_frame: int = 0, num_frames: int = -1):
+        """执行完整的 HaWoR→R1 映射管线
+
+        8个步骤:
+        1. 加载 HaWoR 数据
+        2. 确定坐标变换
+        3. 初始化 Dex Retargeting
+        4. 分析手部轨迹
+        5. 放置 R1 机器人
+        6. 计算工作空间映射
+        7. 初始化 RelaxedIK
+        8. 预计算 + 平滑 + 渲染
+
+        Args:
+            start_frame: 起始帧索引
+            num_frames: 处理帧数 (-1 表示全部)
+        """
         self.logger.info("=" * 80)
         self.logger.info("Hawor 手部姿态 → R1 机器人映射执行")
         self.logger.info("=" * 80)
@@ -551,6 +743,22 @@ class HaworR1Pipeline:
         self.logger.info("=" * 80)
 
     def _determine_coord_transform(self, hawor_data, mano_layer, start_frame, num_frames):
+        """自动检测坐标系类型并返回变换矩阵
+
+        检测策略:
+        - 如果手腕Z坐标绝对值远大于X/Y → 相机坐标系 (Z=深度), 需要变换
+        - 如果手腕Z运动范围远大于X/Y → 相机坐标系, 需要变换
+        - 否则 → Z-up 坐标系, 不需要变换
+
+        Args:
+            hawor_data: load_hawor_data() 返回的字典
+            mano_layer: MANOLayer 实例
+            start_frame: 起始帧索引
+            num_frames: 帧数
+
+        Returns:
+            np.ndarray: (3, 3) 坐标变换矩阵 (R_HAWOR2SAPIEN 或 np.eye(3))
+        """
         if self.coord_transform == "none":
             return np.eye(3)
         elif self.coord_transform == "hawor2sapien":
@@ -600,6 +808,23 @@ class HaworR1Pipeline:
             return np.eye(3)
 
     def _analyze_hand_trajectory(self, hawor_data, mano_layer, R_coord, start_frame, num_frames):
+        """分析手部轨迹, 计算手腕位置统计量
+
+        遍历所有有效帧, 计算 MANO FK 得到手腕位置,
+        然后统计质心、范围、标准差等。
+
+        Args:
+            hawor_data: load_hawor_data() 返回的字典
+            mano_layer: MANOLayer 实例
+            R_coord: 坐标变换矩阵
+            start_frame: 起始帧索引
+            num_frames: 帧数
+
+        Returns:
+            tuple: (wrist_positions, hand_stats)
+                - wrist_positions: list of (3,) 手腕位置
+                - hand_stats: dict 包含 centroid, range, min, max, std, num_valid
+        """
         wrist_positions = []
         for i in range(num_frames):
             global_idx = start_frame + i
@@ -628,6 +853,21 @@ class HaworR1Pipeline:
         }
 
     def _compute_workspace_mapping(self, hand_stats, base_link_p, base_link_R):
+        """计算工作空间映射偏移量
+
+        将手腕轨迹质心映射到臂舒适工作空间:
+        1. 计算舒适目标点 (base_link_R @ COMFORT_TARGET_IN_BASE + base_link_p)
+        2. mapping_offset = 舒适目标点 - 手腕质心 (把手腕拉到舒适区域)
+        3. safety_offset = 沿 base→gripper 方向偏移 SAFETY_DISTANCE (避免重叠)
+
+        Args:
+            hand_stats: _analyze_hand_trajectory() 返回的统计量
+            base_link_p: (3,) arm_base_link 位置
+            base_link_R: (3, 3) arm_base_link 旋转矩阵
+
+        Returns:
+            dict: 包含 mapping_offset, safety_offset, comfort_target 等
+        """
         centroid = hand_stats["centroid"]
         comfort_target_world = base_link_R @ COMFORT_TARGET_IN_BASE + base_link_p
         mapping_offset = comfort_target_world - centroid
@@ -663,6 +903,32 @@ class HaworR1Pipeline:
         base_link_R_inv,
         mapping_info,
     ):
+        """预计算所有帧的 qpos 序列
+
+        流程:
+        1. 找到第一个有效帧, 求解 IK 作为起始点
+        2. IK 预热 (对第一个目标迭代200次)
+        3. Warmup 阶段: smoothstep 插值从当前关节角过渡到第一帧
+        4. 逐帧: MANO FK → Retargeting → IK → 低通滤波 → qpos
+
+        Args:
+            hawor_data: HaWoR 数据
+            start_frame: 起始帧
+            num_frames: 帧数
+            mano_layer: MANOLayer
+            R_coord: 坐标变换矩阵
+            retargeting: DexRetargeting 实例
+            retarget2sapien: retargeting→sapien 关节映射
+            ik_solver: RelaxedIK 求解器
+            r1_robot: SAPIEN R1 机器人实例
+            right_arm_indices: 右臂关节索引列表
+            base_link_p: arm_base_link 位置
+            base_link_R_inv: arm_base_link 逆旋转矩阵
+            mapping_info: _compute_workspace_mapping() 的输出
+
+        Returns:
+            tuple: (qpos_sequence, ik_targets_world, eval_data)
+        """
         qpos_sequence = []
         ik_targets_world = []
         eval_data = {"ik_errors": [], "joint_values": [], "out_of_reach": 0}
@@ -846,6 +1112,27 @@ class HaworR1Pipeline:
         viewer, start_frame, right_ee_link,
         base_link_p, base_link_R_inv, mapping_info, robot_root_pos,
     ):
+        """使用预计算的 qpos 序列渲染视频
+
+        每帧: set_qpos → scene.step() → 渲染 → 叠加信息文字 → 写入视频
+        叠加信息: 帧号、EE-IK 误差 (cm)
+
+        Args:
+            scene: SAPIEN 场景
+            r1_robot: R1 机器人实例
+            qpos_sequence: 预计算的 qpos 列表
+            ik_targets_world: IK 目标位置列表
+            viewer: SAPIEN Viewer
+            start_frame: 起始帧
+            right_ee_link: 右末端连杆
+            base_link_p: arm_base_link 位置
+            base_link_R_inv: arm_base_link 逆旋转矩阵
+            mapping_info: 工作空间映射信息
+            robot_root_pos: 机器人根位置
+
+        Returns:
+            dict: 渲染评估数据
+        """
         self.logger.info(f"\n渲染视频 → {self.output_video}  [视角: {self.view}]")
 
         active_joints = r1_robot.get_active_joints()
@@ -868,7 +1155,7 @@ class HaworR1Pipeline:
         )
         camera.set_local_pose(sapien.Pose(camera_pos.tolist(), camera_quat))
 
-        render_fps = int(self.fps * 0.75)
+        render_fps = self.fps
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(
             self.output_video, fourcc, render_fps,
@@ -931,6 +1218,14 @@ class HaworR1Pipeline:
 
 
 def _setup_logger(output_video: str) -> logging.Logger:
+    """配置日志记录器: 同时输出到控制台和日志文件
+
+    Args:
+        output_video: 输出视频路径 (用于生成日志文件名)
+
+    Returns:
+        logging.Logger: 配置好的日志记录器
+    """
     logger = logging.getLogger("HaworR1")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
@@ -951,6 +1246,13 @@ def _setup_logger(output_video: str) -> logging.Logger:
 
 
 def main():
+    """命令行入口: HaWoR 手部姿态 → R1 机器人映射
+
+    用法示例:
+      python 03_track_robot.py --hawor-dir /path/to/hawor
+      python 03_track_robot.py --hawor-dir /path/to/hawor --view front --num-frames 100
+      python 03_track_robot.py --hawor-dir /path/to/hawor --no-render  # 仅输出qpos
+    """
     parser = argparse.ArgumentParser(
         description="Hawor 手部姿态 → R1 机器人映射执行"
     )

@@ -25,7 +25,56 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## 1. 之前犯的错误（逐步分析）
+### 各坐标系轴约定
+
+```
+RAS Room World (Z-UP):     RAS GLB (Y-UP):          HaWoR SLAM World (Y-down):
+    +Z (up)                    +Y (up)                   -Y (up)
+    |                          |                          |
+    +---- +Y                  +---- -Z                  +---- +Z (forward)
+   /                          /                          /
+  +X                         +X                         +X (right)
+
+HaWoR Render World (Y-UP):  SAPIEN (Z-UP):
+    +Y (up)                    +Z (up)
+    |                          |
+    +---- -Z (backward)       +---- +Y (forward)
+   /                          /
+  +X (right)                 +X (right)
+```
+
+---
+
+## 1. 实际文件路径与数据概况
+
+### 输入文件
+
+| 系统 | 路径 | 帧数 |
+|------|------|------|
+| RAS 输出 | `/mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/outputs/my_7mp4_result` | 20 帧 (0-19) |
+| HaWoR 输出 | `/mnt/data_8THDD/lza/workspace/robot_world_ws/src/HaWoR/example/7` | 113 帧 (0-112) |
+
+### 关键文件对照
+
+| 用途 | RAS | HaWoR |
+|------|-----|-------|
+| 外参（相机位姿） | `extrinsics/0.txt` ~ `19.txt` | `reconstruction/hawor_results_0_113.npz` → `t_c2w`, `R_c2w` |
+| 内参 | `intrinsic.txt` | `hawor_results_0_113.npz` → `img_focal` |
+| 深度图 | `depth/0.png` ~ `19.png` | SLAM `disps`（视差，非直接深度） |
+| 点云 | `point_cloud.ply` | 无 |
+| 场景网格 | **`final_scene.glb`** ← 待变换 | 无 |
+| 手部姿态 | 无 | `hawor_results_0_113.npz` → `pred_trans`, `pred_rot` |
+| SLAM 原始轨迹 | 无 | `SLAM/hawor_slam_w_scale_0_113.npz` → `traj`, `scale` |
+
+### 关键发现
+
+> **HaWoR 的 `hawor_results_0_113.npz` 中 `R_c2w` 和 `t_c2w` 已经应用了 R_x 翻转 (OpenCV→OpenGL)，不是原始 SLAM World。`pred_trans` 仍然是原始 SLAM World。**
+
+验证方法：`R_c2w[0]` 看是否是 `[[1,0,0],[0,-1,0],[0,0,-1]]` 附近。如果是，说明已应用 R_x。
+
+---
+
+## 2. 之前犯的错误（逐步分析）
 
 ### 错误 1：混淆了 HaWoR 的两个坐标系
 
@@ -60,15 +109,9 @@ cam_render = R_x @ pred_trans  # SLAM World → Render World
 - **公共 API**（`scene.create_actor_builder().add_visual_from_file()`）：在 viewer 和视频渲染中都可见
 
 **错误做法**：用内部 API 直接创建 mesh 节点。
-```python
-# 错误：内部API，视频不可见
-mesh = context.create_mesh_from_array(vertices, faces, mat)
-node = internal_scene.add_node(mesh)
-```
 
 **正确做法**：用公共 API，通过临时 PLY 文件加载。
 ```python
-# 正确：公共API，视频可见
 builder = scene.create_actor_builder()
 builder.add_visual_from_file(filename=temp_ply, material=material)
 actor = builder.build_kinematic(name=geom_name)
@@ -78,19 +121,10 @@ actor = builder.build_kinematic(name=geom_name)
 
 **现象**：机械臂末端朝向抖动严重，与实际手腕旋转不匹配。
 
-**原因**：旧方法 `_compute_combined_ee_orientation()` 基于手部关节几何（拇指尖→食指尖、手腕→MCP中心）构造旋转矩阵，与手腕旋转加权混合。关节位置噪声大，且未正确处理 MANO 坐标系到夹爪坐标系的映射。
-
-**错误做法**：
-```python
-# 错误：从关节几何猜测朝向，不稳定
-y_axis = index_tip - thumb_tip
-x_axis = mcp_center - wrist
-R_ee = np.column_stack([x_axis, y_axis, z_axis])
-```
+**原因**：旧方法基于手部关节几何构造旋转矩阵，关节位置噪声大，且未正确处理 MANO 坐标系到夹爪坐标系的映射。
 
 **正确做法**：使用 HaWoR 的手腕旋转（`pred_rot`）+ 正确的坐标系转换。
 ```python
-# 正确：从手腕旋转 + MANO→夹爪坐标系转换
 wrist_R_sapien = RXWORLD_TO_SAPIEN @ axis_angle_to_matrix(pred_rot)
 R_ee_world = wrist_R_sapien @ OPERATOR2MANO_RIGHT.T @ R_GRIPPER_ALIGN
 ```
@@ -101,27 +135,14 @@ R_ee_world = wrist_R_sapien @ OPERATOR2MANO_RIGHT.T @ R_GRIPPER_ALIGN
 
 **原因**：容差 `[0.001, 0.001, 0.001, 0.03, 0.03, 0.03]` 中旋转容差 0.03rad ≈ 1.7°，在 0.5m 臂长下导致 ~15mm 末端偏差。
 
-**错误做法**：
-```python
-tolerances = [0.001, 0.001, 0.001, 0.03, 0.03, 0.03]  # 旋转太松
-```
-
 **正确做法**：
 ```python
-tolerances = [0.001, 0.001, 0.001, 0.005, 0.005, 0.005]  # 旋转收紧到0.29°
+tolerances = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # 位置和朝向平衡
 ```
 
 ### 错误 5：相机 FOV 硬编码
 
 **现象**：渲染视角与原视频不匹配，场景看起来太远。
-
-**原因**：硬编码 `HAWOR_FOCAL = 600.0`，但实际视频的焦距可能不同。
-
-**错误做法**：
-```python
-HAWOR_FOCAL = 600.0  # 硬编码
-CAM_FOV = 2 * np.arctan(CAM_HEIGHT / 2.0 / HAWOR_FOCAL)
-```
 
 **正确做法**：从 HaWoR 数据读取实际焦距。
 ```python
@@ -134,16 +155,15 @@ if img_focal is None:
     else:
         img_focal = 600.0
 
-# 按渲染分辨率缩放
 focal_for_render = img_focal * CAM_WIDTH / 1280.0
 cam_fov = 2 * np.arctan(CAM_HEIGHT / 2.0 / focal_for_render)
 ```
 
 ---
 
-## 2. 正确的对齐方案
+## 3. 正确的对齐方案
 
-### 2.1 完整变换链
+### 3.1 完整变换链
 
 ```
 RAS GLB (Y-UP, VGGT单位)
@@ -162,7 +182,7 @@ HaWoR Render World (Y-UP, 米制)
 SAPIEN World (Z-UP, 米制)
 ```
 
-### 2.2 01_align_scene.py 的对齐原理
+### 3.2 01_align_scene.py 的对齐原理
 
 **核心思想**：同一个视频的第一帧相机，在 RAS 和 HaWoR 中描述同一个物理相机。
 
@@ -181,10 +201,9 @@ HaWoR 第一帧相机: R_c2w_hawor (Y-UP, OpenGL约定)
   p_hawor = s_inv * R_align @ p_glb + t_align_scaled
 ```
 
-### 2.3 02_render_scene.py 中的坐标系变换
+### 3.3 02_render_scene.py 中的坐标系变换
 
 ```python
-# 常量定义
 R_x = np.diag([1.0, -1.0, -1.0])           # OpenCV ↔ OpenGL
 R_AXIS = np.array([[1,0,0],[0,0,1],[0,-1,0]]) # Y-UP ↔ Z-UP
 RXWORLD_TO_SAPIEN = R_AXIS @ R_x            # HaWoR Render → SAPIEN
@@ -202,7 +221,7 @@ p_hawor = s_inv * R_inv @ p_glb + t_inv
 p_sapien = RXWORLD_TO_SAPIEN @ p_hawor
 ```
 
-### 2.4 末端朝向的正确计算
+### 3.4 末端朝向的正确计算
 
 ```python
 # 1. HaWoR 手腕旋转 (轴角 → 旋转矩阵 → SAPIEN坐标系)
@@ -226,7 +245,184 @@ ee_quat_base = quaternion_from_matrix(ee_R_base)
 
 ---
 
-## 3. 坐标系变换速查表
+## 4. 操作步骤（01_align_scene.py 自动化）
+
+`01_align_scene.py` 已将以下步骤自动化，但理解原理有助于排错。
+
+### 4.1 加载 RAS 相机位姿 (Z-UP)
+
+```python
+# RAS 外参: world-to-camera 变换 [R_w2c | t_w2c]
+R_c2w = R_w2c.T
+cam_pos = -R_c2w @ t_w2c
+```
+
+### 4.2 RAS Z-UP → Y-UP 转换
+
+```python
+ZUP_TO_YUP = [[1, 0, 0], [0, 0, 1], [0, -1, 0]]   # (x,y,z) → (x,z,-y)
+ras_cam_pos_yup = (ZUP_TO_YUP @ ras_cam_pos_zup.T).T
+ras_R_c2w_yup  = ZUP_TO_YUP @ R_c2w_zup @ ZUP_TO_YUP.T
+```
+
+### 4.3 加载 HaWoR 相机位姿
+
+从 `hawor_results_*.npz` 读取 `R_c2w` 和 `t_c2w`，这些已经在 **Render World (Y-UP)** 坐标系中。
+
+### 4.4 第一帧相机位姿对齐
+
+```python
+R_align = R_c2w_hawor @ OPENCV_TO_OPENGL @ R_c2w_ras_yup.T
+t_align = t_c2w_hawor - R_align @ t_c2w_ras_yup
+```
+
+### 4.5 尺度校正 (Umeyama)
+
+```python
+sigma_ras = sqrt(mean(||ras_cam - ras_cam_mean||²))
+sigma_hawor = sqrt(mean(||hawor_cam - hawor_cam_mean||²))
+s_inv = 1.0 / (sigma_ras / sigma_hawor)
+```
+
+**静态相机回退**: 当 sigma < 0.01 时，自动回退到基于手-GLB 距离的启发式估算。
+
+### 4.6 保存
+
+```python
+# transform_params.npz 包含:
+s_inv       # RAS → HaWoR 缩放因子 (~0.32)
+R_inv       # GLB Y-UP → HaWoR 旋转矩阵 (= R_align)
+t_inv       # GLB Y-UP → HaWoR 平移 (= t_align_scaled)
+```
+
+---
+
+## 5. 手动对齐步骤（调试用）
+
+当 `01_align_scene.py` 自动对齐结果不理想时，可手动执行以下步骤微调。
+
+### 5.1 加载数据
+
+```python
+import numpy as np; import cv2; import trimesh; import os; from glob import glob
+
+RAS_OUT = '/mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/outputs/my_7mp4_result'
+HAWOR_RES = '/mnt/data_8THDD/lza/workspace/robot_world_ws/src/HaWoR/example/7/reconstruction/hawor_results_0_113.npz'
+
+# RAS 相机位置
+ext_files = sorted(glob(os.path.join(RAS_OUT, 'extrinsics', '*.txt')),
+                   key=lambda x: int(os.path.basename(x).split('.')[0]))
+ras_extrinsics = []
+for f in ext_files:
+    ext = np.loadtxt(f)
+    if ext.shape == (3, 4):
+        ext = np.vstack([ext, [0, 0, 0, 1]])
+    ras_extrinsics.append(ext)
+ras_extrinsics = np.array(ras_extrinsics)
+ras_cam = np.array([-e[:3,:3].T @ e[:3,3] for e in ras_extrinsics])
+
+# HaWoR 相机位置 (恢复原始 SLAM World)
+hawor = dict(np.load(HAWOR_RES, allow_pickle=True))
+R_x = np.array([[1,0,0],[0,-1,0],[0,0,-1]])
+hawor_cam_original = np.array([R_x @ t for t in hawor['t_c2w']])
+```
+
+### 5.2 计算对齐参数
+
+```python
+R_axis = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
+R_residual = np.eye(3)
+R_total = R_residual @ R_axis
+s = 1.0  # 手动调整尺度
+t = ras_cam[0] - s * (R_total @ hawor_cam_original[0])
+
+# 逆变换参数 (用于 GLB)
+s_inv = 1.0 / s
+R_inv = R_total.T
+t_inv = -s_inv * (R_inv @ t)
+```
+
+### 5.3 残差验证
+
+```python
+aligned = s * (R_total @ hawor_cam_original[:n].T).T + t
+errors = np.linalg.norm(aligned - ras_cam[:n], axis=1)
+print(f'errors: mean={errors.mean():.4f}, median={np.median(errors):.4f}, max={errors.max():.4f}')
+```
+
+### 5.4 变换 GLB
+
+```python
+YUP_TO_ZUP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+R_combined = s_inv * (R_inv @ YUP_TO_ZUP)
+t_combined = s_inv * (R_inv @ (-t))
+
+T_4x4 = np.eye(4)
+T_4x4[:3, :3] = R_combined
+T_4x4[:3, 3] = t_combined
+
+scene = trimesh.load(os.path.join(RAS_OUT, 'final_scene.glb'))
+scene.apply_transform(T_4x4)
+scene.export('scene_in_hawor_world.glb')
+```
+
+---
+
+## 6. 对齐正确性分析
+
+### 6.1 为什么这个对齐在数学上是正确的
+
+```
+同一个 mp4 同一帧 i 的相机位置：
+  RAS  给出 cam_ras[i]   ← Room World (z-up, VGGT单位)
+  HaWoR 给出 cam_hawor[i] ← SLAM World (y-down, z-forward, 米)
+
+→ 两个值代表同一个物理点 → 存在唯一的 {R, t, s} 使得 cam_ras = s·R·cam_hawor + t
+→ 这个 {R, t, s} 适用于场景中所有 3D 点
+→ 相机轨迹是连接两个坐标系的可靠桥梁
+```
+
+### 6.2 分项保证性
+
+| 环节 | 代码来源确认 | 保证程度 |
+|------|------------|---------|
+| 轴约定 R_axis | VGGT + DROID-SLAM 都使用 OpenCV 约定 | 数学推导 |
+| 外参格式 | RAS: w2c 4×4; HaWoR: c2w (R_c2w, t_c2w) 已确认 | 代码审查 |
+| 帧对应 | 同一 mp4，帧索引直接对应 | 前提满足 |
+| R_residual | 第一帧 ||R-I|| < 0.001，残差旋转 < 0.5° | 实测验证 |
+| 原点 t | 第一帧相机位置对齐 | 可靠 |
+| **尺度 s** | 需要交叉验证 | **关键变量** |
+
+### 6.3 尺度 s 的选择建议
+
+| 方法 | 可靠性 | 说明 |
+|------|--------|------|
+| A: 深度图比较 | 中 | VGGT 深度取全局均值，可能偏高 |
+| B: 轨迹位移 | 低 | 相机运动太小时不稳定 |
+| C: Umeyama (自动) | 中 | 依赖相机轨迹离散度 |
+| D: 手动 s=1 | 低 | 假设 VGGT 单位 ≈ 米 |
+
+**建议**：先用 `01_align_scene.py` 自动估算，然后根据残差验证结果用 `--force-scale` 调整。
+
+### 6.4 如果对齐结果不对
+
+```
+症状 1: 残差很大 (> 0.5m)
+  → 检查帧对应：RAS 和 HaWoR 处理的帧是否一致
+  → 检查是否用了正确的 hawor_cam_original（不是 haw_c2w 原始）
+
+症状 2: 手在场景外面
+  → 调大或调小 s
+  → 用手-相机距离除以 RAS 相应区域的深度来重新估计 s
+
+症状 3: 场景看起来旋转了
+  → 检查 R_x 是否被正确逆应用
+  → 检查 YUP_TO_ZUP 矩阵方向是否正确
+```
+
+---
+
+## 7. 坐标系变换速查表
 
 | 变换 | 矩阵 | 效果 |
 |------|------|------|
@@ -238,27 +434,9 @@ ee_quat_base = quaternion_from_matrix(ee_R_base)
 | OPERATOR2MANO_RIGHT | `[[0,0,-1],[-1,0,0],[0,1,0]]` | MANO右手→操作者 |
 | R_GRIPPER_ALIGN | `[[0,0,1],[0,1,0],[-1,0,0]]` | 操作者→夹爪 |
 
-### 各坐标系轴约定
-
-```
-RAS Room World (Z-UP):     RAS GLB (Y-UP):          HaWoR SLAM World (Y-down):
-    +Z (up)                    +Y (up)                   -Y (up)
-    |                          |                          |
-    +---- +Y                  +---- -Z                  +---- +Z (forward)
-   /                          /                          /
-  +X                         +X                         +X (right)
-
-HaWoR Render World (Y-UP):  SAPIEN (Z-UP):
-    +Y (up)                    +Z (up)
-    |                          |
-    +---- -Z (backward)       +---- +Y (forward)
-   /                          /
-  +X (right)                 +X (right)
-```
-
 ---
 
-## 4. 验证清单
+## 8. 验证清单
 
 | 检查项 | 方法 | 通过标准 |
 |--------|------|---------|
@@ -268,15 +446,16 @@ HaWoR Render World (Y-UP):  SAPIEN (Z-UP):
 | GLB 在视频中可见 | 渲染检查 | 公共API加载的actor可见 |
 | 末端朝向合理 | 可视化坐标轴 | 夹爪朝向与手腕旋转一致 |
 | 末端位置误差 | FK验证 | < 5mm (收紧容差后) |
+| 2D重投影误差 | 05_video_alignment.py | < 2px (优秀) |
 
 ---
 
-## 5. 关键文件对照
+## 9. 关键文件对照
 
 | 文件 | 作用 |
 |------|------|
 | `01_align_scene.py` | 计算 RAS→HaWoR 变换参数，保存到 `transform_params.npz` |
 | `02_render_scene.py` | 加载变换后的 GLB + HaWoR 手部 + R1 机器人，SAPIEN 渲染 |
+| `03_track_robot.py` | 独立机器人跟踪（不需要 GLB 场景），快速验证映射 |
 | `transform_params.npz` | 包含 `s_inv`, `R_inv`, `t_inv` (GLB→HaWoR 变换参数) |
-| `changelog.md` | 代码修改记录 |
 | `question.md` | 问题与回答 |

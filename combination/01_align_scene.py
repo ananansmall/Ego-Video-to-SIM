@@ -58,6 +58,18 @@ RXWORLD_TO_SAPIEN = R_AXIS @ R_X
 
 
 def umeyama_scale(src_pts, dst_pts):
+    """使用 Umeyama 方法计算两组点之间的尺度比
+
+    通过比较两组点的标准差之比来估计尺度因子。
+    当相机近似静态时(标准差很小), 该方法不可靠。
+
+    Args:
+        src_pts: 源点集, shape=(N, 3), 即 HaWoR 相机位置
+        dst_pts: 目标点集, shape=(N, 3), 即 RAS 相机位置(变换到 HaWoR 坐标系后)
+
+    Returns:
+        float: 尺度比 sigma_dst / sigma_src, RAS/HaWoR 的尺度比
+    """
     src_centered = src_pts - src_pts.mean(axis=0)
     dst_centered = dst_pts - dst_pts.mean(axis=0)
     sigma_src = np.sqrt(np.mean(np.sum(src_centered ** 2, axis=1)))
@@ -68,6 +80,19 @@ def umeyama_scale(src_pts, dst_pts):
 
 
 def main():
+    """对齐 RAS GLB 场景到 HaWoR 坐标系的主函数
+
+    执行7个步骤:
+      1. 加载 RAS 相机位姿 (Z-UP 坐标系)
+      2. 转换 RAS 相机到 Y-UP (与 GLB 一致)
+      3. 加载 HaWoR 第一帧相机位姿
+      4. 第一帧相机位姿对齐 (计算 R_align, t_align)
+      5. Umeyama 尺度校正 (计算 s_inv)
+      6. 验证对齐 (手-GLB距离, 方向点积)
+      7. 保存变换参数到 transform_params.npz
+
+    最终变换公式: p_hawor = s_inv * R_inv @ p_glb + t_inv
+    """
     parser = argparse.ArgumentParser(
         description="基于第一帧相机位姿对齐 RAS GLB 到 HaWoR 坐标系"
     )

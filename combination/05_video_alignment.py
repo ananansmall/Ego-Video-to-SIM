@@ -99,6 +99,14 @@ JOINT_TO_FINGER = [0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5
 
 
 def _find_reconstruction_file(hawor_path):
+    """在 HaWoR 目录中查找重建结果 npz 文件
+
+    Args:
+        hawor_path: HaWoR 输出目录路径
+
+    Returns:
+        Path: 找到的 npz 文件路径，或 None
+    """
     rec_dir = hawor_path / "reconstruction"
     if not rec_dir.exists():
         npz_files = list(hawor_path.glob("*.npz"))
@@ -111,6 +119,14 @@ def _find_reconstruction_file(hawor_path):
 
 
 def _detect_hand_idx(hawor_path):
+    """自动检测 HaWoR 数据中哪只手是活跃的
+
+    Args:
+        hawor_path: HaWoR 输出目录路径
+
+    Returns:
+        int: 手部索引 (0=左手, 1=右手)，或 None
+    """
     cam_dir = Path(hawor_path) / "cam_space"
     if cam_dir.exists():
         detected = set()
@@ -129,6 +145,16 @@ def _detect_hand_idx(hawor_path):
 
 
 def load_hawor_data(hawor_dir, hand_idx=0):
+    """加载 HaWoR 手部重建数据 (含相机轨迹)
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+        hand_idx: 手部索引 (0=左手, 1=右手)
+
+    Returns:
+        dict: 包含 pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid,
+              R_c2w, t_c2w, img_focal
+    """
     hawor_path = Path(hawor_dir)
     rec_file = _find_reconstruction_file(hawor_path)
     if rec_file is None:
@@ -157,6 +183,18 @@ def load_hawor_data(hawor_dir, hand_idx=0):
 
 
 def load_cam_space_data(hawor_dir, hand_idx=0):
+    """加载 HaWoR 相机空间数据 (MANO 关节在相机坐标系下的3D位置)
+
+    从 hawor_dir/cam_space/<hand_idx>/*.json 加载,
+    包含 init_trans, init_root_orient, init_hand_pose, init_betas。
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+        hand_idx: 手部索引
+
+    Returns:
+        dict: 包含 init_trans, init_root_orient, init_hand_pose, init_betas, 或 None
+    """
     cam_dir = Path(hawor_dir) / "cam_space" / str(hand_idx)
     if not cam_dir.exists():
         return None
@@ -177,6 +215,16 @@ def load_cam_space_data(hawor_dir, hand_idx=0):
 
 
 def load_video_frames(hawor_dir):
+    """加载原始视频帧 (从 hawor_dir/extracted_images/)
+
+    Args:
+        hawor_dir: HaWoR 输出目录路径
+
+    Returns:
+        tuple: (frames, img_shape) 或 (None, None)
+            - frames: 视频帧列表 (BGR)
+            - img_shape: (height, width)
+    """
     img_dir = Path(hawor_dir) / "extracted_images"
     if not img_dir.exists():
         return None, None
@@ -198,6 +246,14 @@ def load_video_frames(hawor_dir):
 
 
 def rotation_matrix_to_angle_axis(R):
+    """将旋转矩阵转换为轴角表示
+
+    Args:
+        R: (3, 3) 或 (N, 3, 3) 旋转矩阵
+
+    Returns:
+        np.ndarray: (3,) 或 (N, 3) 轴角向量
+    """
     if R.ndim == 2:
         R = R[np.newaxis]
     angle_axis = np.zeros((R.shape[0], 3), dtype=np.float64)
@@ -223,6 +279,19 @@ def rotation_matrix_to_angle_axis(R):
 
 
 def compute_mano_joints_cam_space(cam_data, frame_idx, mano_layer_cam=None):
+    """在相机坐标系下计算 MANO 关节位置
+
+    使用 cam_space 数据中的旋转矩阵和平移向量,
+    通过 MANO FK 计算关节在相机坐标系下的3D位置。
+
+    Args:
+        cam_data: load_cam_space_data() 返回的字典
+        frame_idx: 帧索引
+        mano_layer_cam: MANOLayer 实例
+
+    Returns:
+        tuple: (vertices, joints) 或 (None, None)
+    """
     init_trans = cam_data["init_trans"][frame_idx]
     init_root_orient = cam_data["init_root_orient"][frame_idx]
     init_hand_pose = cam_data["init_hand_pose"][frame_idx]
@@ -241,6 +310,22 @@ def compute_mano_joints_cam_space(cam_data, frame_idx, mano_layer_cam=None):
 
 
 def project_3d_to_2d(points_3d_cam, focal, cx, cy):
+    """将相机坐标系下的3D点投影到2D图像平面
+
+    使用针孔相机模型: x = f*X/Z + cx, y = f*Y/Z + cy
+    只投影 Z > 0.01 的点 (在相机前方)。
+
+    Args:
+        points_3d_cam: (N, 3) 相机坐标系下的3D点
+        focal: 焦距 (像素)
+        cx: 主点 X (像素)
+        cy: 主点 Y (像素)
+
+    Returns:
+        tuple: (pts_2d, valid)
+            - pts_2d: (N, 2) 2D投影坐标, 无效点为 -1
+            - valid: (N,) 有效标记
+    """
     valid = points_3d_cam[:, 2] > 0.01
     pts_2d = np.full((len(points_3d_cam), 2), -1.0)
     pts_2d[valid, 0] = focal * points_3d_cam[valid, 0] / points_3d_cam[valid, 2] + cx
@@ -249,6 +334,18 @@ def project_3d_to_2d(points_3d_cam, focal, cx, cy):
 
 
 def world_to_cam_hawor(points_world, R_c2w, t_c2w):
+    """将世界坐标系下的点转换到 HaWoR 相机坐标系
+
+    变换链: world → SLAM world (R_x) → camera (R_w2c, t_w2c)
+
+    Args:
+        points_world: (N, 3) 世界坐标系下的点
+        R_c2w: (3, 3) camera-to-world 旋转矩阵
+        t_c2w: (3,) camera-to-world 平移向量
+
+    Returns:
+        np.ndarray: (N, 3) 相机坐标系下的点
+    """
     R_w2c = R_c2w.T
     t_w2c = -R_c2w.T @ t_c2w
     points_world_slam = (R_x @ points_world.T).T
@@ -257,6 +354,20 @@ def world_to_cam_hawor(points_world, R_c2w, t_c2w):
 
 
 def compute_reprojection_error(joints_2d_gt, joints_2d_sim, valid_mask=None):
+    """计算2D重投影误差
+
+    比较真值2D关节和仿真2D关节之间的欧氏距离。
+
+    Args:
+        joints_2d_gt: (21, 2) 真值2D关节坐标
+        joints_2d_sim: (21, 2) 仿真2D关节坐标
+        valid_mask: (21,) 有效标记, None则自动判断
+
+    Returns:
+        tuple: (mean_error, info_dict)
+            - mean_error: 平均误差 (像素)
+            - info_dict: 包含 mean, median, max, per_joint, wrist_err, fingertip_err
+    """
     if valid_mask is None:
         valid_mask = (joints_2d_gt[:, 0] > 0) & (joints_2d_sim[:, 0] > 0)
     if valid_mask.sum() == 0:
@@ -275,6 +386,18 @@ def compute_reprojection_error(joints_2d_gt, joints_2d_sim, valid_mask=None):
 
 
 def draw_2d_skeleton(img, joints_2d, valid, color=(0, 255, 0), radius=4, thickness=2):
+    """在图像上绘制2D手部骨架
+
+    绘制21个关节点和20条骨架线, 每根手指用不同颜色。
+
+    Args:
+        img: BGR 图像 (原地修改)
+        joints_2d: (21, 2) 2D关节坐标
+        valid: (21,) 有效标记
+        color: 绘制颜色, "auto" 则按手指分组着色
+        radius: 关键点半径
+        thickness: 骨架线宽度
+    """
     for i, (x, y) in enumerate(joints_2d):
         if not valid[i] or x < 0 or y < 0:
             continue
@@ -294,6 +417,16 @@ def draw_2d_skeleton(img, joints_2d, valid, color=(0, 255, 0), radius=4, thickne
 
 
 def overlay_sim_on_video(video_frame, sim_frame, alpha=0.5):
+    """将仿真帧半透明叠加到原始视频帧上
+
+    Args:
+        video_frame: 原始视频帧 (BGR)
+        sim_frame: 仿真渲染帧 (BGR)
+        alpha: 仿真帧的透明度 (0=仅视频, 1=仅仿真)
+
+    Returns:
+        np.ndarray: 叠加后的帧
+    """
     h, w = video_frame.shape[:2]
     sim_resized = cv2.resize(sim_frame, (w, h))
     blended = cv2.addWeighted(video_frame, 1 - alpha, sim_resized, alpha, 0)
@@ -301,7 +434,22 @@ def overlay_sim_on_video(video_frame, sim_frame, alpha=0.5):
 
 
 class PoseOptimizer:
+    """基于2D重投影误差的3D位姿偏移优化器
+
+    通过最小化真值2D关节和仿真2D关节之间的距离,
+    优化3D平移偏移量, 使仿真结果与视频对齐。
+    """
+
     def __init__(self, hawor_data, cam_data, img_shape, mano_layer, logger=None):
+        """初始化位姿优化器
+
+        Args:
+            hawor_data: load_hawor_data() 返回的字典
+            cam_data: load_cam_space_data() 返回的字典
+            img_shape: (height, width) 图像尺寸
+            mano_layer: MANOLayer 实例
+            logger: 日志记录器
+        """
         self.hawor_data = hawor_data
         self.cam_data = cam_data
         self.img_h, self.img_w = img_shape
@@ -312,6 +460,14 @@ class PoseOptimizer:
         self.logger = logger or logging.getLogger("PoseOptimizer")
 
     def _get_gt_2d_joints(self, frame_idx):
+        """获取真值2D关节 (从 cam_space 数据投影)
+
+        Args:
+            frame_idx: 帧索引
+
+        Returns:
+            tuple: (joints_2d, valid) 或 (None, None)
+        """
         if self.cam_data is None:
             return None, None
 
@@ -324,6 +480,18 @@ class PoseOptimizer:
         return joints_2d, valid
 
     def _get_sim_2d_joints(self, frame_idx, offset_trans=np.zeros(3), offset_rot=np.zeros(3)):
+        """获取仿真2D关节 (从 HaWoR 世界坐标投影到相机)
+
+        流程: MANO FK → 世界坐标 → 相机坐标 → 2D投影
+
+        Args:
+            frame_idx: 帧索引
+            offset_trans: (3,) 平移偏移量 (优化参数)
+            offset_rot: (3,) 旋转偏移量 (暂未使用)
+
+        Returns:
+            tuple: (joints_2d, valid)
+        """
         pred_trans = self.hawor_data["pred_trans"][frame_idx].copy()
         pred_rot = self.hawor_data["pred_rot"][frame_idx].copy()
 
@@ -346,6 +514,15 @@ class PoseOptimizer:
         return joints_2d, valid
 
     def compute_frame_error(self, frame_idx, offset_trans=np.zeros(3)):
+        """计算单帧的2D重投影误差
+
+        Args:
+            frame_idx: 帧索引
+            offset_trans: (3,) 平移偏移量
+
+        Returns:
+            tuple: (mean_error, info_dict)
+        """
         gt_2d, gt_valid = self._get_gt_2d_joints(frame_idx)
         if gt_2d is None:
             return float("inf"), {}
@@ -356,6 +533,18 @@ class PoseOptimizer:
         return compute_reprojection_error(gt_2d, sim_2d, valid)
 
     def optimize_offset(self, frame_indices=None, method="L-BFGS-B"):
+        """优化3D平移偏移量, 最小化2D重投影误差
+
+        使用 scipy.optimize.minimize (L-BFGS-B) 优化3个平移参数,
+        目标函数为采样帧的平均2D重投影误差。
+
+        Args:
+            frame_indices: 采样帧索引列表, None则自动采样10帧
+            method: 优化方法 (默认 L-BFGS-B)
+
+        Returns:
+            tuple: (offset_trans, final_error, scipy_result)
+        """
         if frame_indices is None:
             n_total = len(self.hawor_data["pred_valid"])
             valid_frames = [i for i in range(n_total) if self.hawor_data["pred_valid"][i]]
@@ -395,6 +584,21 @@ class PoseOptimizer:
 
 
 def run_overlay(hawor_dir, sim_video_path, output_path, hand_idx=0, alpha=0.5, logger=None):
+    """模式1: 视频叠加对比 — 将仿真渲染半透明叠加到原始视频
+
+    在原始视频帧上绘制:
+    - 绿色骨架: 真值2D关节 (cam_space → 投影)
+    - 红色骨架: 仿真2D关节 (world → cam → 投影)
+    - 半透明叠加: 仿真视频帧
+
+    Args:
+        hawor_dir: HaWoR 输出目录
+        sim_video_path: 仿真视频路径
+        output_path: 输出视频路径
+        hand_idx: 手部索引
+        alpha: 叠加透明度
+        logger: 日志记录器
+    """
     logger = logger or logging.getLogger("overlay")
     logger.info("=" * 60)
     logger.info("模式: 视频叠加对比")
@@ -482,6 +686,24 @@ def run_overlay(hawor_dir, sim_video_path, output_path, hand_idx=0, alpha=0.5, l
 
 
 def run_reproj_analysis(hawor_dir, output_path, hand_idx=0, logger=None):
+    """模式2: 2D重投影误差分析 — 量化仿真与视频的对齐质量
+
+    逐帧计算:
+    1. 真值2D关节 (cam_space MANO FK → 投影)
+    2. 仿真2D关节 (world MANO FK → world_to_cam → 投影)
+    3. 两者之间的欧氏距离
+
+    输出: 误差统计 + 可视化视频 (绿=GT, 红=Sim)
+
+    Args:
+        hawor_dir: HaWoR 输出目录
+        output_path: 输出视频路径
+        hand_idx: 手部索引
+        logger: 日志记录器
+
+    Returns:
+        list: 每帧的误差信息字典, 或 None
+    """
     logger = logger or logging.getLogger("reproj_analysis")
     logger.info("=" * 60)
     logger.info("模式: 2D重投影误差分析")
@@ -620,6 +842,26 @@ def run_reproj_analysis(hawor_dir, output_path, hand_idx=0, logger=None):
 
 
 def run_optimize(hawor_dir, output_dir, hand_idx=0, logger=None):
+    """模式3: 位姿优化 — 基于2D重投影误差优化3D平移偏移
+
+    3个步骤:
+    1. 优化前误差分析
+    2. L-BFGS-B 优化平移偏移量
+    3. 验证优化结果 + 可视化
+
+    输出:
+    - pose_offset.npz: 优化后的偏移量
+    - optimization_vis.mp4: 优化前后对比视频 (绿=GT, 品红=Optimized)
+
+    Args:
+        hawor_dir: HaWoR 输出目录
+        output_dir: 输出目录
+        hand_idx: 手部索引
+        logger: 日志记录器
+
+    Returns:
+        np.ndarray: (3,) 优化后的平移偏移量, 或 None
+    """
     logger = logger or logging.getLogger("optimize")
     logger.info("=" * 60)
     logger.info("模式: 位姿优化")
@@ -742,6 +984,19 @@ def run_optimize(hawor_dir, output_dir, hand_idx=0, logger=None):
 
 
 def main():
+    """命令行入口: 视频-仿真对齐
+
+    支持四种模式:
+      overlay:         视频叠加对比 (快速诊断)
+      reproj_analysis: 2D重投影误差分析 (量化对齐)
+      optimize:        位姿优化 (优化3D偏移)
+      full:            完整流程 (叠加+分析+优化)
+
+    用法示例:
+      python 05_video_alignment.py --hawor-dir /path/to/hawor --mode overlay --sim-video output/videos/xxx.mp4
+      python 05_video_alignment.py --hawor-dir /path/to/hawor --mode reproj_analysis
+      python 05_video_alignment.py --hawor-dir /path/to/hawor --mode optimize
+    """
     import argparse
     parser = argparse.ArgumentParser(
         description="视频-仿真对齐: 2D重投影验证 + 视频叠加对比 + 位姿优化",
