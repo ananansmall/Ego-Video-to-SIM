@@ -86,13 +86,21 @@ R_x = np.diag([1.0, -1.0, -1.0])
 R_AXIS = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
 RXWORLD_TO_SAPIEN = R_AXIS @ R_x
 
+FLIP_Z_FOR_PHYSICS = False
+
 RIGHT_ARM_STARTING = [-1.5, 1.9508, -1.0809, -0.4438, 0.1709, 0.1985]
+
+# GLB 坐标系转换: Z-UP (RAS 导出常见) → Y-UP (SAPIEN 标准)
+ZUP_TO_YUP = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
 WARMUP_FRAMES = 30
 ARM_MAX_REACH = 0.713
-COMFORTABLE_REACH = 0.35
-COMFORT_TARGET_IN_BASE = np.array([0.30, 0.0, -0.30])
-BASE_TRACKING_RANGE = 0.04
+COMFORTABLE_REACH = 0.70  # 基座高度: 提高到 0.70m, 让机械臂垂直抓取, 不靠近桌面
+COMFORT_TARGET_IN_BASE = np.array([0.25, 0.0, -0.55])  # 舒适目标点: 更低更近, 机械臂垂直下垂
+BASE_TRACKING_RANGE = 0.0  # 固定底座: 不跟踪手腕
 BASE_TRACKING_ALPHA = 0.15
+# 分段固定基座参数
+BASE_CLUSTER_N = 3  # 将轨迹分为 N 个固定基座
+BASE_CLUSTER_TRANSITION_FRAMES = 10  # 基座间过渡帧数
 SAFETY_DISTANCE = 0.05
 LP_ALPHA_EE = 0.6
 LP_ALPHA_JOINT = 0.5
@@ -113,6 +121,29 @@ R_GRIPPER_ALIGN = np.array([
     [0, 1, 0],
     [-1, 0, 0],
 ], dtype=np.float64)
+
+
+def _detect_glb_up_axis(all_vertices):
+    """检测 GLB 坐标系是 Z-UP 还是 Y-UP (复制自 02_render_scene.py).
+
+    RAS 导出的 GLB 可能是 Y-UP 或 Z-UP.
+    检测启发式: Z-UP 场景中地板在 z=0, 物体在 z>0;
+                Y-UP 场景中地板在 y=0, 物体在 y>0.
+    """
+    FLOOR_THRESHOLD = 0.1
+    min_z = all_vertices[:, 2].min()
+    min_y = all_vertices[:, 1].min()
+    z_is_floor = abs(min_z) < FLOOR_THRESHOLD
+    y_is_floor = abs(min_y) < FLOOR_THRESHOLD
+    if z_is_floor and not y_is_floor:
+        return "z-up"
+    if y_is_floor and not z_is_floor:
+        return "y-up"
+    if z_is_floor and y_is_floor:
+        z_at_floor = (abs(all_vertices[:, 2]) < FLOOR_THRESHOLD).sum()
+        y_at_floor = (abs(all_vertices[:, 1]) < FLOOR_THRESHOLD).sum()
+        return "z-up" if z_at_floor > y_at_floor else "y-up"
+    return "y-up"
 
 CAM_WIDTH = 1920
 CAM_HEIGHT = 1080
@@ -275,57 +306,54 @@ def _generate_gripper_only_urdf(prefix="right"):
     return temp_path
 
 
-def _compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2):
-    """从 MANO 指尖向量解析计算夹爪 root 位姿和手指关节值
+def _compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, prefix="right"):
+    """从 MANO 3 个特征点计算夹爪 gripper_link 位姿和手指关节值
 
-    与 hand_track/render_gripper_only.py 中的实现一致。
-    机器人夹爪几何:
-      finger1 = root_pos + R @ (_FINGER1_ORIGIN + _FINGER1_AXIS * joint1)
-      finger2 = root_pos + R @ (_FINGER2_ORIGIN + _FINGER2_AXIS * joint2)
+    与 hand_track/render_gripper_only.py 的 _compute_analytical_gripper_pose 一致:
+    方法: 加权 SVD (Procrustes) + 匹配指尖中点
+      1. 从 MANO 指尖距离计算手指关节值
+      2. 用加权 SVD 找最近正交旋转矩阵, Y 轴 (开合方向) 权重更高,
+         优先保证开合方向精确 (因为开合方向直接影响指尖位置)
+      3. 匹配两个指尖的中点确定 gripper_link 位置
 
-    Returns:
-        root_pos: (3,) 位置
-        root_R: (3,3) 旋转矩阵
-        joint1, joint2: 手指关节值 [0, 0.05]
+    关键: MANO 的指向方向 (wrist→finger_mid) 和开合方向 (finger1→finger2)
+    通常不正交。当它们非正交时, 标准 SVD 会均等折中, 导致两个方向都不精确。
+    给 Y 轴更高权重可以优先保证开合方向精确, 从而最小化指尖位置误差。
     """
+    W_Y = 5.0  # Y 轴 (开合方向) 权重, 越大越优先保证开合方向精确
+
+    # 1. 计算手指关节值
     v_finger = mano_finger2 - mano_finger1
     finger_dist = np.linalg.norm(v_finger)
-    if finger_dist < 1e-6:
-        y_axis = np.array([0, 1, 0], dtype=np.float64)
-    else:
-        y_axis = v_finger / finger_dist
-
-    finger_mid = (mano_finger1 + mano_finger2) / 2
-    v_wrist = finger_mid - mano_wrist
-    wrist_dist = np.linalg.norm(v_wrist)
-    if wrist_dist < 1e-6:
-        x_axis = np.array([1, 0, 0], dtype=np.float64)
-    else:
-        x_axis = v_wrist / wrist_dist
-
-    # Gram-Schmidt 正交化
-    x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-    x_norm = np.linalg.norm(x_axis)
-    if x_norm < 1e-6:
-        x_axis = np.array([1, 0, 0], dtype=np.float64)
-        x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-        x_norm = np.linalg.norm(x_axis)
-        if x_norm < 1e-6:
-            x_axis = np.array([0, 0, 1], dtype=np.float64)
-            x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-            x_norm = np.linalg.norm(x_axis)
-    x_axis = x_axis / x_norm
-    z_axis = np.cross(x_axis, y_axis)
-    z_axis = z_axis / np.linalg.norm(z_axis)
-
-    root_R = np.column_stack([x_axis, y_axis, z_axis])
-
     required_open_sum = finger_dist - _FINGER_BASE_DIST
     joint1 = max(0.0, min(0.05, required_open_sum / 2))
     joint2 = max(0.0, min(0.05, required_open_sum / 2))
 
-    finger1_offset = _FINGER1_ORIGIN + _FINGER1_AXIS * joint1
-    root_pos = mano_finger1 - root_R @ finger1_offset
+    # 2. 加权 SVD 最近正交旋转
+    finger_mid = (mano_finger1 + mano_finger2) / 2
+    pointing = finger_mid - mano_wrist
+    pointing = pointing / max(np.linalg.norm(pointing), 1e-6)
+
+    y_sign = 1.0 if prefix == "right" else -1.0
+    opening = y_sign * v_finger / max(finger_dist, 1e-6)
+
+    gripper_x = np.array([1.0, 0.0, 0.0])
+    gripper_y = np.array([0.0, 1.0, 0.0])
+
+    # 加权 Procrustes: 找 R 使得 R @ [gripper_x, w_y*gripper_y] ≈ [pointing, w_y*opening]
+    W = np.diag([1.0, W_Y])
+    A = np.column_stack([gripper_x, gripper_y]) @ W  # (3, 2)
+    B = np.column_stack([pointing, opening]) @ W      # (3, 2)
+    H = A @ B.T  # (3, 3)
+    U, S, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    root_R = Vt.T @ np.diag([1.0, 1.0, np.sign(d)]) @ U.T
+
+    # 3. 匹配指尖中点确定 gripper_link 位置
+    finger1_in_gripper = _FINGER1_ORIGIN + _FINGER1_AXIS * joint1
+    finger2_in_gripper = _FINGER2_ORIGIN + _FINGER2_AXIS * joint2
+    finger_mid_in_gripper = (finger1_in_gripper + finger2_in_gripper) / 2
+    root_pos = finger_mid - root_R @ finger_mid_in_gripper
 
     return root_pos, root_R, joint1, joint2
 
@@ -370,6 +398,13 @@ def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
         return False
     if not os.path.exists(input_path):
         return False
+
+    # 如果输入和输出路径相同, 使用临时文件避免冲突
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        tmp_path = str(output_path) + ".tmp.mp4"
+    else:
+        tmp_path = str(output_path)
+
     cmd = [
         ffmpeg_exe, "-y",
         "-i", str(input_path),
@@ -379,20 +414,27 @@ def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-movflags", "+faststart",
-        str(output_path),
+        tmp_path,
     ]
     if logger:
         logger.info(f"  ffmpeg 重编码: CRF={crf}, {fps}fps, libx264")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode == 0:
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            os.remove(input_path)
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            # 如果用了临时文件, 替换原文件
+            if tmp_path != str(output_path):
+                os.replace(tmp_path, str(output_path))
+            # 删除原始输入文件 (如果与输出不同)
+            if os.path.abspath(input_path) != os.path.abspath(output_path):
+                os.remove(input_path)
             if logger:
                 sz = os.path.getsize(output_path)
                 logger.info(f"  ✓ 重编码完成: {output_path} ({sz / 1024 / 1024:.1f}MB)")
             return True
     if logger:
-        logger.warning(f"  ffmpeg 重编码失败: {result.stderr[:200]}")
+        # 显示 stderr 最后 300 字符 (实际错误信息在末尾, 不是开头的 build info)
+        err_tail = result.stderr[-300:] if result.stderr else "无错误输出"
+        logger.warning(f"  ffmpeg 重编码失败 (returncode={result.returncode}): {err_tail}")
     return False
 
 
@@ -433,18 +475,22 @@ def _find_reconstruction_file(hawor_path):
 
 
 def _detect_hand_idx(hawor_path):
-    """自动检测 HaWoR 数据中哪只手是活跃的
+    """自动检测 HaWoR 数据中活跃的手 (改进: 返回 handedness 字符串, 支持双手)
 
     通过检查 cam_space/ 目录下的子目录来判断:
-    - 如果只有 0/ 目录 → 左手活跃
-    - 如果只有 1/ 目录 → 右手活跃
-    - 如果两者都有 → 默认左手 (idx=0)
+    - 只有 0/ → 左手活跃
+    - 只有 1/ → 右手活跃
+    - 两者都有 → 双手 (hand_idx 默认 0, 调用方按需选择)
+
+    回退机制: cam_space 不存在时, 通过 reconstruction npz 中 pred_valid 判断.
 
     Args:
         hawor_path: HaWoR 输出目录路径
 
     Returns:
-        int: 手部索引 (0=左手, 1=右手)，或 None(无法检测)
+        tuple: (hand_idx, handedness_str)
+            hand_idx: int (0=左手, 1=右手); 无法检测时返回 (0, "unknown")
+            handedness_str: "left" / "right" / "both" / "unknown"
     """
     cam_dir = Path(hawor_path) / "cam_space"
     if cam_dir.exists():
@@ -452,15 +498,32 @@ def _detect_hand_idx(hawor_path):
         for d in cam_dir.iterdir():
             if d.is_dir() and d.name.isdigit():
                 detected.add(int(d.name))
-        if 0 in detected and 1 not in detected:
-            return 0
-        if 1 in detected and 0 not in detected:
-            return 1
-        if 0 in detected:
-            return 0
+        if 0 in detected and 1 in detected:
+            return 0, "both"
         if 1 in detected:
-            return 1
-    return None
+            return 1, "right"
+        if 0 in detected:
+            return 0, "left"
+
+    # 回退: 通过 npz pred_valid 检测
+    rec_file = _find_reconstruction_file(Path(hawor_path))
+    if rec_file is not None:
+        try:
+            rec = np.load(str(rec_file), allow_pickle=True)
+            if 'pred_valid' in rec:
+                pred_valid = rec['pred_valid']
+                if pred_valid.ndim == 2 and pred_valid.shape[0] >= 2:
+                    left_active = bool(pred_valid[0].any())
+                    right_active = bool(pred_valid[1].any())
+                    if left_active and right_active:
+                        return 0, "both"
+                    if right_active:
+                        return 1, "right"
+                    if left_active:
+                        return 0, "left"
+        except Exception:
+            pass
+    return 0, "unknown"
 
 
 def load_hawor_data(hawor_dir, hand_idx=0):
@@ -624,12 +687,26 @@ def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
     Returns:
         tuple: (cam_pos, cam_quat)
     """
-    cam_pos_sapien = RXWORLD_TO_SAPIEN @ t_c2w
-    cam_R_sapien = RXWORLD_TO_SAPIEN @ R_c2w
+    # 对齐 02_render_scene.py: 相机数据是 OpenGL 帧 (R_x 已应用), 用 R_AXIS 变换
+    # 手部/GLB 用 RXWORLD_TO_SAPIEN @ SLAM = R_AXIS @ R_x @ SLAM = R_AXIS @ OpenGL
+    # 相机用 R_AXIS @ OpenGL → 两者同帧
+    cam_pos_sapien = R_AXIS @ t_c2w
+    cam_R_sapien = R_AXIS @ R_c2w
 
-    forward = -cam_R_sapien[:, 2]
-    left = -cam_R_sapien[:, 0]
-    up = cam_R_sapien[:, 1]
+    if FLIP_Z_FOR_PHYSICS:
+        cam_pos_sapien[2] = -cam_pos_sapien[2]
+        forward = -cam_R_sapien[:, 2].copy()
+        up = cam_R_sapien[:, 1].copy()
+        forward[2] = -forward[2]
+        up[2] = -up[2]
+        left = np.cross(up, forward)
+        left = left / max(np.linalg.norm(left), 1e-8)
+        up = np.cross(forward, left)
+    else:
+        # 与 02_render_scene.py hawor_cam_to_sapien_pose 完全一致
+        forward = cam_R_sapien[:, 2]
+        left = -cam_R_sapien[:, 0]
+        up = -cam_R_sapien[:, 1]
 
     sapien_cam_R = np.eye(3)
     sapien_cam_R[:, 0] = forward
@@ -674,10 +751,12 @@ def _prepare_arm_urdf(src_urdf_path, arm_prefix="right"):
 
 
 def _compute_object_support_plane(glb_path, transform_params_path):
-    """计算 GLB 物体的支撑平面 (桌面高度 + 物体范围)
+    """计算 GLB 物体的支撑平面 (桌面高度 + 物体范围 + 桌面颜色)
 
-    分析所有几何体变换后的顶点, 找到最低Z坐标和物体分布范围,
-    用于确定物理地面的高度和是否需要添加桌面支撑。
+    分析所有几何体变换后的顶点:
+    1. 用 Z 高度分箱, 找到最大水平面 (桌面表面)
+    2. 从该水平面提取平均顶点颜色
+    3. 用 dynamic (小) 物体的最低 Z 确定桌面高度
 
     Args:
         glb_path: GLB 文件路径
@@ -685,10 +764,13 @@ def _compute_object_support_plane(glb_path, transform_params_path):
 
     Returns:
         dict: {
-            'min_z': 所有顶点最低Z,
+            'min_z': dynamic 物体最低Z,
+            'max_z': 所有物体最高Z,
             'support_z': 支撑面高度 (min_z - 小偏移),
             'center_xy': 物体质心XY,
             'extent_xy': 物体XY范围,
+            'table_color': 桌面颜色RGBA (从GLB提取),
+            'table_surface_z': 检测到的桌面表面Z,
         } 或 None (加载失败)
     """
     if trimesh is None:
@@ -700,26 +782,100 @@ def _compute_object_support_plane(glb_path, transform_params_path):
         t_inv = params['t_inv']
         trimesh_scene = trimesh.load(str(glb_path))
         all_verts_sapien = []
+        dynamic_verts_sapien = []
+        # 存储每个顶点及其原始颜色 (用于桌面颜色提取)
+        verts_with_color = []  # list of (vertices_sapien, vertex_colors)
         for geom_name, geom in trimesh_scene.geometry.items():
             if len(geom.vertices) == 0:
                 continue
             vertices = geom.vertices.copy()
             vertices_hawor = s_inv * (R_inv @ vertices.T).T + t_inv
             vertices_sapien = (RXWORLD_TO_SAPIEN @ vertices_hawor.T).T
+            if FLIP_Z_FOR_PHYSICS:
+                vertices_sapien[:, 2] = -vertices_sapien[:, 2]
             all_verts_sapien.append(vertices_sapien)
+
+            # 提取顶点颜色
+            vc = None
+            if hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
+                vc = geom.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
+            verts_with_color.append((vertices_sapien, vc))
+
+            # 分类: 大型扁平几何体 (桌面/地板) vs 小物体
+            bbox_size = vertices_sapien.max(axis=0) - vertices_sapien.min(axis=0)
+            volume = abs(bbox_size[0] * bbox_size[1] * bbox_size[2])
+            max_extent = max(bbox_size)
+            flatness = bbox_size[2] / max(max(bbox_size[0], bbox_size[1]), 1e-6)
+            is_static = (volume > 0.01 and flatness < 0.3) or max_extent > 0.8
+            if not is_static:
+                dynamic_verts_sapien.append(vertices_sapien)
+
         if not all_verts_sapien:
             return None
+
+        # 桌面高度: 优先用 dynamic (小) 物体的最低 Z
+        if dynamic_verts_sapien:
+            dyn_verts = np.vstack(dynamic_verts_sapien)
+            min_z = float(dyn_verts[:, 2].min())
+        else:
+            all_verts = np.vstack(all_verts_sapien)
+            min_z = float(all_verts[:, 2].min())
+
         all_verts = np.vstack(all_verts_sapien)
-        min_z = float(all_verts[:, 2].min())
         max_z = float(all_verts[:, 2].max())
         center_xy = all_verts[:, :2].mean(axis=0)
         extent_xy = all_verts[:, :2].max(axis=0) - all_verts[:, :2].min(axis=0)
+
+        # === Ray casting: Z 高度分箱找最大水平面 ===
+        # 将 Z 坐标按 1mm 分箱, 找顶点最多且 XY 范围最大的 Z 层
+        z_bins = np.round(all_verts[:, 2] / 0.001) * 0.001
+        unique_z, inv, counts = np.unique(z_bins, return_inverse=True, return_counts=True)
+
+        table_surface_z = None
+        table_color = np.array([0.55, 0.45, 0.35, 1.0])  # 默认木色
+        if len(unique_z) > 0:
+            z_scores = []
+            for zi, z_val in enumerate(unique_z):
+                mask = inv == zi
+                verts_at_z = all_verts[mask]
+                if len(verts_at_z) < 10:
+                    continue
+                xy_extent = verts_at_z[:, :2].max(axis=0) - verts_at_z[:, :2].min(axis=0)
+                area = xy_extent[0] * xy_extent[1]
+                # 分数 = 顶点数 * 面积 (大的水平面得分高)
+                z_scores.append((z_val, counts[zi], area, xy_extent))
+
+            if z_scores:
+                # 找面积最大的水平面 (桌面)
+                z_scores.sort(key=lambda x: x[2], reverse=True)
+                table_surface_z = z_scores[0][0]
+                table_surface_area = z_scores[0][2]
+                table_surface_extent = z_scores[0][3]
+
+                # 提取桌面颜色: 在 table_surface_z 附近 ±1mm 的顶点颜色取平均
+                surface_mask = np.abs(all_verts[:, 2] - table_surface_z) < 0.002
+                surface_colors = []
+                offset = 0
+                for v_sapien, vc in verts_with_color:
+                    if vc is not None:
+                        n_verts = len(v_sapien)
+                        local_mask = surface_mask[offset:offset + n_verts]
+                        if local_mask.any():
+                            surface_colors.append(vc[local_mask])
+                    offset += len(v_sapien)
+                if surface_colors:
+                    all_surface_colors = np.vstack(surface_colors)
+                    avg_color = all_surface_colors.mean(axis=0)
+                    table_color = np.array([avg_color[0], avg_color[1], avg_color[2], 1.0])
+
         return {
             'min_z': min_z,
             'max_z': max_z,
             'support_z': min_z - 0.002,
             'center_xy': center_xy,
             'extent_xy': extent_xy,
+            'table_color': table_color,
+            'table_surface_z': table_surface_z,
         }
     except Exception:
         return None
@@ -756,7 +912,7 @@ def setup_physics_scene(ground_height=GROUND_HEIGHT):
     ground_mat.set_roughness(0.9)
     ground_mat.set_metallic(0.0)
     ground_mat.set_specular(0.04)
-    scene.add_ground(ground_height, render_material=ground_mat, render_half_size=[5, 5])
+    scene.add_ground(ground_height, render_half_size=[0, 0])
 
     return scene
 
@@ -785,6 +941,7 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
     s_inv = float(params['s_inv'])
     R_inv = params['R_inv']
     t_inv = params['t_inv']
+    saved_glb_up_axis = str(params.get('glb_up_axis', 'y-up')) if 'glb_up_axis' in params else None
 
     if trimesh is None:
         if logger:
@@ -806,6 +963,21 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
     if logger:
         logger.info(f"  GLB 内容: {n_geom} 个几何体 (fast_collision={fast_collision})")
 
+    # 检测 GLB 坐标系 (Z-UP vs Y-UP), 与 02_render_scene.py 一致
+    all_verts_list = []
+    for _, geom in trimesh_scene.geometry.items():
+        if len(geom.vertices) > 0:
+            all_verts_list.append(geom.vertices)
+    if saved_glb_up_axis is not None:
+        glb_up_axis = saved_glb_up_axis
+    elif all_verts_list:
+        glb_up_axis = _detect_glb_up_axis(np.vstack(all_verts_list))
+    else:
+        glb_up_axis = "y-up"
+    need_zup_to_yup = glb_up_axis == "z-up"
+    if logger:
+        logger.info(f"  GLB 坐标系: {glb_up_axis}{' (将转换到 Y-UP)' if need_zup_to_yup else ''}")
+
     obj_actors = []
     temp_files = []
 
@@ -815,8 +987,13 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         if len(vertices) == 0 or len(faces) == 0:
             continue
 
+        if need_zup_to_yup:
+            vertices = (ZUP_TO_YUP @ vertices.T).T
+
         vertices_hawor = s_inv * (R_inv @ vertices.T).T + t_inv
         vertices_sapien = (RXWORLD_TO_SAPIEN @ vertices_hawor.T).T
+        if FLIP_Z_FOR_PHYSICS:
+            vertices_sapien[:, 2] = -vertices_sapien[:, 2]
 
         avg_color = None
         if hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
@@ -844,9 +1021,9 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         builder.set_physx_body_type("kinematic")
 
         phys_material = scene.create_physical_material(
-            static_friction=0.5,
-            dynamic_friction=0.5,
-            restitution=0.3,
+            static_friction=0.8,
+            dynamic_friction=0.8,
+            restitution=0.0,
         )
 
         if avg_color is not None:
@@ -961,8 +1138,14 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
             builder.set_physx_body_type("dynamic")
             actor = builder.build(name=f"glb_{geom_name}")
             actor.set_pose(sapien.Pose(p=centroid.tolist(), q=[1, 0, 0, 0]))
+            # 应用质量 (参考 GalaxeaManipSim: 质量下限 0.1kg, 防轻物被碰飞)
+            obj_mass = max(volume * OBJECT_DENSITY, 0.1)
+            for comp in actor.components:
+                if isinstance(comp, sapien.pysapien.physx.PhysxRigidDynamicComponent):
+                    comp.mass = obj_mass
+                    break
             if logger:
-                logger.info(f"    → {geom_name}: dynamic (可交互, vol={volume:.4f}m³, flat={flatness:.2f})")
+                logger.info(f"    → {geom_name}: dynamic (可交互, vol={volume:.4f}m³, flat={flatness:.2f}, mass={obj_mass:.3f}kg)")
 
         obj_actors.append(actor)
 
@@ -1250,7 +1433,7 @@ class PhysicsSimulator:
                  hide_hand=False, speed=1.0,
                  cam_width=CAM_WIDTH, cam_height=CAM_HEIGHT, smooth=1,
                  two_pass=False, support_table=True,
-                 view="fpv", single_gripper=False):
+                 view="fpv", single_gripper=False, base_cluster=False, fixed_base=False):
         """初始化物理仿真器
 
         Args:
@@ -1273,6 +1456,8 @@ class PhysicsSimulator:
             support_table: 是否添加可见桌面支撑 (True=自适应桌面支撑GLB物体, False=仅物理地面)
             view: 相机视角 (fpv=第一人称跟随HaWoR相机, topdown=俯视, behind=后方, front=前方)
             single_gripper: 单夹爪模式 (True=只加载夹爪URDF无机械臂, 直接用MANO手腕位姿驱动)
+            base_cluster: 分段固定基座 (True=将轨迹聚成N段, smoothstep过渡, 替代浮动基座)
+            fixed_base: 固定基座模式 (True=基座不跟随手腕移动, 始终保持初始位置)
         """
         self.hawor_dir = Path(hawor_dir)
         self.ras_dir = Path(ras_dir)
@@ -1292,9 +1477,34 @@ class PhysicsSimulator:
         self.support_table = support_table
         self.view = view
         self.single_gripper = single_gripper
+        self.base_cluster = base_cluster
+        self.fixed_base = fixed_base
         self.logger = logger or logging.getLogger("PhysicsSim")
         self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / HAWOR_FOCAL_DEFAULT)
         self.scene = None
+
+    def _find_glb_path(self):
+        """查找 GLB 场景文件路径
+
+        查找顺序:
+        1. ras_dir/final_scene.glb (RAS 原始输出)
+        2. ras_dir/scene_in_sapien.glb (01_align_scene 输出)
+        3. transform_params 同级目录下的 scene_in_sapien.glb
+
+        Returns:
+            Path 或 None
+        """
+        candidates = [
+            self.ras_dir / "final_scene.glb",
+            self.ras_dir / "scene_in_sapien.glb",
+            self.transform_params_path.parent / "scene_in_sapien.glb",
+        ]
+        for c in candidates:
+            if c.exists():
+                self.logger.info(f"  GLB 文件: {c}")
+                return c
+        self.logger.warning(f"  未找到 GLB 文件 (搜索: {candidates})")
+        return None
 
     def _update_cam_fov(self, hawor_data):
         """根据 HaWoR 数据中的焦距更新相机视场角
@@ -1312,15 +1522,11 @@ class PhysicsSimulator:
             self.logger.info(f"  相机焦距: 使用默认 {HAWOR_FOCAL_DEFAULT}px, FOV={np.degrees(self.cam_fov):.1f}°")
 
     def _render_to_sapien(self, pts_render):
-        """将 HaWoR render world 坐标系的点转换到 SAPIEN 坐标系
-
-        Args:
-            pts_render: (N, 3) 或 (3,) HaWoR render world 坐标
-
-        Returns:
-            np.ndarray: 同形状, SAPIEN 坐标系下的点
-        """
-        return (RXWORLD_TO_SAPIEN @ pts_render.T).T
+        """将 HaWoR render world 坐标系的点转换到 SAPIEN 坐标系"""
+        result = (RXWORLD_TO_SAPIEN @ pts_render.T).T
+        if FLIP_Z_FOR_PHYSICS:
+            result[..., 2] = -result[..., 2]
+        return result
 
     def _log_object_positions(self, obj_actors, label="物体位置"):
         if not self.logger or not obj_actors:
@@ -1379,8 +1585,8 @@ class PhysicsSimulator:
 
         if trimesh is not None and obj_actors:
             try:
-                glb_path = self.ras_dir / "final_scene.glb"
-                if glb_path.exists():
+                glb_path = self._find_glb_path()
+                if glb_path is not None and glb_path.exists():
                     ts = trimesh.load(str(glb_path))
                     self.logger.info(f"    GLB场景图: {len(ts.graph.nodes)} 节点, {len(ts.geometry)} 几何体")
                     has_non_identity = False
@@ -1400,7 +1606,7 @@ class PhysicsSimulator:
 
         策略:
         1. 计算所有有效帧手腕位置的质心
-        2. 基座放在质心正上方 COMFORTABLE_REACH (0.35m) 处
+        2. 基座放在质心正上方 COMFORTABLE_REACH (0.55m) 处
         3. 朝向: 绕Z轴旋转180°
         4. 检查最远手腕距离是否超出臂展
 
@@ -1445,7 +1651,7 @@ class PhysicsSimulator:
     def _compute_tracking_base_pos(initial_base_pos, wrist_pos_sapien, arm_base_q):
         """计算跟踪模式下的基座位置 (小范围跟随手腕)
 
-        基座在初始位置基础上, 沿 XY 方向跟踪手腕 (±BASE_TRACKING_RANGE=8cm),
+        基座在初始位置基础上, 沿 XY 方向跟踪手腕 (±BASE_TRACKING_RANGE=0, 固定底座),
         Z 方向保持固定。
 
         Args:
@@ -1463,6 +1669,131 @@ class PhysicsSimulator:
         delta_world = base_R @ clamped_offset
         return initial_base_pos + delta_world
 
+    @staticmethod
+    def _compute_fixed_base_clusters(wrist_positions, n_clusters=BASE_CLUSTER_N,
+                                      transition_frames=BASE_CLUSTER_TRANSITION_FRAMES):
+        """将手腕轨迹按 XY 空间聚类成 N 个固定基座
+
+        策略:
+        1. 在 XY 平面上对 wrist positions 做 KMeans/均匀分段聚类
+        2. 每个聚类计算最优固定基座位置
+        3. 基座间过渡用 smoothstep 插值
+
+        Args:
+            wrist_positions: (M, 3) 有效帧的手腕位置
+            n_clusters: 分段数 (默认 3)
+            transition_frames: 每段过渡帧数 (默认 10)
+
+        Returns:
+            list of dict: [{
+                'base_pos': (3,), 'base_quat': (4,),
+                'start_frame': int, 'end_frame': int,
+            }]
+        """
+        M = len(wrist_positions)
+        if M < n_clusters * 2:
+            # 帧数太少, 退回单基座模式
+            if M > 0:
+                wrist_arr = np.array(wrist_positions)
+                centroid = wrist_arr.mean(axis=0)
+                base_pos = centroid.copy()
+                base_pos[2] += COMFORTABLE_REACH
+                z_rot_180 = pr.quaternion_from_axis_angle(np.array([0, 0, 1, np.pi]))
+                base_quat = pr.concatenate_quaternions(z_rot_180, np.array([1, 0, 0, 0]))
+            else:
+                base_pos = np.zeros(3)
+                base_quat = np.array([1, 0, 0, 0])
+            return [{'base_pos': base_pos, 'base_quat': base_quat, 'start_frame': 0, 'end_frame': M}]
+
+        wrist_arr = np.array(wrist_positions)
+        xy = wrist_arr[:, :2]
+
+        # 均匀分段: 将轨迹按帧数等分为 N 段
+        segment_size = M // n_clusters
+        clusters = []
+        for i in range(n_clusters):
+            seg_start = i * segment_size
+            seg_end = min((i + 1) * segment_size, M)
+            if seg_end <= seg_start:
+                continue
+            seg_wrists = wrist_arr[seg_start:seg_end]
+            centroid = seg_wrists.mean(axis=0)
+            wrist_range = seg_wrists.max(axis=0) - seg_wrists.min(axis=0)
+
+            base_pos = centroid.copy()
+            base_pos[2] += COMFORTABLE_REACH
+            if wrist_range[0] > 0.01:
+                base_pos[0] += wrist_range[0] * 0.1
+
+            z_rot_180 = pr.quaternion_from_axis_angle(np.array([0, 0, 1, np.pi]))
+            base_quat = pr.concatenate_quaternions(z_rot_180, np.array([1, 0, 0, 0]))
+
+            # 检查臂展
+            max_dist = max(np.linalg.norm(wp - base_pos) for wp in seg_wrists)
+            if max_dist > ARM_MAX_REACH * 0.9:
+                # 超出臂展: 用全局质心基座
+                wrist_centroid = wrist_arr.mean(axis=0)
+                base_pos = wrist_centroid.copy()
+                base_pos[2] += COMFORTABLE_REACH
+                base_quat = pr.concatenate_quaternions(z_rot_180, np.array([1, 0, 0, 0]))
+
+            clusters.append({
+                'base_pos': base_pos,
+                'base_quat': base_quat,
+                'start_frame': seg_start,
+                'end_frame': seg_end,
+            })
+
+        return clusters
+
+    @staticmethod
+    def _compute_frame_base_positions(clusters, num_frames):
+        """预计算每帧的基座位置 (含 smoothstep 过渡)
+
+        Args:
+            clusters: _compute_fixed_base_clusters 的输出
+            num_frames: 总帧数
+
+        Returns:
+            list of (base_pos, base_quat) 每帧一个
+        """
+        frame_bases = []
+        for frame_idx in range(num_frames):
+            # 找到当前帧所属的聚类
+            current_cluster = None
+            next_cluster = None
+            for i, cluster in enumerate(clusters):
+                if cluster['start_frame'] <= frame_idx < cluster['end_frame']:
+                    current_cluster = cluster
+                    if i + 1 < len(clusters):
+                        next_cluster = clusters[i + 1]
+                    break
+
+            if current_cluster is None:
+                # 帧超出范围, 用最后一个聚类
+                current_cluster = clusters[-1]
+                next_cluster = None
+
+            if next_cluster is not None:
+                # 检查是否在过渡区间内
+                dist_to_end = current_cluster['end_frame'] - frame_idx
+                transition_frames = BASE_CLUSTER_TRANSITION_FRAMES
+                if dist_to_end <= transition_frames:
+                    # smoothstep 过渡
+                    t = (transition_frames - dist_to_end) / transition_frames
+                    t = t * t * (3 - 2 * t)  # smoothstep
+                    base_pos = (1 - t) * current_cluster['base_pos'] + t * next_cluster['base_pos']
+                    # 四元数 slerp 近似: 线性插值后归一化
+                    base_quat = (1 - t) * current_cluster['base_quat'] + t * next_cluster['base_quat']
+                    base_quat = base_quat / np.linalg.norm(base_quat)
+                    frame_bases.append((base_pos, base_quat))
+                    continue
+
+            frame_bases.append((current_cluster['base_pos'].copy(),
+                                current_cluster['base_quat'].copy()))
+
+        return frame_bases
+
     def _setup_robot(self, scene, arm_base_pos, arm_base_q):
         """创建并配置 R1 臂机器人 (与02_render_scene.py一致)
 
@@ -1470,7 +1801,7 @@ class PhysicsSimulator:
         - 加载 URDF (fix_root_link=True, 固定基座, 与02一致)
         - 臂关节: PD驱动 stiffness=100000, damping=10000 (与02一致)
         - 夹爪关节: PD驱动 stiffness=100000, damping=10000 (与02一致)
-        - 初始关节角: RIGHT_ARM_STARTING + gripper=[0.04, -0.04]
+        - 初始关节角: RIGHT_ARM_STARTING + gripper=[0.04, 0.04]
 
         Args:
             scene: SAPIEN 场景
@@ -1505,7 +1836,7 @@ class PhysicsSimulator:
             if j < len(RIGHT_ARM_STARTING):
                 init_qpos[idx] = RIGHT_ARM_STARTING[j]
         init_qpos[gripper_idx1] = 0.04
-        init_qpos[gripper_idx2] = -0.04
+        init_qpos[gripper_idx2] = 0.04
         robot.set_qpos(init_qpos)
 
         # 关键: 设置PD drive_target与set_qpos一致，否则PD控制器会把机械臂拉向零位
@@ -1528,9 +1859,34 @@ class PhysicsSimulator:
                                 scene.create_physical_material(
                                     static_friction=1.0,
                                     dynamic_friction=1.0,
-                                    restitution=0.05,
+                                    restitution=0.6,
                                 )
                             )
+
+        # 禁用手指之间的自碰撞 + realsense_link 碰撞 (修复夹爪不对称打开)
+        # 原因: finger1-finger2 自碰撞会把 joint1 卡在 0, joint2 过冲; realsense_link 与手指碰撞
+        # SRDF (robot.srdf) 已声明手指互不碰撞, 但 loader.load() 未传 SRDF, 声明未生效
+        # 用 set_collision_groups API:
+        #   - ignore group (g2) + 相同 id (g3): 两 shape 互相忽略碰撞
+        #   - [0,0,0,0]: 完全不参与任何碰撞
+        finger_ignore_bit = 1 << 0  # bit 0
+        finger_ignore_id = 1
+        finger_link_names = {"right_gripper_finger_link1", "right_gripper_finger_link2"}
+        for link in robot.get_links():
+            if link.get_name() in finger_link_names:
+                for component in link.entity.components:
+                    if isinstance(component, sapien.pysapien.physx.PhysxArticulationLinkComponent):
+                        for cs in component.get_collision_shapes():
+                            g = list(cs.get_collision_groups())
+                            g[2] |= finger_ignore_bit
+                            g[3] = finger_ignore_id
+                            cs.set_collision_groups(g)
+            elif link.get_name() == "right_realsense_link":
+                # realsense_link 是相机, 不需要物理碰撞, 完全禁用
+                for component in link.entity.components:
+                    if isinstance(component, sapien.pysapien.physx.PhysxArticulationLinkComponent):
+                        for cs in component.get_collision_shapes():
+                            cs.set_collision_groups([0, 0, 0, 0])
 
         ee_link = None
         for link in robot.get_links():
@@ -1790,6 +2146,46 @@ class PhysicsSimulator:
         obj.transparency = 0
         return node
 
+    def _create_axes_actors(self, context, internal_scene, origin, axis_len=0.05, radius=0.003):
+        """在场景中添加坐标轴可视化 (X红、Y绿、Z蓝) + 重力方向 (黄色向下)
+
+        使用 SAPIEN 内部渲染 API (capsule mesh + node), 与 _render_cylinder_between 一致。
+
+        Args:
+            context: SAPIEN 渲染上下文
+            internal_scene: SAPIEN 内部场景
+            origin: 坐标轴原点 (3,) np.ndarray
+            axis_len: 轴长度 (米), 默认 0.05
+            radius: 圆柱半径 (米), 默认 0.003
+
+        Returns:
+            list: 渲染节点列表 (需要保持引用, 避免被垃圾回收)
+        """
+        origin = np.array(origin)
+        axes = [
+            (np.array([axis_len, 0, 0]), np.array([1, 0, 0, 1]), "X"),  # 红
+            (np.array([0, axis_len, 0]), np.array([0, 1, 0, 1]), "Y"),  # 绿
+            (np.array([0, 0, axis_len]), np.array([0, 0, 1, 1]), "Z"),  # 蓝
+        ]
+        nodes = []
+        for direction, color, label in axes:
+            mat = context.create_material(np.zeros(4), color, 0.0, 0.5, 0)
+            p1 = origin
+            p2 = origin + direction
+            node = self._render_cylinder_between(p1, p2, radius, mat, context, internal_scene)
+            if node is not None:
+                nodes.append(node)
+
+        # 重力方向: 黄色向下箭头
+        gravity_mat = context.create_material(np.zeros(4), np.array([1, 1, 0, 1]), 0.0, 0.5, 0)
+        p1 = origin
+        p2 = origin + np.array([0, 0, -axis_len])
+        node = self._render_cylinder_between(p1, p2, radius, gravity_mat, context, internal_scene)
+        if node is not None:
+            nodes.append(node)
+
+        return nodes
+
     def _render_hand_skeleton(self, joints_sapien, context, internal_scene, skel_nodes,
                               radius=0.002):
         """渲染手部骨架线 (关节之间的圆柱体连接)
@@ -1879,10 +2275,10 @@ class PhysicsSimulator:
 
         # [2/6] 创建物理场景 + 加载 GLB
         self.logger.info("\n[2/6] 创建物理场景 + 加载 GLB (带碰撞体) ...")
-        glb_path = self.ras_dir / "final_scene.glb"
+        glb_path = self._find_glb_path()
         ground_height = GROUND_HEIGHT
         support_plane = None
-        if glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
+        if glb_path is not None and glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
             try:
                 support_plane = _compute_object_support_plane(glb_path, self.transform_params_path)
                 if support_plane is not None:
@@ -1898,32 +2294,61 @@ class PhysicsSimulator:
         if self.support_table:
             table_builder = self.scene.create_actor_builder()
             table_mat = sapien.render.RenderMaterial()
-            table_mat.set_base_color([0.55, 0.45, 0.35, 1.0])
+            table_color = np.array([0.55, 0.45, 0.35, 1.0])
+            if support_plane is not None and 'table_color' in support_plane:
+                table_color = support_plane['table_color']
+            table_mat.set_base_color(table_color.tolist())
             table_mat.set_roughness(0.8)
             if support_plane is not None:
                 extent = support_plane['extent_xy']
                 center = support_plane['center_xy']
-                table_half_x = max(0.3, extent[0] / 2 + 0.1)
-                table_half_y = max(0.3, extent[1] / 2 + 0.1)
+                table_half_x = max(0.15, extent[0] / 2 + 0.15)
+                table_half_y = max(0.15, extent[1] / 2 + 0.15)
                 table_center_xy = center
             else:
                 table_half_x = 0.5
                 table_half_y = 0.5
                 table_center_xy = np.array([0.0, 0.0])
-            table_half_size = [table_half_x, table_half_y, 0.005]
+            table_half_size = [table_half_x, table_half_y, 0.025]
             table_builder.add_box_visual(half_size=table_half_size, material=table_mat)
-            table_phys_mat = self.scene.create_physical_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.1)
+            table_phys_mat = self.scene.create_physical_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
             table_builder.add_box_collision(half_size=table_half_size, material=table_phys_mat)
             table_builder.set_physx_body_type("kinematic")
             table_actor = table_builder.build(name="support_table")
-            table_pos = [float(table_center_xy[0]), float(table_center_xy[1]), ground_height - 0.005]
+            table_pos = [float(table_center_xy[0]), float(table_center_xy[1]), ground_height - 0.025]
             table_actor.set_pose(sapien.Pose(p=table_pos, q=[1, 0, 0, 0]))
 
         # 加载 GLB 物体 (带碰撞体)
-        if glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
+        glb_actors = []
+        if glb_path is not None and glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
             glb_actors = load_glb_with_physics(glb_path, self.transform_params_path, self.scene,
                                                 logger=self.logger, fast_collision=self.fast_collision)
             self.logger.info(f"  加载 {len(glb_actors)} 个 GLB 物体")
+            if glb_actors:
+                self._log_object_positions(glb_actors, "GLB物体初始位置")
+                # 物理稳定: 让dynamic物体自然落下, 消除初始重叠/穿透
+                dynamic_actors = [
+                    a for a in glb_actors
+                    if any(
+                        isinstance(c, sapien.pysapien.physx.PhysxRigidDynamicComponent) and not c.kinematic
+                        for c in a.components
+                    )
+                ]
+                if dynamic_actors:
+                    self.logger.info(f"  稳定化 {len(dynamic_actors)} 个dynamic物体 (kinematic物体无需稳定) ...")
+                    for _ in range(500):
+                        self.scene.step()
+                    for _ in range(100):
+                        self.scene.step()
+                self._log_object_positions(glb_actors, "GLB物体稳定后位置")
+
+        # 坐标轴 + 重力方向可视化
+        if support_plane is not None:
+            axes_origin = np.array([support_plane['center_xy'][0], support_plane['center_xy'][1], ground_height + 0.01])
+        else:
+            axes_origin = np.array([0.0, 0.0, ground_height + 0.01])
+        self._axes_nodes = self._create_axes_actors(context, internal_scene, axes_origin)
+        self.logger.info(f"  坐标轴可视化: origin={axes_origin}")
 
         # [3/6] 加载夹爪 URDF (只有夹爪, 无机械臂)
         self.logger.info("\n[3/6] 加载单夹爪 URDF (无机械臂) ...")
@@ -1960,6 +2385,20 @@ class PhysicsSimulator:
                     if hasattr(component, 'physx_material'):
                         component.physx_material = self.scene.create_physical_material(
                             static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
+
+        # 禁用手指之间的自碰撞 (修复夹爪不对称打开, 与全臂模式一致)
+        finger_ignore_bit = 1 << 0
+        finger_ignore_id = 1
+        finger_link_names_single = {f"{prefix}_gripper_finger_link1", f"{prefix}_gripper_finger_link2"}
+        for link in robot.get_links():
+            if link.get_name() in finger_link_names_single:
+                for component in link.entity.components:
+                    if isinstance(component, sapien.pysapien.physx.PhysxArticulationLinkComponent):
+                        for cs in component.get_collision_shapes():
+                            g = list(cs.get_collision_groups())
+                            g[2] |= finger_ignore_bit
+                            g[3] = finger_ignore_id
+                            cs.set_collision_groups(g)
 
         # 物理稳定化: 让物体落稳
         for _ in range(200):
@@ -2046,7 +2485,7 @@ class PhysicsSimulator:
 
                     # 解析计算夹爪位姿和手指关节
                     root_pos, root_R, joint1, joint2 = _compute_analytical_gripper_pose(
-                        mano_wrist, mano_finger1, mano_finger2)
+                        mano_wrist, mano_finger1, mano_finger2, prefix=mano_side)
                     root_quat = pr.quaternion_from_matrix(root_R)
 
                     # 设置夹爪 root 位姿 (直接设置, 无需 IK)
@@ -2077,6 +2516,14 @@ class PhysicsSimulator:
                     camera.take_picture()
                     rgb = camera.get_picture("Color")[..., :3]
                     bgr = np.ascontiguousarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8)[..., ::-1])
+                    # 叠加坐标轴信息
+                    cv2.putText(bgr, f"Table Z={ground_height:.4f}m", (15, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                    cam_pos = np.array(camera.get_local_pose().p)
+                    cv2.putText(bgr, f"Cam Z={cam_pos[2]:.4f}m", (15, 78),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                    cv2.putText(bgr, f"Origin Z={axes_origin[2]:.4f}m", (15, 96),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                     for _ in range(frame_repeat):
                         writer.write(bgr)
 
@@ -2129,10 +2576,10 @@ class PhysicsSimulator:
         self._update_cam_fov(hawor_data)
 
         self.logger.info("\n[2/8] 创建物理场景 + 加载 GLB (带碰撞体) ...")
-        glb_path = self.ras_dir / "final_scene.glb"
+        glb_path = self._find_glb_path()
         ground_height = GROUND_HEIGHT
         support_plane = None
-        if glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
+        if glb_path is not None and glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
             try:
                 support_plane = _compute_object_support_plane(glb_path, self.transform_params_path)
                 if support_plane is not None:
@@ -2151,42 +2598,57 @@ class PhysicsSimulator:
 
         # 添加可见桌面支撑 (可选): 自适应位置和大小, 用于支撑GLB物体
         # 桌面位置 = GLB物体XY质心, 桌面大小 = GLB物体XY范围 + 边距
+        TABLE_HALF_THICKNESS = 0.025  # 桌面半厚度=2.5cm (总厚度5cm), 防止物体被推出桌面
+        TABLE_XY_MARGIN = 0.15  # 桌面XY边距=15cm, 防止物体从边缘掉落
         if self.support_table:
             table_builder = self.scene.create_actor_builder()
             table_mat = sapien.render.RenderMaterial()
-            table_mat.set_base_color([0.55, 0.45, 0.35, 1.0])  # 木色
+            table_color = np.array([0.55, 0.45, 0.35, 1.0])  # 默认木色
+            if support_plane is not None and 'table_color' in support_plane:
+                table_color = support_plane['table_color']
+            table_mat.set_base_color(table_color.tolist())
             table_mat.set_roughness(0.8)
             table_mat.set_metallic(0.0)
             if support_plane is not None:
                 # 自适应桌面: 基于GLB物体范围
                 extent = support_plane['extent_xy']
                 center = support_plane['center_xy']
-                # 桌面半尺寸 = 物体范围/2 + 0.1m边距, 最小0.3m
-                table_half_x = max(0.3, extent[0] / 2 + 0.1)
-                table_half_y = max(0.3, extent[1] / 2 + 0.1)
+                # 桌面半尺寸 = 物体范围/2 + 边距, 最小0.15m
+                table_half_x = max(0.15, extent[0] / 2 + TABLE_XY_MARGIN)
+                table_half_y = max(0.15, extent[1] / 2 + TABLE_XY_MARGIN)
                 table_center_xy = center
                 self.logger.info(f"  自适应桌面: 中心={table_center_xy}, 半尺寸=[{table_half_x:.3f}, {table_half_y:.3f}]")
+                if support_plane.get('table_surface_z') is not None:
+                    self.logger.info(f"  检测到GLB桌面表面: Z={support_plane['table_surface_z']:.4f}m, 颜色={table_color}")
             else:
                 # 默认桌面: 1m x 1m 在原点
                 table_half_x = 0.5
                 table_half_y = 0.5
                 table_center_xy = np.array([0.0, 0.0])
-            table_half_size = [table_half_x, table_half_y, 0.005]
+            table_half_size = [table_half_x, table_half_y, TABLE_HALF_THICKNESS]
             table_builder.add_box_visual(half_size=table_half_size, material=table_mat)
-            table_phys_mat = self.scene.create_physical_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.1)
+            table_phys_mat = self.scene.create_physical_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
             table_builder.add_box_collision(half_size=table_half_size, material=table_phys_mat)
             table_builder.set_physx_body_type("kinematic")
             table_actor = table_builder.build(name="support_table")
-            # 桌面顶部 = ground_height, 所以桌面中心Z = ground_height - 0.005
-            table_pos = [float(table_center_xy[0]), float(table_center_xy[1]), ground_height - 0.005]
+            # 桌面顶部 = ground_height, 所以桌面中心Z = ground_height - TABLE_HALF_THICKNESS
+            table_pos = [float(table_center_xy[0]), float(table_center_xy[1]), ground_height - TABLE_HALF_THICKNESS]
             table_actor.set_pose(sapien.Pose(p=table_pos, q=[1, 0, 0, 0]))
-            self.logger.info(f"  ✓ 可见桌面支撑: pos={table_pos} ({table_half_x*2:.2f}m x {table_half_y*2:.2f}m)")
+            self.logger.info(f"  ✓ 可见桌面支撑: pos={table_pos} ({table_half_x*2:.2f}m x {table_half_y*2:.2f}m, 厚{TABLE_HALF_THICKNESS*2:.2f}m)")
         else:
             self.logger.info(f"  桌面支撑已禁用 (--no-support-table), 仅使用物理地面")
 
+        # 坐标轴 + 重力方向可视化
+        if support_plane is not None:
+            axes_origin = np.array([support_plane['center_xy'][0], support_plane['center_xy'][1], ground_height + 0.01])
+        else:
+            axes_origin = np.array([0.0, 0.0, ground_height + 0.01])
+        self._axes_nodes = self._create_axes_actors(context, internal_scene, axes_origin)
+        self.logger.info(f"  坐标轴可视化: origin={axes_origin}")
+
         obj_actors = []
         settled_obj_poses = []  # 稳定后的物体位置，供第二趟重放
-        if glb_path.exists() and self.transform_params_path.exists():
+        if glb_path is not None and glb_path.exists() and self.transform_params_path.exists():
             obj_actors = load_glb_with_physics(glb_path, self.transform_params_path, self.scene, logger=self.logger, fast_collision=self.fast_collision)
             if obj_actors:
                 self.logger.info(f"  ✓ GLB 物理物体: {len(obj_actors)} 个")
@@ -2225,6 +2687,19 @@ class PhysicsSimulator:
             raise RuntimeError("无法提取有效手腕位置")
 
         arm_base_pos, arm_base_q = self._compute_optimal_fixed_base(wrist_positions)
+
+        # 分段固定基座: 预计算每帧的基座位置
+        frame_base_positions = None
+        if self.base_cluster:
+            clusters = self._compute_fixed_base_clusters(wrist_positions, n_clusters=BASE_CLUSTER_N)
+            frame_base_positions = self._compute_frame_base_positions(clusters, num_frames)
+            self.logger.info(f"  分段固定基座: {len(clusters)} 段")
+            for i, c in enumerate(clusters):
+                self.logger.info(f"    段{i}: 帧[{c['start_frame']}-{c['end_frame']}), base={c['base_pos']}")
+        else:
+            self.logger.info(f"  浮动基座模式: XY跟踪范围±{BASE_TRACKING_RANGE}m")
+        if self.fixed_base:
+            self.logger.info(f"  固定基座模式: 基座位置固定在 {arm_base_pos}")
 
         robot, joint_names, arm_joint_indices, gripper_idx1, gripper_idx2, ee_link = \
             self._setup_robot(self.scene, arm_base_pos, arm_base_q)
@@ -2293,6 +2768,9 @@ class PhysicsSimulator:
             joints_sapien = self._render_to_sapien(j)
             wrist_R_render = pr.matrix_from_compact_axis_angle(hawor_data["pred_rot"][g_idx])
             wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
+            if FLIP_Z_FOR_PHYSICS:
+                Z_FLIP_R = np.diag([1.0, 1.0, -1.0])
+                wrist_R_sapien = Z_FLIP_R @ wrist_R_sapien @ Z_FLIP_R
             wrist_quat = pr.quaternion_from_matrix(wrist_R_sapien)
             retargeting.warm_start(
                 joints_sapien[0, :3], wrist_quat,
@@ -2332,8 +2810,16 @@ class PhysicsSimulator:
             if gripper_pos_fk is None:
                 continue
 
-            tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+            if self.fixed_base:
+                tracked_base = arm_base_pos.copy()
+                tracked_base_q = arm_base_q.copy()
+            elif self.base_cluster and frame_base_positions is not None:
+                tracked_base = frame_base_positions[probe_idx][0]
+                tracked_base_q = frame_base_positions[probe_idx][1]
+            else:
+                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                tracked_base_q = arm_base_q
+            robot.set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
             qf = robot.compute_passive_force(gravity=True, coriolis_and_centrifugal=True)
             robot.set_qf(qf)
             self.scene.step()
@@ -2406,7 +2892,7 @@ class PhysicsSimulator:
             t_smooth = t * t * (3 - 2 * t)
             interp = start_joints * (1 - t_smooth) + first_ik_joints * t_smooth
             self._physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
-                               interp, 0.04, -0.04)
+                               interp, 0.04, 0.04)  # 同号: URDF finger_joint axis 相反 + limit 非负, 同号才对称开合
 
         self.logger.info("\n[8/8] 实时IK渲染 (与02_render_scene.py一致) ...")
         self.logger.info(f"  平滑模式: {self.smooth} ({'不平滑' if self.smooth == 0 else '在线EMA' if self.smooth == 1 else '后处理双向滤波'})")
@@ -2473,11 +2959,27 @@ class PhysicsSimulator:
                     retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
                     sapien_qpos = retarget_qpos[retarget2sapien]
 
+                    # [DEBUG] 打印重定向输出和映射后的夹爪关节值
+                    if local_idx < 5:
+                        r_idx1 = retargeting.joint_names.index("right_gripper_finger_joint1")
+                        r_idx2 = retargeting.joint_names.index("right_gripper_finger_joint2")
+                        self.logger.info(f"  [DEBUG 夹爪 帧{local_idx}] retarget_qpos[joint1]={retarget_qpos[r_idx1]:.6f}, retarget_qpos[joint2]={retarget_qpos[r_idx2]:.6f}")
+                        self.logger.info(f"  [DEBUG 夹爪 帧{local_idx}] sapien_qpos[idx1={gripper_idx1}]={sapien_qpos[gripper_idx1] if gripper_idx1 < len(sapien_qpos) else 'OOB':.6f}, sapien_qpos[idx2={gripper_idx2}]={sapien_qpos[gripper_idx2] if gripper_idx2 < len(sapien_qpos) else 'OOB':.6f}")
+                        self.logger.info(f"  [DEBUG 夹爪 帧{local_idx}] len(sapien_qpos)={len(sapien_qpos)}, gripper_idx1={gripper_idx1}, gripper_idx2={gripper_idx2}")
+
                     gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                         retargeting, retarget_qpos)
 
-                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                    robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                    if self.fixed_base:
+                        tracked_base = arm_base_pos.copy()
+                        tracked_base_q = arm_base_q.copy()
+                    elif self.base_cluster and frame_base_positions is not None:
+                        tracked_base = frame_base_positions[local_idx][0]
+                        tracked_base_q = frame_base_positions[local_idx][1]
+                    else:
+                        tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                        tracked_base_q = arm_base_q
+                    robot.set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                     # 关键: 必须调用scene.step()更新link pose, 否则base_link_p/q是旧值
                     # 与02_render_scene.py一致, 但04需要重力补偿防止机械臂下坠
                     qf = robot.compute_passive_force(gravity=True, coriolis_and_centrifugal=True)
@@ -2485,7 +2987,7 @@ class PhysicsSimulator:
                     self.scene.step()
 
                     # 记录base pose供第二趟重放
-                    base_pose_log.append((tracked_base.copy(), arm_base_q.copy()))
+                    base_pose_log.append((tracked_base.copy(), tracked_base_q.copy()))
                     last_tracked_base = tracked_base.copy()
 
                     for link in robot.get_links():
@@ -2533,7 +3035,12 @@ class PhysicsSimulator:
                         filtered_joints = joint_filter.next(np.array(ik_joints))
 
                     gripper_target1 = float(sapien_qpos[gripper_idx1]) if gripper_idx1 < len(sapien_qpos) else 0.04
-                    gripper_target2 = float(sapien_qpos[gripper_idx2]) if gripper_idx2 < len(sapien_qpos) else -0.04
+                    gripper_target1 = max(0.0, min(0.05, gripper_target1))  # clamp 到 URDF limit
+                    gripper_target2 = gripper_target1  # 同号, axis 相反, 对称开合
+
+                    # [DEBUG] 打印 gripper target 和物理仿真后实际 qpos
+                    if local_idx < 5:
+                        self.logger.info(f"  [DEBUG 夹爪 帧{local_idx}] gripper_target1={gripper_target1:.6f}, gripper_target2={gripper_target2:.6f}")
 
                     if self.viewer:
                         # viewer模式: 纯PD驱动 + 重力补偿 + decimation (与_physics_step一致)
@@ -2565,6 +3072,52 @@ class PhysicsSimulator:
                                            filtered_joints, gripper_target1, gripper_target2)
                         # 纯PD驱动: 记录实际qpos（物理仿真后的真实关节角）
                         qpos_log.append(robot.get_qpos().copy())
+
+                    # [DEBUG] 打印物理仿真后实际夹爪 qpos
+                    if local_idx < 5:
+                        actual_qpos = robot.get_qpos()
+                        self.logger.info(f"  [DEBUG 夹爪 帧{local_idx}] actual_qpos[idx1]={actual_qpos[gripper_idx1]:.6f}, actual_qpos[idx2]={actual_qpos[gripper_idx2]:.6f}, diff={abs(actual_qpos[gripper_idx1] - actual_qpos[gripper_idx2]):.6f}")
+
+                        # [DEBUG] 检测夹爪手指的所有接触 (包括与桌面/GLB/自身)
+                        finger_link_names = {"right_gripper_finger_link1", "right_gripper_finger_link2"}
+                        finger_bodies = {}
+                        for link in robot.get_links():
+                            if link.get_name() in finger_link_names:
+                                for component in link.entity.components:
+                                    if isinstance(component, sapien.pysapien.physx.PhysxArticulationLinkComponent):
+                                        finger_bodies[component] = link.get_name()
+                        all_contacts = self.scene.get_contacts()
+                        f1_contacts = 0
+                        f2_contacts = 0
+                        for c in all_contacts:
+                            b0, b1 = c.bodies[0], c.bodies[1]
+                            if b0 in finger_bodies or b1 in finger_bodies:
+                                # 找到另一侧的 body
+                                if b0 in finger_bodies:
+                                    finger_name = finger_bodies[b0]
+                                    other_body = b1
+                                else:
+                                    finger_name = finger_bodies[b1]
+                                    other_body = b0
+                                # 尝试获取另一侧的名称
+                                other_name = "unknown"
+                                for link2 in robot.get_links():
+                                    for comp2 in link2.entity.components:
+                                        if isinstance(comp2, sapien.pysapien.physx.PhysxArticulationLinkComponent) and comp2 == other_body:
+                                            other_name = link2.get_name()
+                                if "finger_link1" in finger_name:
+                                    f1_contacts += 1
+                                elif "finger_link2" in finger_name:
+                                    f2_contacts += 1
+                                if local_idx < 2:
+                                    self.logger.info(f"  [DEBUG 接触 帧{local_idx}] {finger_name} <-> {other_name}")
+                        self.logger.info(f"  [DEBUG 接触 帧{local_idx}] finger_link1 接触数={f1_contacts}, finger_link2 接触数={f2_contacts}")
+
+                        # [DEBUG] 打印手指 link 世界位置
+                        for link in robot.get_links():
+                            if link.get_name() in finger_link_names:
+                                pose = link.get_entity_pose()
+                                self.logger.info(f"  [DEBUG 位置 帧{local_idx}] {link.get_name()}: pos=({pose.p[0]:.4f}, {pose.p[1]:.4f}, {pose.p[2]:.4f})")
 
                     # 诊断: 检查set_qpos后实际EE位置 vs IK目标
                     if local_idx < 5 and gripper_link is not None:
@@ -2611,6 +3164,14 @@ class PhysicsSimulator:
                     label += f"  C:{n_contacts}"
                     cv2.putText(bgr, label, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 err_color if ee_err_cm is not None else (255, 255, 255), 2)
+                    # 坐标轴信息
+                    cv2.putText(bgr, f"Table Z={ground_height:.4f}m", (15, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                    cam_pos_val = np.array(camera.get_local_pose().p)
+                    cv2.putText(bgr, f"Cam Z={cam_pos_val[2]:.4f}m", (15, 78),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                    cv2.putText(bgr, f"Origin Z={axes_origin[2]:.4f}m", (15, 96),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                     for _ in range(frame_repeat):
                         writer.write(bgr)
                 else:
@@ -2627,7 +3188,7 @@ class PhysicsSimulator:
                     if j < len(RIGHT_ARM_STARTING):
                         init_qpos[idx] = RIGHT_ARM_STARTING[j]
                 init_qpos[gripper_idx1] = 0.04
-                init_qpos[gripper_idx2] = -0.04
+                init_qpos[gripper_idx2] = 0.04
                 robot.set_qpos(init_qpos)
 
         if not self.viewer:
@@ -2651,7 +3212,7 @@ class PhysicsSimulator:
                 if j < len(RIGHT_ARM_STARTING):
                     reset_qpos[idx] = RIGHT_ARM_STARTING[j]
             reset_qpos[gripper_idx1] = 0.04
-            reset_qpos[gripper_idx2] = -0.04
+            reset_qpos[gripper_idx2] = 0.04
             robot.set_qpos(reset_qpos)
             # 设置PD target与set_qpos一致, 防止PD控制器拉向零位
             active_joints = robot.get_active_joints()
@@ -2672,7 +3233,7 @@ class PhysicsSimulator:
                 interp_arm = np.array(RIGHT_ARM_STARTING) * (1 - t_smooth) + \
                              np.array([first_target[idx] for idx in arm_joint_indices]) * t_smooth
                 self._physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
-                                   interp_arm, 0.04, -0.04)
+                                   interp_arm, 0.04, 0.04)
             self.scene.update_render()
 
             # 第二趟渲染: PD驱动跟踪第一趟轨迹
@@ -2710,7 +3271,8 @@ class PhysicsSimulator:
                     target_qpos = qpos_log[local_idx]
                     arm_target = np.array([target_qpos[idx] for idx in arm_joint_indices])
                     gripper_t1 = float(target_qpos[gripper_idx1]) if gripper_idx1 < len(target_qpos) else 0.04
-                    gripper_t2 = float(target_qpos[gripper_idx2]) if gripper_idx2 < len(target_qpos) else -0.04
+                    gripper_t1 = max(0.0, min(0.05, gripper_t1))  # clamp 到 URDF limit
+                    gripper_t2 = gripper_t1  # 同号, axis 相反, 对称开合
                     self._physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
                                        arm_target, gripper_t1, gripper_t2)
                 else:
@@ -2774,7 +3336,7 @@ class PhysicsSimulator:
                 if j < len(RIGHT_ARM_STARTING):
                     reset_qpos[idx] = RIGHT_ARM_STARTING[j]
             reset_qpos[gripper_idx1] = 0.04
-            reset_qpos[gripper_idx2] = -0.04
+            reset_qpos[gripper_idx2] = 0.04
             robot.set_qpos(reset_qpos)
 
             initial_obj_poses = settled_obj_poses
@@ -2792,7 +3354,7 @@ class PhysicsSimulator:
                 else:
                     interp = np.array(RIGHT_ARM_STARTING)
                 self._physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
-                                   interp, 0.04, -0.04)
+                                   interp, 0.04, 0.04)
             self.scene.update_render()
 
             self.logger.info("  用平滑后的qpos重新渲染 (kinematic模式, 与02_render_scene.py一致) ...")
@@ -2902,8 +3464,8 @@ def main():
                         help="HaWoR 重建输出目录 (包含 reconstruction/ 子目录或 world_space_res.pth)")
     parser.add_argument("--ras-dir", type=str, required=True,
                         help="RAS 场景重建输出目录 (包含 final_scene.glb)")
-    parser.add_argument("--transform-params", type=str, default="./output/alignment/transform_params.npz",
-                        help="01_align_scene.py 输出的 transform_params.npz 路径")
+    parser.add_argument("--transform-params", type=str, default=None,
+                        help="01_align_scene.py 输出的 transform_params.npz 路径 (默认: 自动推导或自动生成)")
     parser.add_argument("--hand-idx", type=int, default=-1,
                         help="手的索引: 0=左手, 1=右手, -1=自动检测")
     parser.add_argument("--start-frame", type=int, default=0)
@@ -2932,21 +3494,97 @@ def main():
                         help="相机视角: fpv=第一人称(跟随HaWoR相机轨迹), topdown=俯视, behind=后方, front=前方")
     parser.add_argument("--single-gripper", action="store_true",
                         help="单夹爪模式: 只加载夹爪URDF(无机械臂), 直接用MANO手腕位姿驱动夹爪, 参考 hand_track/render_gripper_only.py")
+    parser.add_argument("--base-cluster", action="store_true",
+                        help="分段固定基座模式: 将轨迹按XY空间聚成N段, 基座间smoothstep过渡 (替代浮动基座)")
+    parser.add_argument("--fixed-base", action="store_true", default=True,
+                        help="固定基座模式 (默认开启): 基座不跟随手腕移动")
+    parser.add_argument("--no-fixed-base", action="store_true",
+                        help="禁用固定基座, 使用浮动基座 (XY跟踪范围±4cm)")
     args = parser.parse_args()
 
+    # --no-fixed-base 覆盖 --fixed-base
+    if args.no_fixed_base:
+        args.fixed_base = False
+
     if args.output is None:
-        args.output = f"output/videos/physics_sim_{args.mode}.mp4"
+        # 输出到 physics_pipeline/output 目录 (与 PyBullet 管线统一)
+        # 文件名包含关键参数, 避免不同命令的输出互相覆盖
+        name_parts = [f"physics_sim_{args.mode}"]
+        if args.single_gripper:
+            name_parts.append("gripper")
+        if args.view != "fpv":
+            name_parts.append(args.view)
+        if args.hand_idx >= 0:
+            name_parts.append(f"h{args.hand_idx}")
+        if args.base_cluster:
+            name_parts.append("cluster")
+        elif args.no_fixed_base:
+            name_parts.append("float")
+        if args.two_pass:
+            name_parts.append("2pass")
+        physics_output = Path(__file__).parent / "physics_pipeline" / "output"
+        args.output = str(physics_output / ("_".join(name_parts) + ".mp4"))
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     if args.hand_idx < 0:
-        detected = _detect_hand_idx(Path(args.hawor_dir))
-        if detected is not None:
-            args.hand_idx = detected
-            hand_label = "左手" if detected == 0 else "右手"
-            print(f"自动检测到手: {hand_label} (idx={detected})")
-        else:
-            args.hand_idx = 0
-            print(f"无法自动检测手, 默认使用左手 (idx=0)")
+        detected_idx, handedness = _detect_hand_idx(Path(args.hawor_dir))
+        args.hand_idx = detected_idx
+        # handedness: "left"/"right"/"both"/"unknown"
+        # 注意: 04 仅支持单臂渲染 (与 02 一致), 双手场景默认取 idx=0 (左手) 由调用方按需切换
+        label_map = {"left": "左手", "right": "右手", "both": "双手(默认左手)", "unknown": "未知(默认左手)"}
+        hand_label = label_map.get(handedness, "未知(默认左手)")
+        print(f"自动检测到手: {hand_label} (idx={detected_idx}, handedness={handedness})")
+
+    # 自动推导 transform-params (先查找已有文件, 找不到则调用 01 生成)
+    if args.transform_params is None:
+        hawor_bn = Path(args.hawor_dir).name
+        ras_bn = Path(args.ras_dir).name
+        session_name = f"{hawor_bn}_{ras_bn}"
+        output_dir = Path(__file__).parent / "output" / session_name
+
+        # 1. 先查找已有文件
+        candidates = [
+            output_dir / "alignment" / "transform_params.npz",
+            Path(__file__).parent / "output" / "alignment" / "transform_params.npz",
+        ]
+        for c in candidates:
+            if c.exists():
+                args.transform_params = str(c)
+                print(f"  自动推导 transform-params: {args.transform_params}")
+                break
+
+        # 2. 找不到则调用 01_align_scene.py 的函数生成
+        if args.transform_params is None:
+            print(f"  未找到 transform_params.npz, 自动调用 01_align_scene.py 生成 ...")
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "align_scene_01", str(Path(__file__).parent / "01_align_scene.py")
+                )
+                mod01 = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod01)
+                # 查找 hawor reconstruction npz
+                hawor_rec_dir = Path(args.hawor_dir) / "reconstruction"
+                hawor_npz = None
+                if hawor_rec_dir.exists():
+                    for f in hawor_rec_dir.glob("hawor_results_*.npz"):
+                        hawor_npz = str(f)
+                        break
+                if hawor_npz is None:
+                    raise FileNotFoundError(f"未找到 HaWoR reconstruction npz: {hawor_rec_dir}/hawor_results_*.npz")
+                alignment_dir = str(output_dir / "alignment")
+                args.transform_params = mod01.compute_and_save_transform_params(
+                    ras_output=str(args.ras_dir),
+                    hawor_reconstruction=hawor_npz,
+                    output_dir=alignment_dir,
+                )
+                print(f"  ✓ 自动生成 transform-params: {args.transform_params}")
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"自动生成 transform-params 失败: {e}\n"
+                    f"请先运行: python 01_align_scene.py --ras_output ... --hawor_reconstruction ...\n"
+                    f"或用 --transform-params 手动指定"
+                )
 
     if not Path(args.transform_params).exists():
         raise FileNotFoundError(
@@ -2972,7 +3610,9 @@ def main():
                            two_pass=args.two_pass,
                            support_table=not args.no_support_table,
                            view=args.view,
-                           single_gripper=args.single_gripper)
+                           single_gripper=args.single_gripper,
+                           base_cluster=args.base_cluster,
+                           fixed_base=args.fixed_base)
     sim.run_physics_tracking(start_frame=args.start_frame, num_frames=args.num_frames)
 
 

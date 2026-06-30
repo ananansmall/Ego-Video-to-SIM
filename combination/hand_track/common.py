@@ -69,6 +69,8 @@ FLOATING_LEFT_URDF = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "confi
 R1_RIGHT_SETTINGS = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "settings_right.yaml"
 R1_LEFT_SETTINGS = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "configs" / "settings_left.yaml"
 
+ZUP_TO_YUP = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
+
 R_x = np.diag([1.0, -1.0, -1.0])
 R_AXIS = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
 RXWORLD_TO_SAPIEN = R_AXIS @ R_x
@@ -94,16 +96,40 @@ def detect_hands(hawor_dir):
 
     综合考虑 pred_valid 和 pred_trans/pred_betas 中的 NaN:
     - pred_valid=True 但 pred_trans/pred_betas 含 NaN 的帧视为无效
-    - 有效帧占比 >= 5% 才认为该手活跃
+    - 有效帧占比 >= 5% 才进入候选
+    - 进一步用运动幅度和位置分布排除误检 (静止在原点的"幽灵手")
 
     Args:
         hawor_dir: HaWoR 数据目录
 
     Returns:
-        手部索引列表, 如 [0](左手), [1](右手), [0,1](双手)
+        手部索引列表, 如 [] (无有效手), [0](左手), [1](右手), [0,1](双手)
     """
     hawor_path = Path(hawor_dir)
     VALID_RATIO_THRESHOLD = 0.05
+    MIN_MOTION_RANGE = 0.03          # 有效帧位置 range < 3cm 视为几乎静止
+    ORIGIN_NOISE_RANGE = 0.05        # 均值在原点且 range < 5cm -> 原点噪声
+    ORIGIN_NOISE_CENTER = 0.05       # 原点半径 5cm
+    MIN_HAND_SEPARATION = 0.10       # 双手候选平均位置距离 < 10cm 时只保留更活跃的一只
+
+    def _is_active_hand(trans_valid):
+        """根据有效帧手腕位置判断是否为真实活跃手"""
+        if len(trans_valid) == 0:
+            return False
+        mean_pos = np.mean(trans_valid, axis=0)
+        range_pos = np.max(trans_valid, axis=0) - np.min(trans_valid, axis=0)
+        max_range = np.max(range_pos)
+
+        # 静止在原点 (HaWoR 常见的失败/默认输出)
+        near_origin = np.all(np.abs(mean_pos) < ORIGIN_NOISE_CENTER)
+        if near_origin and max_range < ORIGIN_NOISE_RANGE:
+            return False
+
+        # 几乎完全没有运动
+        if max_range < MIN_MOTION_RANGE:
+            return False
+
+        return True
 
     rec_file = _find_reconstruction_file(hawor_path)
     if rec_file is not None:
@@ -112,20 +138,46 @@ def detect_hands(hawor_dir):
             pred_valid = rec['pred_valid']
             if pred_valid.ndim == 2 and pred_valid.shape[0] >= 2:
                 total = pred_valid.shape[1]
-                hands = []
+                pred_trans = rec.get('pred_trans') if 'pred_trans' in rec else None
+                pred_betas = rec.get('pred_betas') if 'pred_betas' in rec else None
+
+                candidates = []
+                stats = {}
                 for hi in range(min(pred_valid.shape[0], 2)):
                     valid = pred_valid[hi].copy()
                     # 排除 NaN 帧
-                    if 'pred_trans' in rec:
-                        has_nan = np.isnan(rec['pred_trans'][hi]).any(axis=-1)
+                    if pred_trans is not None:
+                        has_nan = np.isnan(pred_trans[hi]).any(axis=-1)
                         valid = valid & ~has_nan
-                    if 'pred_betas' in rec:
-                        has_nan_b = np.isnan(rec['pred_betas'][hi]).any(axis=-1)
+                    if pred_betas is not None:
+                        has_nan_b = np.isnan(pred_betas[hi]).any(axis=-1)
                         valid = valid & ~has_nan_b
-                    if valid.sum() / max(total, 1) >= VALID_RATIO_THRESHOLD:
-                        hands.append(hi)
-                if hands:
-                    return hands
+
+                    valid_ratio = valid.sum() / max(total, 1)
+                    if valid_ratio < VALID_RATIO_THRESHOLD:
+                        continue
+
+                    trans_valid = pred_trans[hi][valid] if pred_trans is not None else np.zeros((0, 3))
+                    if _is_active_hand(trans_valid):
+                        mean_pos = np.mean(trans_valid, axis=0)
+                        range_pos = np.max(trans_valid, axis=0) - np.min(trans_valid, axis=0)
+                        candidates.append(hi)
+                        stats[hi] = {
+                            'valid_ratio': valid_ratio,
+                            'mean_pos': mean_pos,
+                            'range': np.max(range_pos),
+                        }
+
+                # 双手候选时, 检查是否其实是同一只手被误标为两只
+                if len(candidates) == 2:
+                    d = np.linalg.norm(stats[0]['mean_pos'] - stats[1]['mean_pos'])
+                    if d < MIN_HAND_SEPARATION:
+                        # 保留更活跃 (运动范围更大) 的一只
+                        keep = 0 if stats[0]['range'] >= stats[1]['range'] else 1
+                        candidates = [keep]
+
+                if candidates:
+                    return candidates
 
     # fallback: cam_space 目录
     cam_dir = hawor_path / "cam_space"
@@ -279,16 +331,21 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
     s_inv = float(params['s_inv'])
     R_inv = params['R_inv']
     t_inv = params['t_inv']
+    glb_up_axis = str(params.get('glb_up_axis', 'y-up')) if 'glb_up_axis' in params else 'y-up'
     if trimesh is None:
         return []
     trimesh_scene = trimesh.load(str(glb_path))
     obj_actors = []
     temp_files = []
     for geom_name, geom in trimesh_scene.geometry.items():
+        if not hasattr(geom, 'faces'):
+            continue
         vertices = geom.vertices.copy()
         faces = geom.faces.copy()
         if len(vertices) == 0 or len(faces) == 0:
             continue
+        if glb_up_axis == "z-up":
+            vertices = (ZUP_TO_YUP @ vertices.T).T
         vertices_hawor = s_inv * (R_inv @ vertices.T).T + t_inv
         vertices_sapien = (RXWORLD_TO_SAPIEN @ vertices_hawor.T).T
         avg_color = None
@@ -342,17 +399,33 @@ def prepare_arm_urdf(src_urdf_path, arm_prefix="right"):
 # ─── 坐标变换 ────────────────────────────────────────────────────────────────
 
 def _render_to_sapien(pts):
-    """HaWoR render 坐标 → SAPIEN 世界坐标"""
+    """HaWoR SLAM 坐标 → SAPIEN 世界坐标
+
+    pred_trans/顶点在 SLAM 世界 (z-forward, y-down), 用 RXWORLD_TO_SAPIEN
+    (= R_AXIS @ R_x) 转换到 SAPIEN. 这与手部/GLB 一致, 三者同帧.
+    """
     return (RXWORLD_TO_SAPIEN @ pts.T).T
 
 
 def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
-    """HaWoR 相机位姿 → SAPIEN 相机位姿"""
-    cam_pos_sapien = RXWORLD_TO_SAPIEN @ t_c2w
-    cam_R_sapien = RXWORLD_TO_SAPIEN @ R_c2w
-    forward = -cam_R_sapien[:, 2]
+    """HaWoR 相机位姿 → SAPIEN 相机位姿
+
+    R_c2w/t_c2w 已应用 R_x (SLAM→OpenGL 世界), 但相机约定仍为 OpenCV
+    (col0=right, col1=down, col2=forward). SAPIEN 相机约定: col0=forward,
+    col1=left, col2=up.
+
+    关键: 相机 transform 必须用 R_AXIS (而非 RXWORLD_TO_SAPIEN), 才能与
+    手部/GLB (用 RXWORLD_TO_SAPIEN @ SLAM_data = R_AXIS @ OpenGL_data) 同帧.
+    手部 = R_AXIS @ R_x @ SLAM = R_AXIS @ OpenGL, 相机 = R_AXIS @ stored
+    (stored = R_x @ SLAM = OpenGL), 两者均在 R_AXIS @ OpenGL 帧中.
+
+    OpenCV 提取: forward = +col2, left = -col0, up = -col1
+    """
+    cam_pos_sapien = R_AXIS @ t_c2w
+    cam_R_sapien = R_AXIS @ R_c2w
+    forward = cam_R_sapien[:, 2]
     left = -cam_R_sapien[:, 0]
-    up = cam_R_sapien[:, 1]
+    up = -cam_R_sapien[:, 1]
     sapien_cam_R = np.eye(3)
     sapien_cam_R[:, 0] = forward
     sapien_cam_R[:, 1] = left
@@ -509,7 +582,7 @@ def _render_keypoints(joints_sapien, context, internal_scene, kp_nodes,
 def render_robot_video(hawor_dir, ras_dir, transform_params_path, output,
                        hand_idx=1, fps=30, cam_width=1920, cam_height=1080,
                        view="fpv", crf=18, start_frame=0, num_frames=-1,
-                       logger=None):
+                       logger=None, fixed_base=True):
     """渲染 R1 单臂机器人 + GLB 场景视频
 
     核心逻辑来自 02_render_scene.py 的 run_robot_tracking:
@@ -714,7 +787,7 @@ def render_robot_video(hawor_dir, ras_dir, transform_params_path, output,
         retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
         sapien_qpos = retarget_qpos[retarget2sapien]
         gripper_pos_fk, R_ee_world_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
-        tracked_base = _compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+        tracked_base = arm_base_pos if fixed_base else _compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
         robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
         scene.step()
         for link in robot.get_links():
@@ -837,7 +910,7 @@ def render_robot_video(hawor_dir, ras_dir, transform_params_path, output,
 
         gripper_pos_fk, R_ee_world_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
 
-        tracked_base = _compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+        tracked_base = arm_base_pos if fixed_base else _compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
         robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
         scene.step()
 

@@ -1,0 +1,17 @@
+retargeting:
+  type: position
+  # URDF 路径在运行时通过 override 动态替换
+  urdf_path: r1_gripper/r1_gripper_glb.urdf
+
+  target_joint_names: ["left_gripper_finger_joint1", "left_gripper_finger_joint2"]
+  # 3 个目标点: 2 指尖 (位置精确对齐) + 手腕 (方向约束, 在中轴线上即可)
+  target_link_names: ["left_gripper_finger_link1", "left_gripper_finger_link2", "left_gripper_link"]
+  target_link_human_indices: [4, 8, 0]
+
+  add_dummy_free_joint: True
+  low_pass_alpha: 1
+  ignore_mimic_joint: False
+
+  # 优化器参数: 更小的 delta 值使位置约束更紧
+  normal_delta: 0.00001
+  huber_delta: 0.01

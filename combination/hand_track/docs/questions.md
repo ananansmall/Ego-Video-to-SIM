@@ -193,13 +193,16 @@ python hand_track/render_auto.py --mode gripper_arm ...
 - **优化器模式** (alpha=0.6): 对输出 root pose 做 EMA (位置 + 朝向)
 - MANO 数据本身来自神经网络, 已经比较平滑, 只需轻微平滑
 
-### 验证结果
+### 验证结果 (数据集7, 100帧)
 
-```
-gripper 模式:    left 1.31/1.38mm, right 0.36/0.40mm
-gripper_arm 模式: left 1.31/1.38mm, right 0.36/0.40mm
-```
-所有指尖误差 < 1.5mm, 远小于 2% 要求。
+| 模式 | 手 | 指尖1 | 指尖2 | 手腕 | 指向 | 开合 |
+|---|---|---|---|---|---|---|
+| gripper | 右 | 0.91mm | 0.74mm | 0.30mm | 0.04° | 0.03° |
+| gripper | 左 | 3.51mm | 2.79mm | 0.83mm | 0.12° | 0.07° |
+| gripper_arm | 右 | 与 gripper 一致 (同一位姿计算) | | | | |
+| gripper_arm | 左 | 与 gripper 一致 (同一位姿计算) | | | | |
+
+右手误差 < 1mm, 左手误差 ~3.5mm (左手人手几何与夹爪差异更大)。
 
 ---
 
@@ -272,3 +275,357 @@ videos/
 ├── hawor_r1_dual_gripper_urdf.mp4       ← 双夹爪URDF (仅夹爪)
 └── hawor_r1_dual_gripper_urdf_arm.mp4   ← 双夹爪URDF (夹爪+手臂末端)
 ```
+
+---
+
+## Q9: 为什么夹爪3个点不能完全对应上 MANO 手的3个点？
+
+**根因: 夹爪和 MANO 手的几何尺度不同，3个点的相对距离不匹配，刚性变换无法改变距离。**
+
+### 问题
+
+夹爪有3个特征点 (gripper_link, finger_link1, finger_link2)，对应 MANO 手的3个点 (手腕joint0, 指尖joint4, 指尖joint8)。无论怎么旋转平移夹爪，3个点都无法同时精确对应。
+
+### 数学证明
+
+**刚性变换 (旋转+平移) 保持距离不变。** 如果两组3个点的内部距离不同，就不存在刚性变换使它们完全重合。
+
+实测数据 (数据集7):
+
+| 距离 | MANO 右手 | MANO 左手 | 夹爪 (URDF原始) |
+|---|---|---|---|
+| 拇指→腕 (finger1) | **125.5mm** | **116.5mm** | 37.0mm |
+| 食指→腕 (finger2) | **144.8mm** | **127.7mm** | 37.0mm |
+| 指尖间距 | 35.6mm | 59.0mm | 26.9mm |
+
+关键发现: MANO 的拇指(finger1)和食指(finger2)的腕→指尖距离**不同** (右手差 ~19mm, 左手差 ~11mm)。夹爪原始 URDF 两个手指的 X 偏移都是 37mm。
+
+- **腕→指尖距离**: 夹爪 37mm vs MANO 116-145mm，差 79-108mm
+- **指尖间距**: 夹爪基距 26.9mm，通过关节可扩展到 126.9mm，可以覆盖 MANO 范围
+
+### 为什么 `visualize_hand_object.py` 和 `02_render_scene.py` 也不能完全对应？
+
+它们都用 `dex_retargeting` 优化器 (NLopt SLSQP)，优化目标是最小化3个点的位置误差。但优化器也是在做**刚性变换**——8 DOF (6 位姿 + 2 手指关节) 对 9 约束 (3点×3坐标)，超定系统只能求最小二乘解，无法让所有误差为0。
+
+实测优化器的3点误差 vs 解析方法 (数据集7, 右手):
+
+| 方法 | finger1 | finger2 | wrist |
+|---|---|---|---|
+| dex_retargeting 优化器 (2点) | 10.2mm | 10.3mm | 123mm |
+| dex_retargeting 优化器 (3点) | 10.6mm | 10.5mm | 97mm |
+| 解析方法 (不缩放) | 0.4mm | 0.4mm | 85mm |
+| 解析方法 (单值缩放X) | 2.6mm | 3.3mm | 13mm |
+| **解析方法 (独立手指缩放X)** | **0.91mm** | **0.74mm** | **0.30mm** |
+
+### 解决方案: 独立手指缩放X方向
+
+把 URDF 两个手指的 `finger_origin_x` 从 37mm 分别缩放到各自对应的 MANO 腕→指尖距离:
+
+```python
+finger1_origin_x = mean(wrist_to_finger1_dist)  # 拇指→腕, ~125mm(右)/~117mm(左)
+finger2_origin_x = mean(wrist_to_finger2_dist)  # 食指→腕, ~145mm(右)/~128mm(左)
+finger_origin_x  = (finger1 + finger2) / 2      # 平均值, 用于优化器模式回退
+```
+
+**原理**: 
+1. 独立缩放后，gripper_link→finger_link1 的距离匹配 MANO 拇指→腕距离
+2. gripper_link→finger_link2 的距离匹配 MANO 食指→腕距离
+3. gripper_link 自然在腕部位置 (手腕误差 < 1mm)，两个指尖也精确对应
+
+**为什么右手精度高于左手**: MANO 右手几何更接近夹爪 (右手食指 Y 分量 ~13mm vs 夹爪 13.45mm)，而左手食指 Y 分量偏大 (~19mm)，与夹爪的正交几何差异更大。
+
+**残余误差来源**: 即使独立缩放了 X 方向，Y 方向的几何差异仍然存在:
+- 夹爪的指向方向 (X轴) 和开合方向 (Y轴) **严格正交**
+- MANO 手的指向方向 (腕→指尖中点) 和开合方向 (finger2-finger1) **不正交** (内积可达 0.6)
+- 这个"正交性差异"是残余误差的根本原因，无法通过缩放消除
+
+### 验证结果 (数据集7, 100帧)
+
+| 手 | finger1 | finger2 | wrist | 指向误差 | 开合误差 |
+|---|---|---|---|---|---|
+| 右手 | 0.91mm | 0.74mm | 0.30mm | 0.04° | 0.03° |
+| 左手 | 3.51mm | 2.79mm | 0.83mm | 0.12° | 0.07° |
+
+### 类比
+
+想象你有一把小尺子 (37mm) 和一大一小两把长尺子 (拇指 125mm, 食指 145mm)。你不可能把小尺子的两端同时放在两把长尺子的两端——因为长度不同。独立缩放就是把小尺子的两端分别拉长到对应 MANO 手指的长度。
+
+---
+
+## Q10: `render_gripper_only.py` 到底有没有调用 `detect_hands` 做手部检测?
+
+**结论: 调用了。**
+
+### 调用链路
+
+```
+render_gripper_only.py::main()
+  └── detect_hands(args.hawor_dir)      ← 自动检测
+      └── 返回 [0] / [1] / [0,1] / []
+  └── render_gripper_only_video(hand_idx=...)
+      └── 用传入的 hand_idx 渲染单只手
+```
+
+### 关键代码位置
+
+[render_gripper_only.py](file:///home/an/robot_world_ws/src/dex-retargeting/example/combination/hand_track/render_gripper_only.py#L1345-L1370):
+
+```python
+if args.hand_idx >= 0:
+    hand_indices = [args.hand_idx]
+else:
+    hand_indices = detect_hands(args.hawor_dir)
+    hand_count = len(hand_indices)
+    if hand_count == 0:
+        logger.error("...停止生成")
+        sys.exit(1)
+```
+
+### 为什么感觉"没用检测"?
+
+检测只在 `main()` 入口做一次, 真正的渲染函数 `render_gripper_only_video()` / `render_dual_gripper_video()` 接收的是**已经确定好的 `hand_idx`**。渲染函数内部只负责根据 `hand_idx` 取数据, 不重复做检测。
+
+这样设计的理由是:
+- 检测逻辑与渲染逻辑解耦, 便于复用
+- `render_auto.py` 和 `render_gripper_only.py` 共用 `common.detect_hands()`
+- 用户可以通过 `--hand-idx 0/1` 覆盖检测结果
+
+### 验证
+
+在 `7` 上运行:
+```
+手部检测: 左手 (indices=[0])
+```
+实际视频也只渲染了左手, 与检测结果一致。
+
+---
+
+## Q11: 为什么 `01_align_scene.py` "对齐失败"? 明明有相机位置。
+
+**结论: 对齐本身没失败, 失败的是最后的验证步骤。**
+
+### 对齐到底依赖什么
+
+`01_align_scene.py` 的核心计算只依赖两组相机位姿:
+- RAS 相机轨迹 (`extrinsics/*.txt`)
+- HaWoR 相机轨迹 (`R_c2w`, `t_c2w`)
+
+基于这两组位姿, 脚本计算:
+1. `R_align` — 第一帧相机朝向对齐
+2. `t_align` — 第一帧相机位置对齐
+3. `s_inv` — Umeyama 尺度比
+
+这些计算**不依赖手部数据**。
+
+### "对齐失败"的真实原因
+
+之前的崩溃发生在 **Step 6 验证阶段**:
+
+```python
+from scipy.spatial import cKDTree
+tree = cKDTree(glb_hawor)
+dists, _ = tree.query(pred_trans[hand_idx, valid_frames])
+```
+
+某些数据 (如 `laptop`) 中:
+- `pred_valid[hand_idx]` 为 `True`
+- 但对应帧的 `pred_trans[hand_idx]` 全是 `NaN`
+- `cKDTree.query()` 传入 NaN 数组, 直接崩溃
+
+### 修复方式
+
+已在 [01_align_scene.py](file:///home/an/robot_world_ws/src/dex-retargeting/example/combination/01_align_scene.py) 中修复:
+
+1. 生成 `valid_frames` 时同步过滤 `pred_trans` 中的 NaN:
+   ```python
+   valid_mask = pred_valid[hand_idx] & ~np.isnan(pred_trans[hand_idx]).any(axis=-1)
+   valid_frames = np.where(valid_mask)[0]
+   ```
+
+2. 当 `valid_frames` 为空时, 跳过手-GLB距离验证, 仍然保存 `transform_params.npz`:
+   ```python
+   if len(valid_frames) == 0:
+       print(f"  ⚠ {hand_label} 无有效非NaN帧，跳过手-GLB距离验证")
+   else:
+       ...  # 正常做 cKDTree 验证
+   ```
+
+### 修复后 `laptop` 的运行结果
+
+```
+Step 5: 尺度校正 (Umeyama)
+  s_inv (RAS→HaWoR 缩放): 1.025258
+
+Step 6: 验证对齐
+  GLB中心 (HaWoR): [-0.66681061  1.07988363 -0.1335726 ]
+  ⚠ 左手 无有效非NaN帧，跳过手-GLB距离验证
+
+Step 7: 保存变换参数
+  保存到: .../transform_params.npz
+```
+
+对齐参数正常生成, 后续渲染脚本可以加载 GLB 场景。
+
+### 为什么 `pred_valid=True` 但 `pred_trans=NaN`?
+
+这是 HaWoR 重建结果本身的数据质量问题: 手部被标记为"可见/有效", 但 3D 位置估计失败, 输出默认 NaN。`detect_hands()` 已经在更高层过滤掉这类数据, 所以 `laptop` 被正确识别为只含右手; 但 `01_align_scene.py` 之前没有过滤, 导致验证步骤崩溃。
+
+---
+
+## Q12: 相机轨迹从 HaWoR 到 SAPIEN 的完整映射链是什么？为什么相机方向是错的？
+
+**日期**: 2026-06-26
+**分类**: 调试 / 架构
+
+### 问题
+用户感觉"相机方向是错的"，需要完整追踪相机轨迹从 HaWoR 坐标系到 SAPIEN 渲染坐标系的映射链，并给出实际数值。
+
+### 完整映射链
+
+#### 1. 加载 (load_hawor_c2w, common.py L289-295)
+```python
+rec = np.load(rec_file, allow_pickle=True)
+return rec['R_c2w'], rec['t_c2w']   # 直接读取, 无任何预处理
+```
+- `R_c2w`: (N, 3, 3) 相机到世界的旋转
+- `t_c2w`: (N, 3) 相机到世界的平移 (= 相机在世界中的位置)
+
+#### 2. 关键常量 (common.py L74-76, 02_render_scene.py L151)
+```python
+R_x    = np.diag([1.0, -1.0, -1.0])                          # SLAM→render
+R_AXIS = np.array([[1,0,0],[0,0,1],[0,-1,0]])                # Y-up→Z-up
+RXWORLD_TO_SAPIEN = R_AXIS @ R_x
+```
+数值结果 (det = +1.0):
+```
+RXWORLD_TO_SAPIEN = [[1, 0,  0],
+                     [0, 0, -1],
+                     [0, 1,  0]]
+```
+
+#### 3. 转换函数 (common.py L406-420, 02_render_scene.py L1105-1137, 两处完全相同)
+```python
+def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
+    cam_pos_sapien = RXWORLD_TO_SAPIEN @ t_c2w          # 位置: HaWoR Y-up → SAPIEN Z-up
+    cam_R_sapien   = RXWORLD_TO_SAPIEN @ R_c2w          # 旋转: 同上
+    forward = -cam_R_sapien[:, 2]    # OpenGL: -Z = 前
+    left    = -cam_R_sapien[:, 0]    # OpenGL: -X = 左
+    up      =  cam_R_sapien[:, 1]    # OpenGL: +Y = 上  ← 可疑
+    sapien_cam_R[:, 0] = forward
+    sapien_cam_R[:, 1] = left
+    sapien_cam_R[:, 2] = up
+    if det < 0: SVD 修正
+    return cam_pos_sapien, quaternion_from_matrix(sapien_cam_R)
+```
+
+#### 4. 调用点
+- common.py `render_robot_video`: L814 (初始), L852 (每帧) — 仅 `view=="fpv"`
+- common.py `render_gripper_only_video`: L1052 (初始), L1079 (每帧) — 仅 `view=="fpv"`
+- 02_render_scene.py:
+  - `run_hand_only`: L1558, L1734, L1746, L1840
+  - `run_robot_tracking`: L2067, L2142
+  - `run_robot_only`: L2545, L2580
+
+#### 5. 01_align_scene.py 中 R_c2w 是否被预处理？
+**否。** HaWoR 的 `R_c2w` 直接传给渲染器。仅 RAS 的 `R_c2w` 做了 `ZUP_TO_YUP` 转换。代码注释自相矛盾：文件头注释称 HaWoR 是 "OpenCV 约定 (X=right, Y=down, Z=forward)"，但 `hawor_cam_to_sapien_pose` 实际按 OpenGL 约定 (`forward=-Z, up=+Y`) 处理。
+
+### 实际数值 (trace_camera2.py)
+
+两个数据集第 0 帧:
+```
+R_c2w[0] ≈ diag(1, -1, -1)   ← 哨兵/初始化值 (非真实姿态)
+```
+
+数据集 `7` hand 0 (113 有效帧):
+```
+OpenGL (forward=-Z): cam→hand · forward  mean = +0.933   ← 手在相机前方
+OpenCV  (forward=+Z): cam→hand · forward  mean = -0.933  ← 手在相机后方 (矛盾)
+
+forward (函数输出, SAPIEN 世界): [ 0.0048, -0.9999,  0.0063]   → 朝 SAPIEN -Y
+up      (函数输出, SAPIEN 世界): [-0.0011, -0.0063, -0.9999]   → 朝 SAPIEN -Z
+up · SAPIEN +Z = -1.000   ← 相机 Z 轴 (上方) 指向世界下方！
+```
+
+数据集 `hoi4d`: 相机移动 ~50cm，yaw ∈ [-128°, -83°]，pitch ∈ [-25°, 14°]。
+
+### 结论 (相机方向错误的根因)
+
+1. **前向方向 (forward = -Z) 是对的**：手在相机前方 (点积 +0.933)，SAPIEN 实测 -Y 球体出现在画面中心。
+2. **上方方向 (up = +cam_R_sapien[:, 1]) 是错的**：对于 `R_c2w[0] = diag(1,-1,-1)`，`up = [0,0,-1]` 在 SAPIEN 世界中指向**下方** (`up · +Z = -1.0`)，导致渲染画面**上下颠倒**。
+3. **约定矛盾**：`01_align_scene.py` 注释称 HaWoR 是 OpenCV (Y=down)，但转换函数按 OpenGL (Y=up) 处理。数值证据支持 **forward = -Z (OpenGL 式)**，但相机 Y 轴在 HaWoR 世界中为 -Y，表现为 **"混合" 约定** (Y=down 如 OpenCV，Z=back 如 OpenGL)。
+4. **修正方向**：在混合约定下应为 `up = -cam_R_sapien[:, 1]`，但单独翻转会使 `det = -1` (非正常旋转)，需要协调翻转其他轴或保留 SVD 修正。
+
+---
+
+## Q15: 如何新增一个灵巧手渲染? 为什么用 `render_dexterous_only.py` 而非扩展 `render_gripper_only.py`?
+
+**结论**: 已通过新建 `render_dexterous_only.py` 实现, 支持 6 种灵巧手 (allegro/inspire/shadow/ability/leap/svh), 用 `--robot-name` 指定, 通过 `00_run_pipeline.py --dexterous` 调用。
+
+### 调研结论
+
+1. **GalaxeaManipSim 没有灵巧手**: `/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets` 下只有 r1 / r1_lite / r1_pro 三种平行夹爪, 无多指灵巧手
+2. **dex-retargeting 自带 6 种灵巧手**: `dex-retargeting/assets/robots/hands/{allegro,inspire,shadow,ability,leap,svh}/` 各有完整 URDF + mesh + YAML 配置
+3. **参考实现**: `dex-retargeting/example/position_retargeting/visualize_hand_object.py` 展示了标准加载模式 (add_dummy_free_joint + RetargetingConfig)
+
+### 为什么新建文件而非扩展?
+
+用户原话: "我认为最终的目标是随意替换机器人能渲染, 不过你先把一个灵巧手完成"。新建独立文件有以下好处:
+- **单一职责**: `render_gripper_only.py` 专注 1-DOF 平行夹爪 + 解析对齐; `render_dexterous_only.py` 专注多指灵巧手 + dex-retargeting 优化器
+- **避免破坏现有功能**: `render_gripper_only.py` 已稳定 (指尖误差 0.9-3mm), 扩展会引入复杂分支
+- **统一机器人接口**: 未来其他机器人 (机械臂/双足/灵巧手) 可各自有专用渲染文件, 通过 `--robot-name` 切换
+
+### 关键模式 (来自 visualize_hand_object.py)
+
+```python
+# 1. URDF 加载 (加 6DOF dummy free joint 让手腕可移动)
+robot_urdf = urdf.URDF.load(
+    str(urdf_path),
+    add_dummy_free_joints=True,    # 关键: 让手腕可自由移动
+    build_scene_graph=False,
+)
+
+# 2. 配置加载 (从 dex-retargeting 内置 YAML)
+config_path = get_default_config_path(robot_name, hand_type)
+config = RetargetingConfig.load_from_file(config_path)
+retargeting = config.build()
+
+# 3. Warm start (用 MANO 手腕位姿初始化)
+R_mano = pr.matrix_from_compact_axis_axis(hand_pose_frame[0:3])  # 注意 1D 索引
+R_sapien = RXWORLD_TO_SAPIEN @ R_mano
+wrist_quat = pr.quaternion_from_matrix(R_sapien)
+retargeting.warm_start(...)
+
+# 4. 渲染循环 (优化器自动求手腕+手指)
+ref_value = joints_sapien[target_link_human_indices, :3]
+qpos = retargeting.retarget(ref_value)[retarget2sapien]
+robot.set_qpos(qpos)
+```
+
+### 调用方式
+
+```bash
+# 直接调用
+/home/an/miniconda3/envs/dex/bin/python hand_track/render_dexterous_only.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --robot-name allegro
+
+# 通过一键管线
+python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --dexterous --robot-name inspire
+```
+
+### 6 种灵巧手规格
+
+| 机器人 | 总关节数 | 手指关节数 | target links | 指数 | 说明 |
+|---|---|---|---|---|---|
+| allegro | 22 | 16 | 8 | 4 | 默认, 4 指工业灵巧手 |
+| inspire | 18 | 12 | 5 | 5 | 类人手 (无 _glb 版本, 用原始 URDF) |
+| shadow  | 30 | 24 | 10 | 5 | Shadow Hand |
+| ability | 16 | 10 | 5 | 5 | Ability Hand (PSYONIC) |
+| leap    | 22 | 16 | 8 | 4 | Leap Hand |
+| svh     | 26 | 20 | 10 | 5 | Schunk SVH |
+
+---

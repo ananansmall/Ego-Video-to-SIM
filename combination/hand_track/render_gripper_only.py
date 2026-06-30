@@ -22,7 +22,6 @@ import sys
 import time
 import logging
 import argparse
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -50,542 +49,40 @@ from dex_retargeting.constants import RobotName, HandType, RetargetingType, get_
 from dex_retargeting.retargeting_config import RetargetingConfig
 from mano_layer import MANOLayer
 
-GALAXEA_SIM_PATH = Path("/home/an/robot_world_ws/src/GalaxeaManipSim")
-sys.path.insert(0, str(GALAXEA_SIM_PATH))
-
-R1_MESH_DIR = GALAXEA_SIM_PATH / "galaxea_sim" / "assets" / "r1" / "meshes"
-
-R_x = np.diag([1.0, -1.0, -1.0])
-R_AXIS = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
-RXWORLD_TO_SAPIEN = R_AXIS @ R_x
+# 从 gripper_config 导入夹爪配置
+from gripper_config import (
+    RXWORLD_TO_SAPIEN, R1_MESH_DIR,
+    WARMUP_FRAMES, LP_ALPHA_POS, LP_ALPHA_ORI, LP_ALPHA_ANALYTICAL, GRIPPER_INIT_OPEN,
+    FINGER_BASE_DIST, FINGER_GEOM_ARRAYS, GRIPPER_JOINT_GEOM,
+    EmaTargetSmoother, PositionEmaSmoother,
+    generate_gripper_urdf, prepare_full_arm_urdf, prepare_half_arm_urdf,
+    compute_analytical_gripper_pose, compute_gripper_offset_in_root,
+    init_gripper_retargeting,
+)
+# 新对齐策略 (用户要求: 先对齐夹爪两点, 再用中点-手腕连线确定位姿)
+from align_strategy import (
+    compute_gripper_pose_aligned, compute_arm_root_pose,
+    verify_alignment, print_verification, GRIPPER_OPEN_SCALE,
+)
 
 HAWOR_FOCAL_DEFAULT = 600.0
 
-# ── 平滑参数 (与 02_render_scene.py 一致) ──
-WARMUP_FRAMES = 30          # smoothstep 过渡帧数
-LP_ALPHA_POS = 0.6          # EMA 位置平滑系数 (优化器模式)
-LP_ALPHA_ORI = 0.6          # EMA 朝向平滑系数 (优化器模式)
-LP_ALPHA_ANALYTICAL = 0.9   # EMA 平滑系数 (解析模式, MANO 数据本身平滑, 只需轻微平滑)
-GRIPPER_INIT_OPEN = 0.04    # 夹爪初始开合量 (两个手指都是正值, 在 [0, 0.05] 范围内)
 
+def _compute_gripper_pose_by_strategy(strategy, mano_wrist, mano_finger1, mano_finger2,
+                                       prefix, finger_origin_x, finger1_origin_x, finger2_origin_x,
+                                       open_scale=GRIPPER_OPEN_SCALE):
+    """根据对齐策略选择计算函数 (单/双手通用)
 
-class EmaTargetSmoother:
-    """EMA 目标平滑器 (从 02_render_scene.py 复制)
-
-    对位置和朝向(四元数)做指数移动平均, 减少抖动。
-    alpha 越大越跟随, 越小越平滑。
+    strategy="aligned": 新策略 (先对齐夹爪两点 + 中点手腕连线确定位姿, 带开合缩放)
+    strategy="analytical": 旧策略 (Gram-Schmidt)
     """
-
-    def __init__(self, pos_alpha=LP_ALPHA_POS, ori_alpha=LP_ALPHA_ORI):
-        self.pos_alpha = pos_alpha
-        self.ori_alpha = ori_alpha
-        self.pos = None
-        self.ori_quat = None
-
-    def smooth(self, pos, ori_quat):
-        if self.pos is None:
-            self.pos = pos.copy()
-            self.ori_quat = ori_quat.copy()
-            return self.pos.copy(), self.ori_quat.copy()
-        self.pos = self.pos + self.pos_alpha * (pos - self.pos)
-        self.ori_quat = self.ori_quat + self.ori_alpha * (ori_quat - self.ori_quat)
-        norm = np.linalg.norm(self.ori_quat)
-        if norm > 1e-8:
-            self.ori_quat /= norm
-        if self.ori_quat[0] < 0:
-            self.ori_quat = -self.ori_quat
-        return self.pos.copy(), self.ori_quat.copy()
-
-    def reset(self):
-        self.pos = None
-        self.ori_quat = None
-
-
-class PositionEmaSmoother:
-    """多点位 EMA 平滑器 (用于解析模式: 平滑 MANO 输入位置)
-
-    对多个 3D 点位同时做 EMA 平滑, 保持各点之间的几何关系一致。
-    用于解析模式: 先平滑 MANO 指尖/手腕位置, 再计算解析位姿,
-    这样 root pose 和手指关节都从同一组平滑后的输入导出, 保持一致性。
-    """
-    def __init__(self, alpha=LP_ALPHA_POS):
-        self.alpha = alpha
-        self.positions = None  # (N, 3) array
-
-    def smooth(self, positions):
-        """positions: (N, 3) array, 返回平滑后的 (N, 3) array"""
-        if self.positions is None:
-            self.positions = positions.copy()
-        else:
-            self.positions = self.positions + self.alpha * (positions - self.positions)
-        return self.positions.copy()
-
-    def reset(self):
-        self.positions = None
-
-
-# ── 机器人夹爪几何常数 (从 URDF 提取) ──
-# 两个手指闭合时的距离 (joint1=joint2=0)
-_FINGER_BASE_DIST = 0.026906  # = abs(0.013453 - (-0.013453))
-
-# prefix 相关的手指几何 (numpy 数组, 用于解析计算)
-# 与 _GRIPPER_JOINT_GEOM 一致, 左右手 joint1/joint2 互换
-_FINGER_GEOM_ARRAYS = {
-    "left": {
-        "finger1_origin": np.array([0.03689, 0.013453, 0.00012067]),
-        "finger1_axis": np.array([0.0, 1.0, 0.0]),
-        "finger2_origin": np.array([0.03689, -0.013453, -0.00012053]),
-        "finger2_axis": np.array([0.0, -1.0, 0.0]),
-    },
-    "right": {
-        "finger1_origin": np.array([0.03689, -0.013453, -0.00012053]),
-        "finger1_axis": np.array([0.0, -1.0, 0.0]),
-        "finger2_origin": np.array([0.03689, 0.013453, 0.00012067]),
-        "finger2_axis": np.array([0.0, 1.0, 0.0]),
-    },
-}
-
-
-def _compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, prefix="right"):
-    """从 MANO 指尖向量解析计算夹爪 gripper_link 位姿和手指关节值
-
-    机器人夹爪几何 (prefix 相关):
-      finger1 = gripper_pos + R @ (finger1_origin + finger1_axis * joint1)
-      finger2 = gripper_pos + R @ (finger2_origin + finger2_axis * joint2)
-
-    约束:
-      finger1 = mano_finger1  (精确匹配)
-      finger2 = mano_finger2  (距离匹配, 方向来自朝向)
-
-    解法:
-      1. 从 MANO 指尖向量确定 gripper 朝向 R
-         - Y轴: finger1→finger2 方向 (对应机器人 finger 分离方向)
-         - X轴: wrist→finger_mid 方向 (对应机器人指尖前向)
-         - Z轴: X × Y
-      2. 从指尖距离确定 joint1+joint2
-      3. gripper_pos = mano_finger1 - R @ (finger1_origin + finger1_axis * joint1)
-         (确保 finger1 精确匹配)
-
-    Returns:
-        gripper_pos: (3,) gripper_link 位置
-        gripper_R: (3,3) gripper_link 旋转矩阵
-        joint1, joint2: 手指关节值
-    """
-    fg = _FINGER_GEOM_ARRAYS[prefix]
-
-    # 1. 计算 gripper 朝向
-    v_finger = mano_finger2 - mano_finger1
-    finger_dist = np.linalg.norm(v_finger)
-    if finger_dist < 1e-6:
-        y_axis = np.array([0, 1, 0], dtype=np.float64)
+    if strategy == "aligned":
+        return compute_gripper_pose_aligned(
+            mano_wrist, mano_finger1, mano_finger2, prefix, open_scale=open_scale)
     else:
-        # 关键: y_axis 方向需要与机器人 finger2-finger1 的 Y 分量符号一致
-        # 右手: finger2_origin - finger1_origin = (0, +0.026906, 0) → y_sign=+1
-        # 左手: finger2_origin - finger1_origin = (0, -0.026906, 0) → y_sign=-1
-        # 这样 R @ (finger2_origin - finger1_origin) 与 (mano_finger2 - mano_finger1) 同向
-        finger_diff_robot = fg["finger2_origin"] - fg["finger1_origin"]
-        y_sign = np.sign(finger_diff_robot[1]) if abs(finger_diff_robot[1]) > 1e-6 else 1.0
-        y_axis = y_sign * v_finger / finger_dist
-
-    finger_mid = (mano_finger1 + mano_finger2) / 2
-    v_wrist = finger_mid - mano_wrist
-    wrist_dist = np.linalg.norm(v_wrist)
-    if wrist_dist < 1e-6:
-        x_axis = np.array([1, 0, 0], dtype=np.float64)
-    else:
-        x_axis = v_wrist / wrist_dist
-
-    # Gram-Schmidt 正交化
-    x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-    x_norm = np.linalg.norm(x_axis)
-    if x_norm < 1e-6:
-        x_axis = np.array([1, 0, 0], dtype=np.float64)
-        x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-        x_norm = np.linalg.norm(x_axis)
-        if x_norm < 1e-6:
-            x_axis = np.array([0, 0, 1], dtype=np.float64)
-            x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
-            x_norm = np.linalg.norm(x_axis)
-    x_axis = x_axis / x_norm
-    z_axis = np.cross(x_axis, y_axis)
-    z_axis = z_axis / np.linalg.norm(z_axis)
-
-    gripper_R = np.column_stack([x_axis, y_axis, z_axis])
-
-    # 2. 计算手指关节值
-    # robot finger_dist = _FINGER_BASE_DIST + joint1 + joint2
-    required_open_sum = finger_dist - _FINGER_BASE_DIST
-    joint1 = max(0.0, min(0.05, required_open_sum / 2))
-    joint2 = max(0.0, min(0.05, required_open_sum / 2))
-
-    # 3. 计算 gripper_pos (匹配 fingertip1, 确保精确跟踪)
-    gripper_pos = mano_finger1 - gripper_R @ (fg["finger1_origin"] + fg["finger1_axis"] * joint1)
-
-    return gripper_pos, gripper_R, joint1, joint2
-
-
-# 夹爪 URDF 模板 (只有 gripper 部分)
-_GRIPPER_URDF_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
-<robot name="r1_gripper_{prefix}">
-  <link name="{prefix}_gripper_base_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.01"/>
-      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
-    </inertial>
-  </link>
-  <joint name="{prefix}_gripper_base_joint" type="fixed">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <parent link="{prefix}_gripper_base_link"/>
-    <child link="{prefix}_gripper_link"/>
-  </joint>
-  <link name="{prefix}_gripper_link">
-    <inertial>
-      <origin xyz="-0.031107240301242 -1.38928815840433E-07 -1.43700425780935E-07" rpy="0 0 0"/>
-      <mass value="0.604"/>
-      <inertia ixx="0.000175880119550986" ixy="4.17894263577595E-10" ixz="-5.34925118595879E-10"
-               iyy="9.86374067070897E-05" iyz="-8.18555544397352E-08" izz="0.000165120109045834"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_link.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_link.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_gripper_finger_joint1" type="prismatic">
-    <origin xyz="{joint1_origin}" rpy="0 0 0"/>
-    <parent link="{prefix}_gripper_link"/>
-    <child link="{prefix}_gripper_finger_link1"/>
-    <axis xyz="{joint1_axis}"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
-  </joint>
-  <link name="{prefix}_gripper_finger_link1">
-    <inertial>
-      <origin xyz="-0.0195895587205407 0.0151136130965041 -0.00542255818128545" rpy="0 0 0"/>
-      <mass value="0.027"/>
-      <inertia ixx="2.40569063762433E-06" ixy="-3.99002073372071E-07" ixz="-5.12217975840564E-08"
-               iyy="5.71082134562374E-06" iyz="6.19457183851545E-08" izz="6.4848556091919E-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_gripper_finger_joint2" type="prismatic">
-    <origin xyz="{joint2_origin}" rpy="0 0 0"/>
-    <parent link="{prefix}_gripper_link"/>
-    <child link="{prefix}_gripper_finger_link2"/>
-    <axis xyz="{joint2_axis}"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
-  </joint>
-  <link name="{prefix}_gripper_finger_link2">
-    <inertial>
-      <origin xyz="-0.019589448977496 -0.0151137821219537 0.00542248304315596" rpy="0 0 0"/>
-      <mass value="0.027"/>
-      <inertia ixx="2.40568339234574E-06" ixy="3.98973340378568E-07" ixz="5.12055978237686E-08"
-               iyy="5.71082803574443E-06" iyz="6.19476812784019E-08" izz="6.48485579679143E-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2.STL"/>
-      </geometry>
-    </collision>
-  </link>
-</robot>
-"""
-
-
-# 夹爪+手臂末端 URDF 模板 (gripper + arm_link4/5/6)
-# arm_base_link 代表 arm_link3 的位置, 包含 arm_joint4/5/6 + gripper
-# 比纯夹爪更生动, 同时排除手臂底座不确定性
-_GRIPPER_WITH_ARM_URDF_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
-<robot name="r1_gripper_arm_{prefix}">
-  <link name="{prefix}_arm_base_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.01"/>
-      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
-    </inertial>
-  </link>
-  <joint name="{prefix}_arm_joint4" type="revolute">
-    <origin xyz="0.02735 -0.069767 0" rpy="0 0 0"/>
-    <parent link="{prefix}_arm_base_link"/>
-    <child link="{prefix}_arm_link4"/>
-    <axis xyz="1 0 0"/>
-    <limit lower="-2.8798" upper="2.8798" effort="7" velocity="25.133"/>
-  </joint>
-  <link name="{prefix}_arm_link4">
-    <inertial>
-      <origin xyz="0.24285 -0.0023763 -3.4603E-07" rpy="0 0 0"/>
-      <mass value="0.694"/>
-      <inertia ixx="8.45E-05" ixy="8.2612E-07" ixz="2.2124E-09" iyy="0.00010174" iyz="5.3644E-09" izz="9.7044E-05"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link4.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="1 1 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link4.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_arm_joint5" type="revolute">
-    <origin xyz="0.2463 0.00050106 0" rpy="0 0 0"/>
-    <parent link="{prefix}_arm_link4"/>
-    <child link="{prefix}_arm_link5"/>
-    <axis xyz="0 -1 0"/>
-    <limit lower="-1.6581" upper="1.6581" effort="7" velocity="25.133"/>
-  </joint>
-  <link name="{prefix}_arm_link5">
-    <inertial>
-      <origin xyz="0.054309 -0.0041807 -3.8613E-06" rpy="0 0 0"/>
-      <mass value="0.417"/>
-      <inertia ixx="8.4E-05" ixy="-1.6234E-05" ixz="-7.4239E-08" iyy="9.8498E-05" iyz="-1.3874E-08" izz="0.00011333"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link5.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="1 1 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link5.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_arm_joint6" type="revolute">
-    <origin xyz="0.058249 -0.00049975 0" rpy="0 0 0"/>
-    <parent link="{prefix}_arm_link5"/>
-    <child link="{prefix}_arm_link6"/>
-    <axis xyz="1 0 0"/>
-    <limit lower="-2.8798" upper="2.8798" effort="7" velocity="25.133"/>
-  </joint>
-  <link name="{prefix}_arm_link6">
-    <inertial>
-      <origin xyz="0.028138 1.2134E-07 5.405E-08" rpy="0 0 0"/>
-      <mass value="0.037"/>
-      <inertia ixx="3.5662E-06" ixy="6.6514E-12" ixz="2.9628E-12" iyy="2.0238E-06" iyz="-4.0687E-12" izz="2.0238E-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link6.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_arm_link6.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_gripper_joint" type="fixed">
-    <origin xyz="0.1039 0 0" rpy="0 0 0"/>
-    <parent link="{prefix}_arm_link6"/>
-    <child link="{prefix}_gripper_link"/>
-  </joint>
-  <link name="{prefix}_gripper_link">
-    <inertial>
-      <origin xyz="-0.031107240301242 -1.38928815840433E-07 -1.43700425780935E-07" rpy="0 0 0"/>
-      <mass value="0.604"/>
-      <inertia ixx="0.000175880119550986" ixy="4.17894263577595E-10" ixz="-5.34925118595879E-10"
-               iyy="9.86374067070897E-05" iyz="-8.18555544397352E-08" izz="0.000165120109045834"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_link.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_link.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_gripper_finger_joint1" type="prismatic">
-    <origin xyz="{joint1_origin}" rpy="0 0 0"/>
-    <parent link="{prefix}_gripper_link"/>
-    <child link="{prefix}_gripper_finger_link1"/>
-    <axis xyz="{joint1_axis}"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
-  </joint>
-  <link name="{prefix}_gripper_finger_link1">
-    <inertial>
-      <origin xyz="-0.0195895587205407 0.0151136130965041 -0.00542255818128545" rpy="0 0 0"/>
-      <mass value="0.027"/>
-      <inertia ixx="2.40569063762433E-06" ixy="-3.99002073372071E-07" ixz="-5.12217975840564E-08"
-               iyy="5.71082134562374E-06" iyz="6.19457183851545E-08" izz="6.4848556091919E-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1.STL"/>
-      </geometry>
-    </collision>
-  </link>
-  <joint name="{prefix}_gripper_finger_joint2" type="prismatic">
-    <origin xyz="{joint2_origin}" rpy="0 0 0"/>
-    <parent link="{prefix}_gripper_link"/>
-    <child link="{prefix}_gripper_finger_link2"/>
-    <axis xyz="{joint2_axis}"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
-  </joint>
-  <link name="{prefix}_gripper_finger_link2">
-    <inertial>
-      <origin xyz="-0.019589448977496 -0.0151137821219537 0.00542248304315596" rpy="0 0 0"/>
-      <mass value="0.027"/>
-      <inertia ixx="2.40568339234574E-06" ixy="3.98973340378568E-07" ixz="5.12055978237686E-08"
-               iyy="5.71082803574443E-06" iyz="6.19476812784019E-08" izz="6.48485579679143E-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2.STL"/>
-      </geometry>
-      <material name="">
-        <color rgba="0.823529411764706 0.823529411764706 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2.STL"/>
-      </geometry>
-    </collision>
-  </link>
-</robot>
-"""
-
-
-# 夹爪手指关节几何 (从 robot.urdf 提取, 左右手 joint1/joint2 互换)
-_GRIPPER_JOINT_GEOM = {
-    "left": {
-        "joint1_origin": "0.03689 0.013453 0.00012067",
-        "joint1_axis": "0 1 0",
-        "joint2_origin": "0.03689 -0.013453 -0.00012053",
-        "joint2_axis": "0 -1 0",
-    },
-    "right": {
-        "joint1_origin": "0.03689 -0.013453 -0.00012053",
-        "joint1_axis": "0 -1 0",
-        "joint2_origin": "0.03689 0.013453 0.00012067",
-        "joint2_axis": "0 1 0",
-    },
-}
-
-
-def _generate_gripper_urdf(prefix="right"):
-    """生成只包含夹爪的 URDF 文件"""
-    xml = _GRIPPER_URDF_TEMPLATE.format(
-        prefix=prefix,
-        mesh_dir=str(R1_MESH_DIR),
-        **_GRIPPER_JOINT_GEOM[prefix],
-    )
-    temp_dir = tempfile.mkdtemp(prefix=f"r1_gripper_{prefix}-")
-    temp_path = f"{temp_dir}/r1_gripper_{prefix}.urdf"
-    with open(temp_path, "w") as f:
-        f.write(xml)
-    return temp_path
-
-
-def _generate_gripper_with_arm_urdf(prefix="right"):
-    """生成包含夹爪+arm_link4/5/6的 URDF 文件"""
-    xml = _GRIPPER_WITH_ARM_URDF_TEMPLATE.format(
-        prefix=prefix,
-        mesh_dir=str(R1_MESH_DIR),
-        **_GRIPPER_JOINT_GEOM[prefix],
-    )
-    temp_dir = tempfile.mkdtemp(prefix=f"r1_gripper_arm_{prefix}-")
-    temp_path = f"{temp_dir}/r1_gripper_arm_{prefix}.urdf"
-    with open(temp_path, "w") as f:
-        f.write(xml)
-    return temp_path
-
-
-def _compute_gripper_offset_in_root(robot, prefix):
-    """计算 gripper_link 相对于 root link 的位置 offset (当所有 arm_joint=0 时)
-
-    由于 fix_root_link=True, root link 的位姿为 identity。
-    gripper_link 的位姿就是它相对于 root 的 offset。
-
-    用于 gripper_arm 模式: 设置 root pose 时需要补偿这个 offset,
-    使得 gripper_link 的实际位置等于 retargeting FK 给出的位置。
-
-    Returns:
-        offset_pos: (3,) gripper_link 相对于 root 的位置
-        offset_R: (3,3) gripper_link 相对于 root 的旋转
-    """
-    target_name = f"{prefix}_gripper_link"
-    for link in robot.get_links():
-        if link.get_name() == target_name:
-            pose = link.get_entity_pose()
-            offset_pos = np.array(pose.p)
-            offset_R = pr.matrix_from_quaternion(np.array(pose.q))
-            return offset_pos, offset_R
-    return np.zeros(3), np.eye(3)
-
-
-# ─── 从 common.py 导入共享函数 ──────────────────────────────────────────────
+        return compute_analytical_gripper_pose(
+            mano_wrist, mano_finger1, mano_finger2, prefix, finger_origin_x,
+            finger1_origin_x=finger1_origin_x, finger2_origin_x=finger2_origin_x)
 
 from common import (
     detect_hands, load_hawor_data, load_hawor_c2w, setup_scene,
@@ -594,7 +91,7 @@ from common import (
     _compute_wrist_positions_sapien, _get_gripper_pose_from_retargeting,
 )
 
-# 重新定义 _ensure_transform_params (从 render_auto.py 复制)
+
 def _ensure_transform_params(ras_dir, hawor_dir, output_dir, logger):
     tp_path = os.path.join(output_dir, "transform_params.npz")
     if os.path.exists(tp_path):
@@ -692,19 +189,16 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                               hand_idx=1, fps=30, cam_width=1920, cam_height=1080,
                               view="fpv", crf=18, start_frame=0, num_frames=-1,
                               with_arm=False, smooth=1, viewer=False, verify=False,
-                              analytical=True, logger=None):
+                              analytical=True, arm_mode="half", logger=None,
+                              strategy="aligned", open_scale=GRIPPER_OPEN_SCALE):
     """渲染只有夹爪URDF的视频 (不加载手臂)
 
-    只加载 gripper_link + finger_link1/2 的 URDF, 夹爪位姿直接从
-    retargeting FK 获取。不需要 IK, 不需要手臂底座。
-
     Args:
-        与 render_robot_video 相同
-        smooth: 0=不平滑, 1=EMA平滑 (位置+朝向)
-        viewer: True=使用 SAPIEN Viewer 实时循环播放 (不保存视频)
-        verify: True=计算并输出指尖位置/手腕位姿误差
-        analytical: True=解析模式 (从MANO指尖向量直接计算root位姿, 指尖误差≈0)
-                    False=优化器模式 (NLopt SLSQP, 可能有局部最优问题)
+        analytical: True=解析模式 (Gram-Schmidt, 有投影误差)
+                    False=优化器模式 (dex_retargeting PositionOptimizer, gripper-only URDF, 3点约束)
+        arm_mode: gripper_arm 模式的手臂类型: "half"=link4-6, "full"=link1-6
+        strategy: 对齐策略 "aligned"=新策略(先对齐夹爪两点+中点手腕连线), "analytical"=旧策略
+        open_scale: 夹爪开合缩放因子 (仅 aligned 策略使用)
     """
     import logging
     if logger is None:
@@ -735,30 +229,43 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
     betas_mean = hawor_data["pred_betas"][start_frame].astype(np.float32)
     mano_layer = MANOLayer(prefix, betas_mean)
 
-    # ── Retargeting (获取 ref_indices 和 FK) ──
-    robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
-    RetargetingConfig.set_default_urdf_dir(str(robot_dir))
-    hand_type = HandType.left if hand_idx == 0 else HandType.right
-    config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, hand_type)
-    # 用3个目标点 (与 02_render_scene.py 的 run_robot_tracking 一致):
-    #   finger_link1 → MANO joint4 (指尖1)
-    #   finger_link2 → MANO joint8 (指尖2)
-    #   gripper_link  → MANO joint0 (手腕)
-    # 3点约束 (9 > 8 DOF) 完全确定 root pose (6 DOF) + 手指关节 (2 DOF)
-    override = dict(
-        add_dummy_free_joint=True, normal_delta=1e-5, huber_delta=0.01,
-        target_link_names=[f"{prefix}_gripper_finger_link1",
-                           f"{prefix}_gripper_finger_link2",
-                           f"{prefix}_gripper_link"],
-        target_link_human_indices=np.array([4, 8, 0]),
-        target_joint_names=[f"{prefix}_gripper_finger_joint1",
-                            f"{prefix}_gripper_finger_joint2"],
-    )
-    config = RetargetingConfig.load_from_file(config_path, override=override)
-    retargeting = config.build()
-    ref_indices = retargeting.optimizer.target_link_human_indices
-    fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
-    # fixed_qpos 将在 URDF 加载后设置 (需要 init_qpos)
+    # ── finger_origin_x: 始终使用 URDF 原始 37mm (与 02_render_scene.py 一致, 不缩放) ──
+    # 02_render_scene.py 从不缩放 finger origin, 始终使用 r1_lite_robot_glb.urdf 的原始 0.03689
+    # 我们也保持一致, 所有模式 (gripper / gripper_arm) 都使用 37mm
+    finger_origin_x = 0.03689
+    finger1_origin_x = 0.03689
+    finger2_origin_x = 0.03689
+    logger.info(f"  finger_origin_x = {finger_origin_x*1000:.1f}mm (URDF 原始值, 不缩放, 与 02_render_scene.py 一致)")
+
+    # ── 初始化 Retargeting ──
+    if analytical:
+        # 解析模式: 仍需 ref_indices 用于关键点标记, 用 gripper-only 配置
+        robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
+        RetargetingConfig.set_default_urdf_dir(str(robot_dir))
+        retargeting, ref_indices, _ = init_gripper_retargeting(prefix, finger_origin_x, PROJECT_ROOT)
+        fixed_qpos = np.zeros(0, dtype=np.float32)  # 解析模式不需要 fixed_qpos
+        strat_label = "新对齐策略(先对齐夹爪两点+中点手腕连线)" if strategy == "aligned" else "旧策略(Gram-Schmidt)"
+        logger.info(f"  模式: 解析 ({strat_label}, open_scale={open_scale})")
+    else:
+        # 优化器模式: 用 gripper-only URDF + 3 target links, 每个手指独立缩放
+        robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
+        RetargetingConfig.set_default_urdf_dir(str(robot_dir))
+        retargeting, ref_indices, _ = init_gripper_retargeting(
+            prefix, finger_origin_x, PROJECT_ROOT,
+            finger1_origin_x=finger1_origin_x,
+            finger2_origin_x=finger2_origin_x,
+        )
+        # gripper-only URDF 没有 arm 关节, 不需要 fixed_qpos
+        fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
+        fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
+        logger.info(f"  模式: 优化器 (gripper-only URDF, 8 DOF = 6 dummy + 2 finger, 3 target points, 独立缩放)")
+
+    # ── 对齐策略选择 ──
+    def _compute_gripper_pose(mano_wrist, mano_finger1, mano_finger2):
+        """根据 strategy 选择对齐策略计算夹爪位姿"""
+        return _compute_gripper_pose_by_strategy(
+            strategy, mano_wrist, mano_finger1, mano_finger2,
+            prefix, finger_origin_x, finger1_origin_x, finger2_origin_x, open_scale)
 
     # ── 创建场景 ──
     scene = setup_scene()
@@ -772,11 +279,18 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
 
     # ── 加载夹爪 URDF ──
     if with_arm:
-        gripper_urdf_path = _generate_gripper_with_arm_urdf(prefix)
-        logger.info(f"  模式: 夹爪+手臂末端 (arm_link4/5/6)")
+        if arm_mode == "full":
+            gripper_urdf_path = prepare_full_arm_urdf(prefix)
+            logger.info(f"  渲染URDF: 完整手臂+夹爪 (arm_link1-6 + gripper, 不缩放, 参考 GalaxeaManipSim)")
+        else:
+            gripper_urdf_path = prepare_half_arm_urdf(prefix)
+            logger.info(f"  渲染URDF: 半个手臂+夹爪 (arm_link4-6 + gripper, 不缩放, 参考 GalaxeaManipSim)")
     else:
-        gripper_urdf_path = _generate_gripper_urdf(prefix)
-        logger.info(f"  模式: 仅夹爪")
+        gripper_urdf_path = generate_gripper_urdf(
+            prefix, finger_origin_x,
+            finger1_origin_x=finger1_origin_x, finger2_origin_x=finger2_origin_x,
+        )
+        logger.info(f"  渲染URDF: 仅夹爪")
     loader = scene.create_urdf_loader()
     loader.fix_root_link = True
     loader.load_multiple_collisions_from_file = True
@@ -787,7 +301,6 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
 
     gripper_idx1 = joint_names.index(f"{prefix}_gripper_finger_joint1")
     gripper_idx2 = joint_names.index(f"{prefix}_gripper_finger_joint2")
-    # arm 关节索引 (gripper_arm 模式下需要显式设为 0, 防止物理仿真漂移)
     arm_joint_indices = [i for i, n in enumerate(joint_names) if 'arm_joint' in n]
 
     for joint in robot.get_active_joints():
@@ -799,43 +312,28 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
     robot.set_qpos(init_qpos)
 
     # retargeting → sapien qpos 映射
-    retarget2sapien = np.array(
-        [retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names]
-    ).astype(int)
-    # SAPIEN 关节名 → retargeting 关节索引 (用于直接从 retarget_qpos 取手指关节值)
     sapien_name_to_retarget_idx = {
         n: retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names
     }
-    # retargeting 索引 → SAPIEN 索引 (用于设置 fixed_qpos)
-    sapien2retarget = {}
-    for sapien_i, retarget_i in enumerate(retarget2sapien):
-        sapien2retarget[retarget_i] = sapien_i
-    # 设置 fixed_qpos (与 02_render_scene.py 一致: 从 init_qpos 取值)
-    fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
-    for i, retarget_idx in enumerate(fixed_retarget_indices):
-        if retarget_idx in sapien2retarget:
-            fixed_qpos[i] = init_qpos[sapien2retarget[retarget_idx]]
 
     scene.step()
     scene.update_render()
 
-    # 计算 gripper_link 相对于 root 的 offset (用于 gripper_arm 模式补偿)
-    # 注意: scene.step() 会导致 arm 关节漂移, 必须显式重置为 0 后再计算 offset
+    # 计算 gripper_link 相对于 root 的 offset
     if with_arm and arm_joint_indices:
         qpos_now = robot.get_qpos().copy()
         for ai in arm_joint_indices:
             qpos_now[ai] = 0.0
         robot.set_qpos(qpos_now)
         scene.update_render()
-    gripper_offset_pos, gripper_offset_R = _compute_gripper_offset_in_root(robot, prefix)
     if with_arm:
-        logger.info(f"  gripper_link 相对于 root 的 offset: pos={gripper_offset_pos}, R=...")
+        gripper_offset_pos, gripper_offset_R = compute_gripper_offset_in_root(robot, prefix)
     else:
-        # gripper 模式下 offset 应该为 0 (gripper_base_link 和 gripper_link 之间是 fixed joint, origin 0 0 0)
         gripper_offset_pos = np.zeros(3)
         gripper_offset_R = np.eye(3)
 
-    # ── Warm start retargeting ──
+    # ── Warm start retargeting (用解析位姿初始化, 避免局部最优) ──
+    hand_type = HandType.left if hand_idx == 0 else HandType.right
     for probe_idx in range(num_frames):
         g_idx = start_frame + probe_idx
         if not hawor_data["pred_valid"][g_idx]:
@@ -847,17 +345,27 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
             continue
         _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
         joints_sapien = _render_to_sapien(j)
-        wrist_R_render = pr.matrix_from_compact_axis_angle(rot)
-        wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
-        wrist_quat = pr.quaternion_from_matrix(wrist_R_sapien)
+        mano_wrist = joints_sapien[0, :3]
+        mano_finger1 = joints_sapien[ref_indices[0], :3]
+        mano_finger2 = joints_sapien[ref_indices[1], :3]
+        g_pos, g_R, joint1, joint2 = _compute_gripper_pose(mano_wrist, mano_finger1, mano_finger2)
+        g_quat = pr.quaternion_from_matrix(g_R)
         retargeting.warm_start(
-            joints_sapien[0, :3], wrist_quat,
-            hand_type=hand_type, is_mano_convention=True,
+            g_pos, g_quat,
+            hand_type=hand_type, is_mano_convention=False,
         )
-        logger.info(f"  ✓ Warm start 完成 (帧 {g_idx})")
+        # 用解析关节值初始化手指
+        finger_j1_name = f"{prefix}_gripper_finger_joint1"
+        finger_j2_name = f"{prefix}_gripper_finger_joint2"
+        for num, jname in enumerate(retargeting.optimizer.target_joint_names):
+            if jname == finger_j1_name:
+                retargeting.last_qpos[num] = joint1
+            elif jname == finger_j2_name:
+                retargeting.last_qpos[num] = joint2
+        logger.info(f"  ✓ Warm start 完成 (帧 {g_idx}), j1={joint1:.4f}, j2={joint2:.4f}")
         break
 
-    # ── 探测首帧有效位姿 (用于 warmup smoothstep) ──
+    # ── 探测首帧有效位姿 ──
     first_valid_pos = None
     first_valid_quat = None
     for probe_idx in range(num_frames):
@@ -872,42 +380,32 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
         _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
         joints_sapien = _render_to_sapien(j)
         if analytical:
-            # 解析模式: 直接从 MANO 指尖向量计算 gripper_link 位姿
             mano_wrist = joints_sapien[0, :3]
             mano_finger1 = joints_sapien[ref_indices[0], :3]
             mano_finger2 = joints_sapien[ref_indices[1], :3]
-            g_pos, g_R, _, _ = _compute_analytical_gripper_pose(
-                mano_wrist, mano_finger1, mano_finger2, prefix)
-            # 转换为 root 位姿
+            g_pos, g_R, _, _ = _compute_gripper_pose(mano_wrist, mano_finger1, mano_finger2)
             root_R = g_R @ gripper_offset_R.T
             root_pos = g_pos - root_R @ gripper_offset_pos
             first_valid_pos = root_pos.copy()
             first_valid_quat = pr.quaternion_from_matrix(root_R)
         else:
-            ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+            ref_value = joints_sapien[ref_indices, :3]
             retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-            _, gripper_R_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
-            # Hybrid: FK 朝向 + 解析位置 (匹配 fingertip1)
-            mano_finger1 = joints_sapien[ref_indices[0], :3]
-            mano_finger2 = joints_sapien[ref_indices[1], :3]
-            mano_finger_dist = float(np.linalg.norm(mano_finger1 - mano_finger2))
-            required_open = max(0.0, mano_finger_dist - _FINGER_BASE_DIST)
-            joint1 = min(0.05, required_open / 2)
-            root_R = gripper_R_fk @ gripper_offset_R.T
-            fg = _FINGER_GEOM_ARRAYS[prefix]
-            finger1_in_root = gripper_offset_pos + gripper_offset_R @ (fg["finger1_origin"] + fg["finger1_axis"] * joint1)
-            root_pos = mano_finger1 - root_R @ finger1_in_root
+            g_pos_fk, g_R_fk = _get_gripper_pose_from_retargeting(
+                retargeting, retarget_qpos, prefix)
+            root_R = g_R_fk @ gripper_offset_R.T
+            root_pos = g_pos_fk - root_R @ gripper_offset_pos
             first_valid_pos = root_pos.copy()
             first_valid_quat = pr.quaternion_from_matrix(root_R)
         break
 
-    # ── Warmup smoothstep 过渡 (从初始位姿到首帧有效位姿) ──
+    # ── Warmup smoothstep ──
     if first_valid_pos is not None:
         init_root_pos = np.zeros(3)
         init_root_quat = np.array([1.0, 0.0, 0.0, 0.0])
         for wi in range(WARMUP_FRAMES):
             t = (wi + 1) / WARMUP_FRAMES
-            t = t * t * (3 - 2 * t)  # smoothstep
+            t = t * t * (3 - 2 * t)
             interp_pos = init_root_pos * (1 - t) + first_valid_pos * t
             interp_quat = init_root_quat * (1 - t) + first_valid_quat * t
             norm = np.linalg.norm(interp_quat)
@@ -917,9 +415,7 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
             scene.step()
         logger.info(f"  Warmup 完成 ({WARMUP_FRAMES} 帧 smoothstep 过渡)")
 
-    # ── EMA 目标平滑器 ──
-    # 解析模式: 平滑 MANO 输入位置 (保持 root pose 和手指关节一致性)
-    # 优化器模式: 平滑输出 root pose
+    # ── EMA 平滑器 ──
     target_smoother = None
     mano_smoother = None
     if smooth == 1:
@@ -968,7 +464,7 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
         if sapien_viewer:
             sapien_viewer.set_camera_xyz(x=cam_pos[0], y=cam_pos[1], z=cam_pos[2])
 
-    # ── 视频写入器 (仅非 viewer 模式) ──
+    # ── 视频写入器 ──
     writer = None
     if not viewer:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -983,17 +479,17 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
     if verify:
         logger.info("  验证模式: 开启 (计算指尖位置 + 手腕位姿误差)")
 
-    # ── 渲染循环 (viewer 模式循环播放) ──
+    # ── 渲染循环 ──
     animation_loop = True
     while animation_loop:
         if not viewer:
-            animation_loop = False  # 非 viewer 模式只跑一遍
+            animation_loop = False
 
         for local_idx in trange(num_frames, desc=f"夹爪URDF-{prefix}", disable=viewer):
             global_idx = start_frame + local_idx
 
-            # 更新相机
-            if view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
+            # 更新相机 (与 02_render_scene.py 一致: 有相机轨迹时始终每帧更新)
+            if R_c2w_all is not None and t_c2w_all is not None:
                 cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[global_idx], t_c2w_all[global_idx])
                 if camera:
                     camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
@@ -1048,8 +544,6 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
             kp_nodes = _render_keypoints(joints_sapien[:, :3], context, internal_scene, kp_nodes, ref_indices, radius=0.012)
 
             if analytical:
-                # 解析模式: 先平滑 MANO 输入位置, 再计算解析位姿
-                # (保持 root pose 和手指关节一致性, 指尖误差仅来自输入平滑滞后)
                 mano_wrist = joints_sapien[0, :3]
                 mano_finger1 = joints_sapien[ref_indices[0], :3]
                 mano_finger2 = joints_sapien[ref_indices[1], :3]
@@ -1057,53 +551,36 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                     mano_pts = np.stack([mano_wrist, mano_finger1, mano_finger2])
                     mano_pts = mano_smoother.smooth(mano_pts)
                     mano_wrist, mano_finger1, mano_finger2 = mano_pts[0], mano_pts[1], mano_pts[2]
-                g_pos, g_R, joint1, joint2 = _compute_analytical_gripper_pose(
-                    mano_wrist, mano_finger1, mano_finger2, prefix)
-                # 从 gripper_link 位姿转换为 root 位姿 (gripper_arm 模式需要减去 offset)
+                g_pos, g_R, joint1, joint2 = _compute_gripper_pose(mano_wrist, mano_finger1, mano_finger2)
                 root_R = g_R @ gripper_offset_R.T
                 root_pos = g_pos - root_R @ gripper_offset_pos
                 root_quat = pr.quaternion_from_matrix(root_R)
                 robot.set_root_pose(sapien.Pose(root_pos.tolist(), root_quat.tolist()))
                 qpos = robot.get_qpos().copy()
-                # 显式设置 arm 关节为 0 (防止物理仿真漂移)
                 for arm_idx in arm_joint_indices:
                     qpos[arm_idx] = 0.0
                 qpos[gripper_idx1] = float(joint1)
                 qpos[gripper_idx2] = float(joint2)
                 robot.set_qpos(qpos)
             else:
-                # Retargeting 优化器模式 (与 02_render_scene.py 的 run_robot_tracking 一致):
-                # 1. 用 3 点 retargeting 优化器获取 root pose (6 DOF) + 手指关节 (2 DOF)
-                # 2. 从内部机器人 FK 获取 gripper_link 朝向 (优化器的最佳朝向估计)
-                # 3. 手指关节用解析值 (从 MANO 指尖距离计算, 确保夹爪开合)
-                # 4. root 位置用解析值 (匹配 fingertip1, 确保指尖精确跟踪)
-                #    (Hybrid 方案: FK 朝向 + 解析位置 + 解析手指关节)
-                ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+                # 优化器模式: gripper-only URDF, 8 DOF, 3 target points
+                ref_value = joints_sapien[ref_indices, :3]
                 retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
 
-                # 夹爪朝向: 用 retargeting FK (与 02_render_scene.py 一致)
-                _, gripper_R_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
+                # 从优化器 FK 获取 gripper_link 位姿
+                g_pos_fk, g_R_fk = _get_gripper_pose_from_retargeting(
+                    retargeting, retarget_qpos, prefix)
 
-                # 手指关节: 用解析值从 MANO 指尖距离计算 (确保夹爪开合)
-                # 优化器给的手指关节值常接近 0 (几何不匹配导致), 无法体现开合
-                mano_finger1 = joints_sapien[ref_indices[0], :3]
-                mano_finger2 = joints_sapien[ref_indices[1], :3]
-                mano_finger_dist = float(np.linalg.norm(mano_finger1 - mano_finger2))
-                required_open = max(0.0, mano_finger_dist - _FINGER_BASE_DIST)
-                joint1 = min(0.05, required_open / 2)
-                joint2 = min(0.05, required_open / 2)
+                # 从优化器 qpos 提取手指关节值
+                joint1 = retarget_qpos[sapien_name_to_retarget_idx[f"{prefix}_gripper_finger_joint1"]]
+                joint2 = retarget_qpos[sapien_name_to_retarget_idx[f"{prefix}_gripper_finger_joint2"]]
 
-                # root 朝向: 用 FK 朝向 (补偿 gripper_link 相对于 root 的 offset)
-                root_R = gripper_R_fk @ gripper_offset_R.T
-                # root 位置: 解析计算, 匹配 fingertip1
-                # finger1_pos = root_pos + root_R @ (gripper_offset_pos + gripper_offset_R @ (finger1_origin + finger1_axis * joint1))
-                # 令 finger1_pos = mano_finger1, 解出 root_pos
-                fg = _FINGER_GEOM_ARRAYS[prefix]
-                finger1_in_root = gripper_offset_pos + gripper_offset_R @ (fg["finger1_origin"] + fg["finger1_axis"] * joint1)
-                root_pos = mano_finger1 - root_R @ finger1_in_root
+                # 从 gripper_link 位姿转换为 root 位姿
+                root_R = g_R_fk @ gripper_offset_R.T
+                root_pos = g_pos_fk - root_R @ gripper_offset_pos
                 root_quat = pr.quaternion_from_matrix(root_R)
 
-                # EMA 平滑 (对 root pose 做平滑, 减少抖动)
+                # EMA 平滑
                 if target_smoother is not None:
                     root_pos, root_quat = target_smoother.smooth(root_pos, root_quat)
 
@@ -1116,11 +593,9 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                 qpos[gripper_idx2] = float(joint2)
                 robot.set_qpos(qpos)
 
-            # 验证: 计算指尖位置和手腕位姿误差
-            # 注意: verify 模式下不调用 scene.step(), 避免物理仿真导致 arm 关节漂移
+            # 验证误差
             if verify:
                 scene.update_render()
-                # 获取 SAPIEN 中 finger_link1/2 的实际位置
                 finger1_pos = None
                 finger2_pos = None
                 gripper_link_pos = None
@@ -1135,13 +610,9 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                         pose = link.get_entity_pose()
                         gripper_link_pos = np.array(pose.p)
                         gripper_link_R = pr.matrix_from_quaternion(np.array(pose.q))
-                # MANO 指尖位置 (ref_indices=[4,8,0], 即 finger1→joint4, finger2→joint8, wrist→joint0)
                 mano_finger1 = joints_sapien[ref_indices[0], :3]
                 mano_finger2 = joints_sapien[ref_indices[1], :3]
-                # MANO 手腕位置和朝向
                 mano_wrist_pos = joints_sapien[0, :3]
-                wrist_R_render = pr.matrix_from_compact_axis_angle(rot)
-                wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
 
                 err = {}
                 if finger1_pos is not None:
@@ -1150,10 +621,26 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                     err['finger2_mm'] = float(np.linalg.norm(finger2_pos - mano_finger2) * 1000)
                 if gripper_link_pos is not None:
                     err['wrist_pos_mm'] = float(np.linalg.norm(gripper_link_pos - mano_wrist_pos) * 1000)
-                    # 朝向误差 (角度, 度)
-                    R_diff = gripper_link_R.T @ wrist_R_sapien
-                    angle_rad = np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1))
-                    err['wrist_ori_deg'] = float(np.degrees(angle_rad))
+                    mano_pointing = ((mano_finger1 + mano_finger2) / 2 - mano_wrist_pos)
+                    mano_pointing_norm = np.linalg.norm(mano_pointing)
+                    if mano_pointing_norm > 1e-6:
+                        mano_pointing = mano_pointing / mano_pointing_norm
+                        gripper_x = gripper_link_R[:, 0]
+                        pointing_cos = np.clip(np.dot(gripper_x, mano_pointing), -1, 1)
+                        err['pointing_deg'] = float(np.degrees(np.arccos(pointing_cos)))
+                    mano_opening = mano_finger2 - mano_finger1
+                    mano_opening_norm = np.linalg.norm(mano_opening)
+                    if mano_opening_norm > 1e-6:
+                        y_sign = 1.0 if prefix == "right" else -1.0
+                        gripper_x = gripper_link_R[:, 0]
+                        # 投影到指向方向垂直面，与夹爪y轴定义一致
+                        mano_opening_proj = mano_opening - np.dot(mano_opening, gripper_x) * gripper_x
+                        mano_opening_proj_norm = np.linalg.norm(mano_opening_proj)
+                        if mano_opening_proj_norm > 1e-6:
+                            mano_opening_dir = y_sign * mano_opening_proj / mano_opening_proj_norm
+                            gripper_y = gripper_link_R[:, 1]
+                            opening_cos = np.clip(np.dot(gripper_y, mano_opening_dir), -1, 1)
+                            err['opening_deg'] = float(np.degrees(np.arccos(opening_cos)))
                 verify_errors.append(err)
             else:
                 scene.step()
@@ -1174,7 +661,6 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
 
         if viewer:
             logger.info("  动画播放完成, 重新开始... (关闭窗口退出)")
-            # 重置 qpos 和平滑器
             init_qpos = robot.get_qpos().copy()
             init_qpos[gripper_idx1] = GRIPPER_INIT_OPEN
             init_qpos[gripper_idx2] = GRIPPER_INIT_OPEN
@@ -1217,7 +703,7 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
     # ── 验证误差报告 ──
     if verify and verify_errors:
         logger.info("\n  === 验证误差报告 ===")
-        for key in ['finger1_mm', 'finger2_mm', 'wrist_pos_mm', 'wrist_ori_deg']:
+        for key in ['finger1_mm', 'finger2_mm', 'wrist_pos_mm', 'pointing_deg', 'opening_deg']:
             vals = [e[key] for e in verify_errors if key in e]
             if vals:
                 mean_v = np.mean(vals)
@@ -1225,17 +711,10 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
                 unit = 'mm' if 'mm' in key else 'deg'
                 label = {
                     'finger1_mm': '指尖1位置误差', 'finger2_mm': '指尖2位置误差',
-                    'wrist_pos_mm': '手腕位置误差', 'wrist_ori_deg': '手腕朝向误差'
+                    'wrist_pos_mm': '手腕位置误差',
+                    'pointing_deg': '指向方向误差', 'opening_deg': '开合方向误差',
                 }[key]
                 logger.info(f"  {label}: mean={mean_v:.2f}{unit}, max={max_v:.2f}{unit}")
-        # 计算相对误差 (以手腕位置为基准)
-        wrist_pos_errors = [e['wrist_pos_mm'] for e in verify_errors if 'wrist_pos_mm' in e]
-        if wrist_pos_errors:
-            mean_wrist = np.mean(wrist_pos_errors)
-            # 手腕运动范围作为基准
-            wrist_range = np.ptp([e.get('wrist_pos_mm', 0) for e in verify_errors]) if len(verify_errors) > 1 else 100.0
-            rel_err = mean_wrist / max(wrist_range, 1.0) * 100
-            logger.info(f"  手腕位置相对误差: {rel_err:.2f}% (基准: 手腕运动范围 {wrist_range:.1f}mm)")
 
     return final_path
 
@@ -1244,19 +723,9 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                                fps=30, cam_width=1920, cam_height=1080,
                                view="fpv", crf=18, start_frame=0, num_frames=-1,
                                with_arm=False, smooth=1, viewer=False, verify=False,
-                               analytical=True, logger=None):
-    """在同一场景中渲染左右夹爪URDF (双手, 一个视频)
-
-    在同一个 SAPIEN 场景中加载左右两个夹爪 URDF,
-    两个夹爪同时渲染到同一个视频, 各自跟踪对应的手。
-
-    Args:
-        smooth: 0=不平滑, 1=EMA平滑 (位置+朝向)
-        viewer: True=使用 SAPIEN Viewer 实时循环播放 (不保存视频)
-        verify: True=计算并输出指尖位置/手腕位姿误差
-        analytical: True=解析模式 (从MANO指尖向量直接计算root位姿, 指尖误差≈0)
-                    False=优化器模式 (NLopt SLSQP, 可能有局部最优问题)
-    """
+                               analytical=True, arm_mode="half", logger=None, hand_indices=None,
+                               strategy="aligned", open_scale=GRIPPER_OPEN_SCALE):
+    """在同一场景中渲染左右夹爪URDF (双手, 一个视频)"""
     import logging
     if logger is None:
         logger = logging.getLogger("dual_gripper")
@@ -1268,15 +737,15 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
 
     logger.info(f"双夹爪URDF渲染: 同一场景")
 
-    # ── 加载数据 ──
     R_c2w_all, t_c2w_all = load_hawor_c2w(hawor_dir)
 
-    # 为左右手分别加载数据和初始化 retargeting
     robot_dir = PROJECT_ROOT / "assets" / "robots" / "hands"
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
 
     gripper_states = []
-    for hi in [0, 1]:
+    if hand_indices is None:
+        hand_indices = [0, 1]
+    for hi in hand_indices:
         prefix = "left" if hi == 0 else "right"
         hand_type = HandType.left if hi == 0 else HandType.right
 
@@ -1286,39 +755,42 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
         betas_mean = hawor_data["pred_betas"][start_frame].astype(np.float32)
         mano_layer = MANOLayer(prefix, betas_mean)
 
-        config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, hand_type)
-        # 用3个目标点 (与 02_render_scene.py 的 run_robot_tracking 一致):
-        #   finger_link1 → MANO joint4 (指尖1)
-        #   finger_link2 → MANO joint8 (指尖2)
-        #   gripper_link  → MANO joint0 (手腕)
-        # 3点约束 (9 > 8 DOF) 完全确定 root pose (6 DOF) + 手指关节 (2 DOF)
-        override = dict(
-            add_dummy_free_joint=True, normal_delta=1e-5, huber_delta=0.01,
-            target_link_names=[f"{prefix}_gripper_finger_link1",
-                               f"{prefix}_gripper_finger_link2",
-                               f"{prefix}_gripper_link"],
-            target_link_human_indices=np.array([4, 8, 0]),
-            target_joint_names=[f"{prefix}_gripper_finger_joint1",
-                                f"{prefix}_gripper_finger_joint2"],
-        )
-        config = RetargetingConfig.load_from_file(config_path, override=override)
-        retargeting = config.build()
-        ref_indices = retargeting.optimizer.target_link_human_indices
-        fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
-        # fixed_qpos 将在 URDF 加载后设置 (需要 init_qpos)
-
         gripper_states.append({
             "prefix": prefix, "hand_idx": hi, "hand_type": hand_type,
             "hawor_data": hawor_data, "mano_layer": mano_layer,
-            "retargeting": retargeting, "ref_indices": ref_indices,
-            "fixed_retarget_indices": fixed_retarget_indices,
             "total_frames": total_frames,
+            "finger_origin_x": 0.03689,
         })
 
-    # 统一帧数
     total_frames = min(gs["total_frames"] for gs in gripper_states)
     if num_frames < 0 or num_frames > total_frames - start_frame:
         num_frames = total_frames - start_frame
+
+    # finger_origin_x: 始终使用 URDF 原始 37mm (与 02_render_scene.py 一致, 不缩放)
+    for gs in gripper_states:
+        gs["finger1_origin_x"] = 0.03689
+        gs["finger2_origin_x"] = 0.03689
+        gs["finger_origin_x"] = 0.03689
+        logger.info(f"  {gs['prefix']} finger_origin_x = 37mm (URDF 原始值, 不缩放, 与 02_render_scene.py 一致)")
+
+    # 初始化 retargeting (gripper-only URDF, 独立缩放)
+    for gs in gripper_states:
+        prefix = gs["prefix"]
+        fox = gs["finger_origin_x"]
+        f1x = gs["finger1_origin_x"]
+        f2x = gs["finger2_origin_x"]
+
+        retargeting, ref_indices, _ = init_gripper_retargeting(
+            prefix, fox, PROJECT_ROOT,
+            finger1_origin_x=f1x, finger2_origin_x=f2x,
+        )
+        fixed_retarget_indices = retargeting.optimizer.idx_pin2fixed
+        fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
+
+        gs["retargeting"] = retargeting
+        gs["ref_indices"] = ref_indices
+        gs["fixed_qpos"] = fixed_qpos
+        logger.info(f"  {prefix} 优化器: gripper-only URDF, finger1={f1x*1000:.1f}mm, finger2={f2x*1000:.1f}mm")
 
     focal = gripper_states[0]["hawor_data"].get("img_focal")
     if focal is None or focal <= 0:
@@ -1339,10 +811,21 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
     # ── 加载左右夹爪 URDF ──
     for gs in gripper_states:
         prefix = gs["prefix"]
+        fox = gs["finger_origin_x"]
+        f1x = gs["finger1_origin_x"]
+        f2x = gs["finger2_origin_x"]
         if with_arm:
-            gripper_urdf_path = _generate_gripper_with_arm_urdf(prefix)
+            if arm_mode == "full":
+                gripper_urdf_path = prepare_full_arm_urdf(prefix)
+                logger.info(f"  {prefix} 渲染URDF: 完整手臂+夹爪 (arm_link1-6 + gripper, 不缩放)")
+            else:
+                gripper_urdf_path = prepare_half_arm_urdf(prefix)
+                logger.info(f"  {prefix} 渲染URDF: 半个手臂+夹爪 (arm_link4-6 + gripper, 不缩放)")
         else:
-            gripper_urdf_path = _generate_gripper_urdf(prefix)
+            gripper_urdf_path = generate_gripper_urdf(
+                prefix, fox,
+                finger1_origin_x=f1x, finger2_origin_x=f2x,
+            )
         loader = scene.create_urdf_loader()
         loader.fix_root_link = True
         loader.load_multiple_collisions_from_file = True
@@ -1361,40 +844,22 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
         robot.set_qpos(init_qpos)
 
         retargeting = gs["retargeting"]
-        retarget2sapien = np.array(
-            [retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names]
-        ).astype(int)
-        # SAPIEN 关节名 → retargeting 关节索引 (用于直接从 retarget_qpos 取手指关节值)
         sapien_name_to_retarget_idx = {
             n: retargeting.joint_names.index(n) for n in joint_names if n in retargeting.joint_names
         }
-        # retargeting 索引 → SAPIEN 索引 (用于设置 fixed_qpos)
-        sapien2retarget = {}
-        for sapien_i, retarget_i in enumerate(retarget2sapien):
-            sapien2retarget[retarget_i] = sapien_i
-        # 设置 fixed_qpos (与 02_render_scene.py 一致: 从 init_qpos 取值)
-        fixed_retarget_indices = gs["fixed_retarget_indices"]
-        fixed_qpos = np.zeros(len(fixed_retarget_indices), dtype=np.float32)
-        for i, retarget_idx in enumerate(fixed_retarget_indices):
-            if retarget_idx in sapien2retarget:
-                fixed_qpos[i] = init_qpos[sapien2retarget[retarget_idx]]
 
         gs["robot"] = robot
         gs["gripper_idx1"] = gripper_idx1
         gs["gripper_idx2"] = gripper_idx2
-        gs["retarget2sapien"] = retarget2sapien
         gs["sapien_name_to_retarget_idx"] = sapien_name_to_retarget_idx
-        gs["fixed_qpos"] = fixed_qpos
         gs["joint_names"] = joint_names
-        # arm 关节索引 (gripper_arm 模式下需要显式设为 0, 防止物理仿真漂移)
         gs["arm_joint_indices"] = [i for i, n in enumerate(joint_names) if 'arm_joint' in n]
         logger.info(f"  ✓ {prefix} 夹爪已加载: {joint_names}")
 
     scene.step()
     scene.update_render()
 
-    # 计算 gripper_link 相对于 root 的 offset (用于 gripper_arm 模式补偿)
-    # 注意: scene.step() 会导致 arm 关节漂移, 必须显式重置为 0 后再计算 offset
+    # 计算 gripper_link offset
     for gs in gripper_states:
         prefix = gs["prefix"]
         robot = gs["robot"]
@@ -1406,19 +871,24 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                     qpos_now[ai] = 0.0
                 robot.set_qpos(qpos_now)
                 scene.update_render()
-            offset_pos, offset_R = _compute_gripper_offset_in_root(robot, prefix)
+            offset_pos, offset_R = compute_gripper_offset_in_root(robot, prefix)
         else:
             offset_pos = np.zeros(3)
             offset_R = np.eye(3)
         gs["gripper_offset_pos"] = offset_pos
         gs["gripper_offset_R"] = offset_R
 
-    # ── Warm start ──
+    # ── Warm start (用解析位姿初始化, 避免局部最优) ──
     for gs in gripper_states:
         hawor_data = gs["hawor_data"]
         mano_layer = gs["mano_layer"]
         retargeting = gs["retargeting"]
         hand_type = gs["hand_type"]
+        ref_indices = gs["ref_indices"]
+        prefix = gs["prefix"]
+        fox = gs["finger_origin_x"]
+        f1x = gs["finger1_origin_x"]
+        f2x = gs["finger2_origin_x"]
         for probe_idx in range(num_frames):
             g_idx = start_frame + probe_idx
             if not hawor_data["pred_valid"][g_idx]:
@@ -1430,29 +900,29 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                 continue
             _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
             joints_sapien = _render_to_sapien(j)
-            wrist_R_render = pr.matrix_from_compact_axis_angle(rot)
-            wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
-            wrist_quat = pr.quaternion_from_matrix(wrist_R_sapien)
+            mano_wrist = joints_sapien[0, :3]
+            mano_finger1 = joints_sapien[ref_indices[0], :3]
+            mano_finger2 = joints_sapien[ref_indices[1], :3]
+            g_pos, g_R, joint1, joint2 = _compute_gripper_pose_by_strategy(
+                strategy, mano_wrist, mano_finger1, mano_finger2,
+                prefix, fox, f1x, f2x, open_scale)
+            g_quat = pr.quaternion_from_matrix(g_R)
             retargeting.warm_start(
-                joints_sapien[0, :3], wrist_quat,
-                hand_type=hand_type, is_mano_convention=True,
+                g_pos, g_quat,
+                hand_type=hand_type, is_mano_convention=False,
             )
-            # 手动设置手指关节初始值: 根据 MANO 指尖距离推算
-            # robot finger_dist = 0.026906 + joint1 + joint2
-            # mano finger_dist = ||joints_sapien[4] - joints_sapien[8]||
-            prefix = gs["prefix"]
-            mano_finger_dist = float(np.linalg.norm(
-                joints_sapien[ref_indices[0], :3] - joints_sapien[ref_indices[1], :3]))
-            required_open = max(0.0, min(0.05, (mano_finger_dist - 0.026906) / 2))
+            # 用解析关节值初始化手指
             finger_j1_name = f"{prefix}_gripper_finger_joint1"
             finger_j2_name = f"{prefix}_gripper_finger_joint2"
             for num, jname in enumerate(retargeting.optimizer.target_joint_names):
-                if jname == finger_j1_name or jname == finger_j2_name:
-                    retargeting.last_qpos[num] = required_open
-            logger.info(f"  ✓ {gs['prefix']} Warm start 完成 (帧 {g_idx}), finger_init={required_open:.4f} (mano_dist={mano_finger_dist*1000:.1f}mm)")
+                if jname == finger_j1_name:
+                    retargeting.last_qpos[num] = joint1
+                elif jname == finger_j2_name:
+                    retargeting.last_qpos[num] = joint2
+            logger.info(f"  ✓ {prefix} Warm start 完成 (帧 {g_idx}), j1={joint1:.4f}, j2={joint2:.4f}")
             break
 
-    # ── 探测首帧有效位姿 + Warmup smoothstep ──
+    # ── 探测首帧 + Warmup ──
     for gs in gripper_states:
         hawor_data = gs["hawor_data"]
         mano_layer = gs["mano_layer"]
@@ -1476,35 +946,26 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
             _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
             joints_sapien = _render_to_sapien(j)
             if analytical:
-                # 解析模式: 直接从 MANO 指尖向量计算 gripper_link 位姿
                 mano_wrist = joints_sapien[0, :3]
                 mano_finger1 = joints_sapien[ref_indices[0], :3]
                 mano_finger2 = joints_sapien[ref_indices[1], :3]
-                g_pos, g_R, _, _ = _compute_analytical_gripper_pose(
-                    mano_wrist, mano_finger1, mano_finger2, prefix)
-                # 转换为 root 位姿
+                g_pos, g_R, _, _ = _compute_gripper_pose_by_strategy(
+                    strategy, mano_wrist, mano_finger1, mano_finger2,
+                    prefix, gs["finger_origin_x"], gs["finger1_origin_x"], gs["finger2_origin_x"], open_scale)
                 root_R = g_R @ gripper_offset_R.T
                 root_pos = g_pos - root_R @ gripper_offset_pos
                 first_valid_pos = root_pos.copy()
                 first_valid_quat = pr.quaternion_from_matrix(root_R)
             else:
-                ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+                ref_value = joints_sapien[ref_indices, :3].astype(np.float32)
                 retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
-                _, gripper_R_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
-                # Hybrid: FK 朝向 + 解析位置 (匹配 fingertip1)
-                mano_finger1 = joints_sapien[ref_indices[0], :3]
-                mano_finger2 = joints_sapien[ref_indices[1], :3]
-                mano_finger_dist = float(np.linalg.norm(mano_finger1 - mano_finger2))
-                required_open = max(0.0, mano_finger_dist - _FINGER_BASE_DIST)
-                joint1 = min(0.05, required_open / 2)
-                root_R = gripper_R_fk @ gripper_offset_R.T
-                fg = _FINGER_GEOM_ARRAYS[prefix]
-                finger1_in_root = gripper_offset_pos + gripper_offset_R @ (fg["finger1_origin"] + fg["finger1_axis"] * joint1)
-                root_pos = mano_finger1 - root_R @ finger1_in_root
+                g_pos_fk, g_R_fk = _get_gripper_pose_from_retargeting(
+                    retargeting, retarget_qpos, prefix)
+                root_R = g_R_fk @ gripper_offset_R.T
+                root_pos = g_pos_fk - root_R @ gripper_offset_pos
                 first_valid_pos = root_pos.copy()
                 first_valid_quat = pr.quaternion_from_matrix(root_R)
             break
-        # Warmup smoothstep
         if first_valid_pos is not None:
             init_root_pos = np.zeros(3)
             init_root_quat = np.array([1.0, 0.0, 0.0, 0.0])
@@ -1520,7 +981,6 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                 robot.set_root_pose(sapien.Pose(interp_pos.tolist(), interp_quat.tolist()))
                 scene.step()
             logger.info(f"  ✓ {prefix} Warmup 完成 ({WARMUP_FRAMES} 帧 smoothstep)")
-        # 平滑器: 解析模式用 MANO 输入位置平滑, 优化器模式用 root pose 平滑
         if smooth == 1:
             if analytical:
                 gs["mano_smoother"] = PositionEmaSmoother(alpha=LP_ALPHA_ANALYTICAL)
@@ -1580,7 +1040,7 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
         if sapien_viewer:
             sapien_viewer.set_camera_xyz(x=cam_pos[0], y=cam_pos[1], z=cam_pos[2])
 
-    # ── 视频写入器 (仅非 viewer 模式) ──
+    # ── 视频写入器 ──
     writer = None
     if not viewer:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -1590,12 +1050,11 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
     internal_scene = scene.render_system._internal_scene
     kp_nodes = []
 
-    # ── 验证误差记录 ──
     verify_errors = [] if verify else None
     if verify:
         logger.info("  验证模式: 开启 (计算指尖位置 + 手腕位姿误差)")
 
-    # ── 渲染循环 (viewer 模式循环播放) ──
+    # ── 渲染循环 ──
     animation_loop = True
     while animation_loop:
         if not viewer:
@@ -1604,15 +1063,13 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
         for local_idx in trange(num_frames, desc="双夹爪URDF", disable=viewer):
             global_idx = start_frame + local_idx
 
-            # 更新相机
-            if view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
+            if R_c2w_all is not None and t_c2w_all is not None:
                 cam_pos, cam_quat = hawor_cam_to_sapien_pose(R_c2w_all[global_idx], t_c2w_all[global_idx])
                 if camera:
                     camera.set_local_pose(sapien.Pose(cam_pos.tolist(), cam_quat.tolist()))
                 if sapien_viewer:
                     sapien_viewer.set_camera_xyz(x=cam_pos[0], y=cam_pos[1], z=cam_pos[2])
 
-            # 清除上一帧的关键点
             for node in kp_nodes:
                 internal_scene.remove_node(node)
             kp_nodes.clear()
@@ -1628,7 +1085,6 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                 mano_layer = gs["mano_layer"]
                 ref_indices = gs["ref_indices"]
                 fixed_qpos = gs["fixed_qpos"]
-                retarget2sapien = gs["retarget2sapien"]
                 target_smoother = gs.get("target_smoother")
 
                 if not hawor_data["pred_valid"][global_idx]:
@@ -1643,12 +1099,10 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                 _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
                 joints_sapien = _render_to_sapien(j)
 
-                # 关键点标记 (左手清除重建, 右手累加)
                 clear_kp = (prefix == "left")
                 kp_nodes = _render_keypoints(joints_sapien[:, :3], context, internal_scene, kp_nodes, ref_indices, radius=0.012, clear_existing=clear_kp)
 
                 if analytical:
-                    # 解析模式: 先平滑 MANO 输入位置, 再计算解析位姿
                     mano_wrist = joints_sapien[0, :3]
                     mano_finger1 = joints_sapien[ref_indices[0], :3]
                     mano_finger2 = joints_sapien[ref_indices[1], :3]
@@ -1657,9 +1111,9 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                         mano_pts = np.stack([mano_wrist, mano_finger1, mano_finger2])
                         mano_pts = mano_smoother.smooth(mano_pts)
                         mano_wrist, mano_finger1, mano_finger2 = mano_pts[0], mano_pts[1], mano_pts[2]
-                    g_pos, g_R, joint1, joint2 = _compute_analytical_gripper_pose(
-                        mano_wrist, mano_finger1, mano_finger2, prefix)
-                    # 从 gripper_link 位姿转换为 root 位姿 (gripper_arm 模式需要减去 offset)
+                    g_pos, g_R, joint1, joint2 = _compute_gripper_pose_by_strategy(
+                        strategy, mano_wrist, mano_finger1, mano_finger2,
+                        prefix, gs["finger_origin_x"], gs["finger1_origin_x"], gs["finger2_origin_x"], open_scale)
                     gripper_offset_pos = gs["gripper_offset_pos"]
                     gripper_offset_R = gs["gripper_offset_R"]
                     root_R = g_R @ gripper_offset_R.T
@@ -1667,46 +1121,28 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                     root_quat = pr.quaternion_from_matrix(root_R)
                     robot.set_root_pose(sapien.Pose(root_pos.tolist(), root_quat.tolist()))
                     qpos = robot.get_qpos().copy()
-                    # 显式设置 arm 关节为 0 (防止物理仿真漂移)
                     for arm_idx in gs.get("arm_joint_indices", []):
                         qpos[arm_idx] = 0.0
                     qpos[gs["gripper_idx1"]] = float(joint1)
                     qpos[gs["gripper_idx2"]] = float(joint2)
                     robot.set_qpos(qpos)
                 else:
-                    # Retargeting 优化器模式 (与 02_render_scene.py 的 run_robot_tracking 一致):
-                    # 1. 用 3 点 retargeting 优化器获取 root pose (6 DOF)
-                    # 2. 从内部机器人 FK 获取 gripper_link 朝向 (优化器的最佳朝向估计)
-                    # 3. 手指关节用解析值 (从 MANO 指尖距离计算, 确保夹爪开合)
-                    # 4. root 位置用解析值 (匹配 fingertip1, 确保指尖精确跟踪)
-                    #    (Hybrid 方案: FK 朝向 + 解析位置 + 解析手指关节)
-                    ref_value = joints_sapien[ref_indices, :].astype(np.float32)
+                    ref_value = joints_sapien[ref_indices, :3].astype(np.float32)
                     retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
 
-                    # 夹爪朝向: 用 retargeting FK
-                    _, gripper_R_fk = _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix)
+                    g_pos_fk, g_R_fk = _get_gripper_pose_from_retargeting(
+                        retargeting, retarget_qpos, prefix)
 
-                    # 补偿 offset
+                    sapien_name_to_retarget_idx = gs["sapien_name_to_retarget_idx"]
+                    joint1 = retarget_qpos[sapien_name_to_retarget_idx[f"{prefix}_gripper_finger_joint1"]]
+                    joint2 = retarget_qpos[sapien_name_to_retarget_idx[f"{prefix}_gripper_finger_joint2"]]
+
                     gripper_offset_pos = gs["gripper_offset_pos"]
                     gripper_offset_R = gs["gripper_offset_R"]
-
-                    # 手指关节: 用解析值从 MANO 指尖距离计算 (确保夹爪开合)
-                    mano_f1 = joints_sapien[ref_indices[0], :3]
-                    mano_f2 = joints_sapien[ref_indices[1], :3]
-                    mano_finger_dist = float(np.linalg.norm(mano_f1 - mano_f2))
-                    required_open = max(0.0, mano_finger_dist - _FINGER_BASE_DIST)
-                    joint1 = min(0.05, required_open / 2)
-                    joint2 = min(0.05, required_open / 2)
-
-                    # root 朝向: 用 FK 朝向
-                    root_R = gripper_R_fk @ gripper_offset_R.T
-                    # root 位置: 解析计算, 匹配 fingertip1
-                    fg = _FINGER_GEOM_ARRAYS[prefix]
-                    finger1_in_root = gripper_offset_pos + gripper_offset_R @ (fg["finger1_origin"] + fg["finger1_axis"] * joint1)
-                    root_pos = mano_f1 - root_R @ finger1_in_root
+                    root_R = g_R_fk @ gripper_offset_R.T
+                    root_pos = g_pos_fk - root_R @ gripper_offset_pos
                     root_quat = pr.quaternion_from_matrix(root_R)
 
-                    # EMA 平滑
                     if target_smoother is not None:
                         root_pos, root_quat = target_smoother.smooth(root_pos, root_quat)
 
@@ -1719,8 +1155,6 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                     qpos[gs["gripper_idx2"]] = float(joint2)
                     robot.set_qpos(qpos)
 
-                # 验证误差
-                # 注意: verify 模式下不调用 scene.step(), 避免物理仿真导致 arm 关节漂移
                 if verify:
                     scene.update_render()
                     for link in robot.get_links():
@@ -1736,16 +1170,31 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
                     mano_finger1 = joints_sapien[ref_indices[0], :3]
                     mano_finger2 = joints_sapien[ref_indices[1], :3]
                     mano_wrist_pos = joints_sapien[0, :3]
-                    wrist_R_render = pr.matrix_from_compact_axis_angle(rot)
-                    wrist_R_sapien = RXWORLD_TO_SAPIEN @ wrist_R_render @ RXWORLD_TO_SAPIEN.T
                     err = {'prefix': prefix}
                     err[f'{prefix}_finger1_mm'] = float(np.linalg.norm(finger1_pos - mano_finger1) * 1000)
                     err[f'{prefix}_finger2_mm'] = float(np.linalg.norm(finger2_pos - mano_finger2) * 1000)
                     err[f'{prefix}_wrist_pos_mm'] = float(np.linalg.norm(gripper_link_pos - mano_wrist_pos) * 1000)
-                    R_diff = gripper_link_R.T @ wrist_R_sapien
-                    angle_rad = np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1))
-                    err[f'{prefix}_wrist_ori_deg'] = float(np.degrees(angle_rad))
-                    # 记录手指关节值 (确认夹爪开合)
+
+                    mano_pointing = ((mano_finger1 + mano_finger2) / 2 - mano_wrist_pos)
+                    mano_pointing_norm = np.linalg.norm(mano_pointing)
+                    if mano_pointing_norm > 1e-6:
+                        mano_pointing_dir = mano_pointing / mano_pointing_norm
+                        gripper_x = gripper_link_R[:, 0]
+                        pointing_cos = np.clip(np.dot(gripper_x, mano_pointing_dir), -1, 1)
+                        err[f'{prefix}_pointing_deg'] = float(np.degrees(np.arccos(pointing_cos)))
+                    mano_opening = mano_finger2 - mano_finger1
+                    mano_opening_norm = np.linalg.norm(mano_opening)
+                    if mano_opening_norm > 1e-6:
+                        y_sign = 1.0 if prefix == "right" else -1.0
+                        gripper_x = gripper_link_R[:, 0]
+                        # 投影到指向方向垂直面，与夹爪y轴定义一致
+                        mano_opening_proj = mano_opening - np.dot(mano_opening, gripper_x) * gripper_x
+                        mano_opening_proj_norm = np.linalg.norm(mano_opening_proj)
+                        if mano_opening_proj_norm > 1e-6:
+                            mano_opening_dir = y_sign * mano_opening_proj / mano_opening_proj_norm
+                            gripper_y = gripper_link_R[:, 1]
+                            opening_cos = np.clip(np.dot(gripper_y, mano_opening_dir), -1, 1)
+                            err[f'{prefix}_opening_deg'] = float(np.degrees(np.arccos(opening_cos)))
                     qpos_now = robot.get_qpos()
                     err[f'{prefix}_joint1'] = float(qpos_now[gs["gripper_idx1"]])
                     err[f'{prefix}_joint2'] = float(qpos_now[gs["gripper_idx2"]])
@@ -1792,7 +1241,6 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
     if not viewer:
         writer.release()
 
-        # ffmpeg 重编码
         final_path = output
         tmp_path = str(output).replace(".mp4", "_tmp.mp4")
         if os.path.exists(str(output)):
@@ -1826,20 +1274,19 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
             for suffix, label, unit in [('_finger1_mm', '指尖1位置误差', 'mm'),
                                          ('_finger2_mm', '指尖2位置误差', 'mm'),
                                          ('_wrist_pos_mm', '手腕位置误差', 'mm'),
-                                         ('_wrist_ori_deg', '手腕朝向误差', 'deg')]:
+                                         ('_pointing_deg', '指向方向误差', 'deg'),
+                                         ('_opening_deg', '开合方向误差', 'deg')]:
                 key = f'{pfx}{suffix}'
                 vals = [e[key] for e in verify_errors if key in e]
                 if vals:
                     mean_v = np.mean(vals)
                     max_v = np.max(vals)
                     logger.info(f"  [{pfx}] {label}: mean={mean_v:.2f}{unit}, max={max_v:.2f}{unit}")
-            # 手指关节值范围 (确认夹爪开合)
             j1_vals = [e[f'{pfx}_joint1'] for e in verify_errors if f'{pfx}_joint1' in e]
             j2_vals = [e[f'{pfx}_joint2'] for e in verify_errors if f'{pfx}_joint2' in e]
             if j1_vals:
                 logger.info(f"  [{pfx}] 手指关节: joint1=[{min(j1_vals):.4f}, {max(j1_vals):.4f}], "
-                            f"joint2=[{min(j2_vals):.4f}, {max(j2_vals):.4f}] "
-                            f"(开合范围: {max(j1_vals)+max(j2_vals)-min(j1_vals)-min(j2_vals):.4f}m)")
+                            f"joint2=[{min(j2_vals):.4f}, {max(j2_vals):.4f}]")
     return final_path
 
 
@@ -1862,7 +1309,10 @@ def main():
                         help="相机视角 (默认 fpv)")
     parser.add_argument("--mode", type=str, default="both",
                         choices=["gripper", "gripper_arm", "both"],
-                        help="渲染模式: gripper=仅夹爪, gripper_arm=夹爪+手臂末端, both=两者都渲染 (默认)")
+                        help="渲染模式: gripper=仅夹爪, gripper_arm=夹爪+手臂, both=两者都渲染 (默认)")
+    parser.add_argument("--arm-mode", type=str, default="half",
+                        choices=["half", "full"],
+                        help="gripper_arm 模式的手臂类型: half=半个手臂(link4-6), full=完整手臂(link1-6) (默认 half)")
     parser.add_argument("--smooth", type=int, default=1,
                         choices=[0, 1],
                         help="平滑模式: 0=不平滑, 1=EMA平滑 (默认 1)")
@@ -1871,7 +1321,15 @@ def main():
     parser.add_argument("--verify", action="store_true",
                         help="计算并输出指尖位置/手腕位姿误差")
     parser.add_argument("--optimizer", action="store_true",
-                        help="使用优化器模式 (默认: 解析模式, 从 MANO 指尖向量直接计算位姿, 精确跟踪 3 个特征点)")
+                        help="使用优化器模式 (默认: 解析模式; 加此参数使用 dex_retargeting PositionOptimizer + gripper-only URDF, 3点约束精确跟踪)")
+    parser.add_argument("--strategy", type=str, default="aligned",
+                        choices=["aligned", "analytical"],
+                        help="对齐策略: aligned=新策略(先对齐夹爪两点+中点手腕连线确定位姿, 默认), analytical=旧策略(Gram-Schmidt)")
+    parser.add_argument("--open-scale", type=float, default=GRIPPER_OPEN_SCALE,
+                        help=f"夹爪开合缩放因子 (默认 {GRIPPER_OPEN_SCALE}, 放大开合效果; 1.0=精确映射)")
+    parser.add_argument("--hand-idx", type=int, default=-1,
+                        choices=[-1, 0, 1],
+                        help="手部索引: -1=自动检测, 0=左手, 1=右手 (默认 -1)")
     args = parser.parse_args()
 
     # Logger
@@ -1888,17 +1346,25 @@ def main():
         args.output_dir = str(SCRIPT_DIR / "output" / hawor_name)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # [1] 自动检测手部
-    hand_indices = detect_hands(args.hawor_dir)
-    hand_count = len(hand_indices)
-    hand_label = "双手" if hand_count == 2 else ("左手" if hand_indices[0] == 0 else "右手")
-    logger.info(f"[1/3] 手部检测: {hand_label} (indices={hand_indices})")
+    # [1] 检测手部 (自动检测或用户指定)
+    if args.hand_idx >= 0:
+        hand_indices = [args.hand_idx]
+        hand_label = "左手" if args.hand_idx == 0 else "右手"
+        logger.info(f"[1/3] 手部指定: {hand_label} (index={args.hand_idx})")
+    else:
+        hand_indices = detect_hands(args.hawor_dir)
+        hand_count = len(hand_indices)
+        if hand_count == 0:
+            logger.error("[1/3] 手部检测: 未检测到有效手部数据 (pred_valid 全为 False 或持续为 NaN), 停止生成")
+            sys.exit(1)
+        hand_label = "双手" if hand_count == 2 else ("左手" if hand_indices[0] == 0 else "右手")
+        logger.info(f"[1/3] 手部检测: {hand_label} (indices={hand_indices})")
 
     # [2] 确保 transform_params 存在
     logger.info(f"\n[2/3] 准备 GLB 变换参数 ...")
     tp_path = _ensure_transform_params(args.ras_dir, args.hawor_dir, args.output_dir, logger)
 
-    # [3] 渲染 — 默认同时渲染 gripper 和 gripper_arm
+    # [3] 渲染
     modes_to_render = []
     if args.mode in ("gripper", "both"):
         modes_to_render.append(("gripper", False, ""))
@@ -1906,13 +1372,13 @@ def main():
         modes_to_render.append(("gripper_arm", True, "_arm"))
 
     analytical = not args.optimizer
-    logger.info(f"\n[3/3] 渲染夹爪URDF视频 (mode={args.mode}, smooth={args.smooth}, viewer={args.viewer}, verify={args.verify}, analytical={analytical}) ...")
+    logger.info(f"\n[3/3] 渲染夹爪URDF视频 (mode={args.mode}, strategy={args.strategy}, open_scale={args.open_scale}, smooth={args.smooth}, viewer={args.viewer}, verify={args.verify}, analytical={analytical}) ...")
     start_time = time.time()
 
     for mode_name, with_arm, mode_suffix in modes_to_render:
         logger.info(f"\n--- 渲染模式: {mode_name} ---")
 
-        if hand_count == 1:
+        if len(hand_indices) == 1:
             hi = hand_indices[0]
             side = "left" if hi == 0 else "right"
             output_video = os.path.join(args.output_dir, "videos", f"hawor_r1_{side}_gripper_urdf{mode_suffix}.mp4")
@@ -1925,10 +1391,10 @@ def main():
                 view=args.view, crf=args.crf, start_frame=args.start_frame,
                 num_frames=args.num_frames, with_arm=with_arm,
                 smooth=args.smooth, viewer=args.viewer, verify=args.verify,
-                analytical=analytical, logger=logger,
+                analytical=analytical, arm_mode=args.arm_mode, logger=logger,
+                strategy=args.strategy, open_scale=args.open_scale,
             )
         else:
-            # 双手: 同一个场景中渲染左右夹爪
             output_video = os.path.join(args.output_dir, "videos", f"hawor_r1_dual_gripper_urdf{mode_suffix}.mp4")
             os.makedirs(os.path.dirname(output_video), exist_ok=True)
 
@@ -1939,7 +1405,9 @@ def main():
                 view=args.view, crf=args.crf, start_frame=args.start_frame,
                 num_frames=args.num_frames, with_arm=with_arm,
                 smooth=args.smooth, viewer=args.viewer, verify=args.verify,
-                analytical=analytical, logger=logger,
+                analytical=analytical, arm_mode=args.arm_mode, logger=logger,
+                hand_indices=hand_indices,
+                strategy=args.strategy, open_scale=args.open_scale,
             )
 
     elapsed = time.time() - start_time

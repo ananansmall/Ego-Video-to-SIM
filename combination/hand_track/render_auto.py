@@ -178,8 +178,13 @@ def main():
                         choices=["fpv", "topdown", "behind", "front"],
                         help="相机视角 (默认 fpv 第一视角, 与02一致)")
     parser.add_argument("--mode", type=str, default="gripper",
-                        choices=["gripper", "gripper_arm"],
-                        help="夹爪URDF渲染模式: gripper=仅夹爪, gripper_arm=夹爪+手臂末端")
+                        choices=["gripper", "gripper_arm", "both"],
+                        help="夹爪URDF渲染模式: gripper=仅夹爪, gripper_arm=夹爪+手臂末端, both=两者都渲染")
+    parser.add_argument("--hand-idx", type=int, default=-1,
+                        choices=[-1, 0, 1],
+                        help="手部索引: -1=自动检测, 0=强制左手, 1=强制右手 (默认 -1)")
+    parser.add_argument("--optimizer", action="store_true",
+                        help="使用 dex_retargeting PositionOptimizer (默认: 解析法 Gram-Schmidt)")
     args = parser.parse_args()
 
     # Logger
@@ -196,11 +201,20 @@ def main():
         args.output_dir = str(SCRIPT_DIR / "output" / hawor_name)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # [1] 自动检测手部
-    hand_indices = detect_hands(args.hawor_dir)
-    hand_count = len(hand_indices)
-    hand_label = "双手" if hand_count == 2 else ("左手" if hand_indices[0] == 0 else "右手")
-    logger.info(f"[1/3] 手部检测: {hand_label} (indices={hand_indices})")
+    # [1] 自动检测手部 (或用户强制指定)
+    if args.hand_idx >= 0:
+        hand_indices = [args.hand_idx]
+        hand_count = 1
+        hand_label = "左手" if args.hand_idx == 0 else "右手"
+        logger.info(f"[1/3] 手部指定: {hand_label} (index={args.hand_idx})")
+    else:
+        hand_indices = detect_hands(args.hawor_dir)
+        hand_count = len(hand_indices)
+        if hand_count == 0:
+            logger.error("[1/3] 手部检测: 未检测到有效手部数据 (pred_valid 全为 False 或持续为 NaN), 停止生成")
+            sys.exit(1)
+        hand_label = "双手" if hand_count == 2 else ("左手" if hand_indices[0] == 0 else "右手")
+        logger.info(f"[1/3] 手部检测: {hand_label} (indices={hand_indices})")
 
     # [2] 确保 transform_params 存在
     logger.info(f"\n[2/3] 准备 GLB 变换参数 ...")
@@ -211,8 +225,10 @@ def main():
     # [3] 渲染
     logger.info(f"\n[3/3] 渲染视频 ...")
     start_time = time.time()
-    with_arm = (args.mode == "gripper_arm")
-    mode_suffix = "_arm" if with_arm else ""
+
+    # mode="both" 时渲染两轮: 先 gripper, 再 gripper_arm
+    # tracking 和 keypoint 视频与 with_arm 无关, 只渲染一次; 夹爪URDF视频按 mode 循环
+    render_modes = [False, True] if args.mode == "both" else [args.mode == "gripper_arm"]
 
     if hand_count == 1:
         # 单手: 直接渲染
@@ -244,16 +260,20 @@ def main():
             num_frames=args.num_frames, logger=logger,
         )
 
-        # 夹爪URDF视频 (只有夹爪物理模型)
-        gripper_urdf_video = os.path.join(args.output_dir, "videos", f"hawor_r1_{side}_gripper_urdf{mode_suffix}.mp4")
-        logger.info(f"\n  ── 渲染夹爪URDF (mode={args.mode}) ──")
-        render_gripper_only_video(
-            hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
-            transform_params_path=tp_path, output=gripper_urdf_video,
-            hand_idx=hi, fps=args.fps, cam_width=args.width, cam_height=args.height,
-            view=args.view, crf=args.crf, start_frame=args.start_frame,
-            num_frames=args.num_frames, with_arm=with_arm, logger=logger,
-        )
+        # 夹爪URDF视频 (按 mode 循环渲染)
+        for with_arm in render_modes:
+            mode_suffix = "_arm" if with_arm else ""
+            mode_label = "gripper_arm" if with_arm else "gripper"
+            gripper_urdf_video = os.path.join(args.output_dir, "videos", f"hawor_r1_{side}_gripper_urdf{mode_suffix}.mp4")
+            logger.info(f"\n  ── 渲染夹爪URDF (mode={mode_label}) ──")
+            render_gripper_only_video(
+                hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
+                transform_params_path=tp_path, output=gripper_urdf_video,
+                hand_idx=hi, fps=args.fps, cam_width=args.width, cam_height=args.height,
+                view=args.view, crf=args.crf, start_frame=args.start_frame,
+                num_frames=args.num_frames, with_arm=with_arm, logger=logger,
+                analytical=not args.optimizer,
+            )
     else:
         # 双手: 分别渲染左臂和右臂, 然后合成
         videos_dir = os.path.join(args.output_dir, "videos")
@@ -308,48 +328,22 @@ def main():
                 os.remove(v)
         logger.info(f"  ✓ 已删除单独的左/右臂视频, 仅保留合成视频")
 
-        # 夹爪视频 (左右分别渲染+合成)
-        left_gripper = os.path.join(videos_dir, "hawor_r1_left_gripper.mp4")
-        right_gripper = os.path.join(videos_dir, "hawor_r1_right_gripper.mp4")
-        dual_gripper = os.path.join(videos_dir, "hawor_r1_dual_gripper.mp4")
+        # 夹爪URDF视频 (按 mode 循环渲染)
+        for with_arm in render_modes:
+            mode_suffix = "_arm" if with_arm else ""
+            mode_label = "gripper_arm" if with_arm else "gripper"
+            dual_gripper_urdf = os.path.join(videos_dir, f"hawor_r1_dual_gripper_urdf{mode_suffix}.mp4")
 
-        logger.info(f"\n  ── 渲染左夹爪 ──")
-        render_gripper_video(
-            hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
-            transform_params_path=tp_path, output=left_gripper,
-            hand_idx=0, fps=args.fps, cam_width=args.width, cam_height=args.height,
-            view=args.view, crf=args.crf, start_frame=args.start_frame,
-            num_frames=args.num_frames, logger=logger,
-        )
-
-        logger.info(f"\n  ── 渲染右夹爪 ──")
-        render_gripper_video(
-            hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
-            transform_params_path=tp_path, output=right_gripper,
-            hand_idx=1, fps=args.fps, cam_width=args.width, cam_height=args.height,
-            view=args.view, crf=args.crf, start_frame=args.start_frame,
-            num_frames=args.num_frames, logger=logger,
-        )
-
-        logger.info(f"\n  ── 合成双夹爪视频 ──")
-        _combine_videos_side_by_side(left_gripper, right_gripper, dual_gripper, args.fps, args.crf, logger)
-        # 删除单独的左/右夹爪视频 (用户不需要)
-        for v in (left_gripper, right_gripper):
-            if os.path.exists(v):
-                os.remove(v)
-        logger.info(f"  ✓ 已删除单独的左/右夹爪视频, 仅保留合成视频")
-
-        # 夹爪URDF视频 (同一场景两只手)
-        dual_gripper_urdf = os.path.join(videos_dir, f"hawor_r1_dual_gripper_urdf{mode_suffix}.mp4")
-
-        logger.info(f"\n  ── 渲染双夹爪URDF (同场景, mode={args.mode}) ──")
-        render_dual_gripper_video(
-            hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
-            transform_params_path=tp_path, output=dual_gripper_urdf,
-            fps=args.fps, cam_width=args.width, cam_height=args.height,
-            view=args.view, crf=args.crf, start_frame=args.start_frame,
-            num_frames=args.num_frames, with_arm=with_arm, logger=logger,
-        )
+            logger.info(f"\n  ── 渲染双夹爪URDF (同场景, mode={mode_label}) ──")
+            render_dual_gripper_video(
+                hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
+                transform_params_path=tp_path, output=dual_gripper_urdf,
+                fps=args.fps, cam_width=args.width, cam_height=args.height,
+                view=args.view, crf=args.crf, start_frame=args.start_frame,
+                num_frames=args.num_frames, with_arm=with_arm, logger=logger,
+                hand_indices=hand_indices,
+                analytical=not args.optimizer,
+            )
 
     elapsed = time.time() - start_time
     logger.info(f"\n总耗时: {elapsed:.1f} 秒")
