@@ -1,0 +1,20 @@
+Contact report for right hand (mode=finger)
+Total frames: 600, Valid: 438
+Fingers: ['thumb', 'index', 'middle', 'ring', 'pinky']
+Thresholds: <0.005m = contact, <0.015m = close
+
+--- Per-finger contact statistics ---
+thumb   :     0/600 close (0.0%),     0 full, avg_dist=0.0313m
+index   :     0/600 close (0.0%),     0 full, avg_dist=0.0306m
+middle  :     0/600 close (0.0%),     0 full, avg_dist=0.0239m
+ring    :     0/600 close (0.0%),     0 full, avg_dist=0.0239m
+pinky   :     0/600 close (0.0%),     0 full, avg_dist=0.0379m
+
+--- Grasp windows (thumb-index < 25mm) ---
+  frames 0-74 (75 frames), avg_thumb_index_dist=0.0309m
+  frames 93-341 (249 frames), avg_thumb_index_dist=0.0297m
+  frames 358-599 (242 frames), avg_thumb_index_dist=0.0302m
+
+Total grasp frames: 566/600 (94.3%)
+Avg thumb-index distance during grasp: 0.0301m
+Avg thumb-index distance (all frames): 0.0314m

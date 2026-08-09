@@ -36,25 +36,24 @@
       - s_inv, R_inv, t_inv: GLB RAS y-down → HaWoR y-up 变换参数
       - 使用 load_glb_transformed() 直接加载原始 GLB 并变换
 
-  坐标系变换链:
+  坐标系变换链 (三者同帧 = R_AXIS @ OpenGL_world):
     ┌──────────────────────────────────────────────────────────────────────┐
-    │  手部 (HaWoR render world, y-up, 米)                                │
-    │      ↓ RXWORLD_TO_SAPIEN = R_AXIS @ R_x                            │
-    │        R_AXIS = [[1,0,0],[0,0,1],[0,-1,0]]  (y-up → z-up)         │
-    │        R_x    = diag(1,-1,-1)  (SLAM world → render world)         │
-    │  SAPIEN 世界 (z-up)                                                 │
+    │  手部 (HaWoR SLAM world, z-forward, y-down, 米)                     │
+    │      ↓ RXWORLD_TO_SAPIEN = R_AXIS @ R_x  (SLAM → SAPIEN)           │
+    │  SAPIEN 世界 (帧: R_AXIS @ OpenGL)                                  │
     │                                                                      │
-    │  相机 (HaWoR render world, R_c2w/t_c2w)                             │
+    │  相机 (R_c2w/t_c2w 已应用 R_x, 即 stored = R_x @ SLAM = OpenGL)     │
     │      ↓ hawor_cam_to_sapien_pose                                     │
-    │        cam_R_sapien = RXWORLD_TO_SAPIEN @ R_c2w                     │
-    │        sapien_cam_R: X=-backward, Y=-right, Z=up                    │
+    │        cam_pos = R_AXIS @ t_c2w  (注意: 用 R_AXIS, 非 RXWORLD!)     │
+    │        cam_R   = R_AXIS @ R_c2w  (使相机与手部同帧)                  │
+    │        sapien_cam_R: X=+col2(forward), Y=-col0(left), Z=-col1(up)  │
     │  SAPIEN 相机 (X=forward, Y=left, Z=up)                              │
     │                                                                      │
-    │  GLB (RAS y-down, 米制)                                             │
+    │  GLB (RAS y-up, 米制)                                               │
     │      ↓ 01_align_scene 变换: p_hawor = s_inv*R_inv@p_ras + t_inv   │
-    │  HaWoR render world (y-up, 米)                                      │
+    │  HaWoR SLAM world (z-forward, y-down, 米)                           │
     │      ↓ RXWORLD_TO_SAPIEN                                            │
-    │  SAPIEN 世界 (z-up)                                                 │
+    │  SAPIEN 世界 (帧: R_AXIS @ OpenGL, 与手部/相机一致)                 │
     └──────────────────────────────────────────────────────────────────────┘
 
   三种渲染模式:
@@ -74,7 +73,7 @@
     臂关节角 (arm qpos)
 
   GLB 渲染方式:
-    01_align_scene.py 计算 RAS Z-UP → HaWoR render world 的变换参数并保存到 transform_params.npz,
+    01_align_scene.py 计算 RAS Z-UP → HaWoR SLAM world 的变换参数并保存到 transform_params.npz,
     本脚本使用 load_glb_transformed() 以 pipeline_universal.py 风格加载:
       1. trimesh 加载 GLB → 遍历 geometry.items()
       2. 对每个几何体顶点应用变换: p_hawor = s_inv * R_inv @ p_ras + t_inv
@@ -129,6 +128,9 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "example" / "position_retargeting"))
+
+# 全局: 是否优先加载 *_depth_aligned.npz（默认 True）
+PREFER_DEPTH_ALIGNED = True
 
 from dex_retargeting.constants import RobotName, HandType, RetargetingType, get_default_config_path, OPERATOR2MANO_RIGHT
 from dex_retargeting.retargeting_config import RetargetingConfig
@@ -521,7 +523,23 @@ def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
             logger.warning("  imageio-ffmpeg 未安装，跳过 H.264 重编码")
         return False
     if not os.path.exists(input_path):
+        if logger:
+            logger.warning(f"  ffmpeg 重编码失败: 输入文件不存在 {input_path}")
         return False
+
+    # 检查输入文件大小 (空文件会导致 ffmpeg 立即失败, 错误信息只有版本号)
+    input_size = os.path.getsize(input_path)
+    if input_size == 0:
+        if logger:
+            logger.warning(f"  ffmpeg 重编码失败: 输入文件为空 (0 bytes) {input_path}")
+        return False
+
+    # 如果输入和输出路径相同, 使用临时文件避免冲突
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        tmp_path = str(output_path) + ".tmp.mp4"
+    else:
+        tmp_path = str(output_path)
+
     cmd = [
         ffmpeg_exe, "-y",
         "-i", str(input_path),
@@ -531,20 +549,27 @@ def reencode_with_ffmpeg(input_path, output_path, crf=18, fps=30, logger=None):
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-movflags", "+faststart",
-        str(output_path),
+        tmp_path,
     ]
     if logger:
         logger.info(f"  ffmpeg 重编码: CRF={crf}, {fps}fps, libx264")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode == 0:
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            os.remove(input_path)
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            # 如果用了临时文件, 替换原文件
+            if tmp_path != str(output_path):
+                os.replace(tmp_path, str(output_path))
+            # 删除原始输入文件 (如果与输出不同)
+            if os.path.abspath(input_path) != os.path.abspath(output_path):
+                os.remove(input_path)
             if logger:
                 old_size = os.path.getsize(output_path)
                 logger.info(f"  ✓ 重编码完成: {output_path} ({old_size / 1024 / 1024:.1f}MB)")
             return True
     if logger:
-        logger.warning(f"  ffmpeg 重编码失败: {result.stderr[:200]}")
+        # 显示 stderr 最后 300 字符 (实际错误信息在末尾, 不是开头的 build info)
+        err_tail = result.stderr[-300:] if result.stderr else "无错误输出"
+        logger.warning(f"  ffmpeg 重编码失败 (returncode={result.returncode}): {err_tail}")
     return False
 
 
@@ -564,11 +589,12 @@ def axis_angle_to_matrix(aa):
     return pr.matrix_from_axis_angle(np.array([axis[0], axis[1], axis[2], angle]))
 
 
-def _find_reconstruction_file(hawor_path):
+def _find_reconstruction_file(hawor_path, prefer_depth_aligned=True):
     """在 HaWoR 目录中查找重建结果 npz 文件
 
     Args:
         hawor_path: HaWoR 输出目录路径
+        prefer_depth_aligned: True=优先使用 *_depth_aligned.npz, False=只用原始文件
 
     Returns:
         Path: 找到的 npz 文件路径，或 None
@@ -576,6 +602,13 @@ def _find_reconstruction_file(hawor_path):
     rec_dir = hawor_path / "reconstruction"
     if not rec_dir.exists():
         return None
+    if prefer_depth_aligned:
+        for f in rec_dir.glob("hawor_results_*_depth_aligned.npz"):
+            return f
+    for f in rec_dir.glob("hawor_results_*.npz"):
+        if "_depth_aligned" not in str(f):
+            return f
+    # 兜底: 如果上面没找到，用所有文件（包含 depth_aligned）
     for f in rec_dir.glob("hawor_results_*.npz"):
         return f
     return None
@@ -683,7 +716,7 @@ def load_hawor_data(hawor_dir, hand_idx=0):
             - img_focal: float 相机焦距 (像素)
     """
     hawor_path = Path(hawor_dir)
-    rec_file = _find_reconstruction_file(hawor_path)
+    rec_file = _find_reconstruction_file(hawor_path, PREFER_DEPTH_ALIGNED)
     ws_file = hawor_path / "world_space_res.pth"
 
     img_focal = None
@@ -789,7 +822,7 @@ def load_hawor_c2w(hawor_dir):
             - t_c2w: (N, 3) 相机平移向量
             如果文件不存在则返回 (None, None)
     """
-    rec_file = _find_reconstruction_file(Path(hawor_dir))
+    rec_file = _find_reconstruction_file(Path(hawor_dir), PREFER_DEPTH_ALIGNED)
     if rec_file is None:
         return None, None
     rec = np.load(str(rec_file), allow_pickle=True)
@@ -841,15 +874,52 @@ def compute_smooth_shading_normal(vertices, faces):
     return normal
 
 
+def _detect_glb_up_axis(all_vertices):
+    """检测 GLB 坐标系是 Z-UP 还是 Y-UP
+
+    RAS 导出的 GLB 可能是 Y-UP (做了 z-up→y-up 转换) 或 Z-UP (未转换)。
+    01_align_scene.py 的对齐变换 R_inv 假设 GLB 是 Y-UP。
+    如果 GLB 实际是 Z-UP, 需要先用 ZUP_TO_YUP 转换顶点。
+
+    检测启发式: Z-UP 场景中地板在 z=0, 物体在 z>0;
+                Y-UP 场景中地板在 y=0, 物体在 y>0。
+
+    Args:
+        all_vertices: (N, 3) 所有 GLB 顶点
+
+    Returns:
+        str: "z-up" 或 "y-up"
+    """
+    FLOOR_THRESHOLD = 0.1
+    min_z = all_vertices[:, 2].min()
+    min_y = all_vertices[:, 1].min()
+    z_is_floor = abs(min_z) < FLOOR_THRESHOLD
+    y_is_floor = abs(min_y) < FLOOR_THRESHOLD
+    if z_is_floor and not y_is_floor:
+        return "z-up"
+    if y_is_floor and not z_is_floor:
+        return "y-up"
+    if z_is_floor and y_is_floor:
+        z_at_floor = (abs(all_vertices[:, 2]) < FLOOR_THRESHOLD).sum()
+        y_at_floor = (abs(all_vertices[:, 1]) < FLOOR_THRESHOLD).sum()
+        return "z-up" if z_at_floor > y_at_floor else "y-up"
+    return "y-up"
+
+
+ZUP_TO_YUP = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
+
+
 def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
     """加载 GLB 场景并变换到 SAPIEN 坐标系
 
-    变换链: GLB (RAS y-down) → HaWoR render world (y-up) → SAPIEN (z-up)
+    变换链:
+      GLB (RAS, 可能 z-up 或 y-up) → Y-UP (如需) → HaWoR SLAM world (z-forward) → SAPIEN (z-up)
     1. 读取 01_align_scene.py 生成的变换参数 (s_inv, R_inv, t_inv)
-    2. trimesh 加载 GLB, 遍历每个 geometry
-    3. 对顶点应用变换: p_hawor = s_inv * R_inv @ p_ras + t_inv
-    4. 转换到 SAPIEN: p_sapien = RXWORLD_TO_SAPIEN @ p_hawor
-    5. 导出临时 PLY, 用 SAPIEN API 加载为 kinematic actor
+    2. trimesh 加载 GLB, 自动检测坐标系 (z-up / y-up)
+    3. 若 z-up, 先用 ZUP_TO_YUP 转换顶点到 y-up
+    4. 对顶点应用变换: p_hawor = s_inv * R_inv @ p_yup + t_inv
+    5. 转换到 SAPIEN: p_sapien = RXWORLD_TO_SAPIEN @ p_hawor
+    6. 导出临时 PLY, 用 SAPIEN API 加载为 kinematic actor
 
     Args:
         glb_path: GLB 文件路径
@@ -864,6 +934,7 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
     s_inv = float(params['s_inv'])
     R_inv = params['R_inv']
     t_inv = params['t_inv']
+    saved_glb_up_axis = str(params.get('glb_up_axis', 'y-up')) if 'glb_up_axis' in params else None
 
     if trimesh is None:
         if logger:
@@ -879,17 +950,53 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
     if logger:
         logger.info(f"  GLB 内容: {n_geom} 个几何体")
 
+    # 自动检测 GLB 坐标系 (优先使用 transform_params 中保存的值)
+    all_verts_list = []
+    for _, geom in trimesh_scene.geometry.items():
+        if len(geom.vertices) > 0:
+            all_verts_list.append(geom.vertices)
+    if saved_glb_up_axis is not None:
+        glb_up_axis = saved_glb_up_axis
+    elif all_verts_list:
+        glb_up_axis = _detect_glb_up_axis(np.vstack(all_verts_list))
+    else:
+        glb_up_axis = "y-up"
+    need_zup_to_yup = glb_up_axis == "z-up"
+    if logger:
+        logger.info(f"  GLB 坐标系: {glb_up_axis}{' (将转换到 Y-UP)' if need_zup_to_yup else ''}")
+
     import gc
     from sapien.core import Pose
 
     obj_actors = []
     temp_files = []
 
+    # 建立 geom_key → 原始 node_name 映射 (避免使用 trimesh 自动生成的 geometry_N)
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
     for geom_name, geom in trimesh_scene.geometry.items():
+        real_name = geom_to_node.get(geom_name, geom_name)
         vertices = geom.vertices.copy()
+        if not hasattr(geom, 'faces'):
+            continue
         faces = geom.faces.copy()
         if len(vertices) == 0 or len(faces) == 0:
             continue
+
+        # Z-UP → Y-UP 转换 (对齐变换 R_inv 假设 Y-UP 输入)
+        if need_zup_to_yup:
+            vertices = (ZUP_TO_YUP @ vertices.T).T
 
         vertices_hawor = s_inv * (R_inv @ vertices.T).T + t_inv
         vertices_sapien = (RXWORLD_TO_SAPIEN @ vertices_hawor.T).T
@@ -901,7 +1008,7 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
                 avg_rgb = vertex_colors[:, :3].mean(axis=0)
                 avg_color = [avg_rgb[0]/255.0, avg_rgb[1]/255.0, avg_rgb[2]/255.0, 1.0]
 
-        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{geom_name.replace(" ", "_")}.ply'
+        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{real_name.replace(" ", "_")}.ply'
         geom_transformed = trimesh.Trimesh(
             vertices=vertices_sapien,
             faces=faces,
@@ -923,7 +1030,7 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
         else:
             builder.add_visual_from_file(filename=temp_ply)
 
-        actor = builder.build_kinematic(name=geom_name)
+        actor = builder.build_kinematic(name=real_name)
         actor.set_pose(Pose(p=[0, 0, 0], q=[1, 0, 0, 0]))
         obj_actors.append(actor)
 
@@ -1023,9 +1130,16 @@ def make_look_at_camera(eye, target, up=np.array([0, 0, 1.0])):
 def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
     """将 HaWoR 相机位姿转换为 SAPIEN 相机位姿
 
-    变换链:
-    1. 将 HaWoR 相机位置/旋转转换到 SAPIEN 坐标系
-    2. 将 OpenGL 相机约定 (Z=后方) 转换为 SAPIEN 相机约定 (Z=上方)
+    R_c2w/t_c2w 已应用 R_x (SLAM→OpenGL 世界), 但相机约定仍为 OpenCV
+    (col0=right, col1=down, col2=forward). SAPIEN 相机约定: col0=forward,
+    col1=left, col2=up.
+
+    关键: 相机 transform 必须用 R_AXIS (而非 RXWORLD_TO_SAPIEN), 才能与
+    手部/GLB (用 RXWORLD_TO_SAPIEN @ SLAM_data = R_AXIS @ OpenGL_data) 同帧.
+    手部 = R_AXIS @ R_x @ SLAM = R_AXIS @ OpenGL, 相机 = R_AXIS @ stored
+    (stored = R_x @ SLAM = OpenGL), 两者均在 R_AXIS @ OpenGL 帧中.
+
+    OpenCV 提取: forward = +col2, left = -col0, up = -col1
 
     Args:
         R_c2w: (3, 3) HaWoR 相机旋转矩阵 (camera-to-world)
@@ -1036,12 +1150,12 @@ def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
             - cam_pos: (3,) SAPIEN 坐标系下的相机位置
             - cam_quat: (4,) SAPIEN 相机朝向四元数
     """
-    cam_pos_sapien = RXWORLD_TO_SAPIEN @ t_c2w
-    cam_R_sapien = RXWORLD_TO_SAPIEN @ R_c2w
+    cam_pos_sapien = R_AXIS @ t_c2w
+    cam_R_sapien = R_AXIS @ R_c2w
 
-    forward = -cam_R_sapien[:, 2]
+    forward = cam_R_sapien[:, 2]
     left = -cam_R_sapien[:, 0]
-    up = cam_R_sapien[:, 1]
+    up = -cam_R_sapien[:, 1]
 
     sapien_cam_R = np.eye(3)
     sapien_cam_R[:, 0] = forward
@@ -1059,7 +1173,7 @@ class HandObjectRenderer:
     def __init__(self, hawor_dir, ras_dir, transform_params_path, output="hand_object.mp4",
                  fps=30, hand_idx=0, logger=None, viewer=False, crf=18,
                  cam_width=CAM_WIDTH, cam_height=CAM_HEIGHT,
-                 view="fpv", smooth=1):
+                 view="fpv", smooth=1, fixed_base=True):
         """初始化手部+物体渲染器
 
         Args:
@@ -1076,6 +1190,7 @@ class HandObjectRenderer:
             cam_height: 渲染高度 (像素)
             view: 相机视角模式 (fpv=第一人称, topdown=顶部俯视, behind=后上方, front=正前方)
             smooth: 平滑模式 (0=不平滑, 1=在线EMA, 2=后处理双向滤波)
+            fixed_base: 固定基座模式 (True=基座不跟随手腕移动, 始终保持初始位置)
         """
         self.hawor_dir = Path(hawor_dir)
         self.ras_dir = Path(ras_dir)
@@ -1089,6 +1204,7 @@ class HandObjectRenderer:
         self.cam_height = cam_height
         self.view = view
         self.smooth = smooth
+        self.fixed_base = fixed_base
         self.logger = logger or logging.getLogger("HandObjectRender")
         self.cam_fov = 2 * np.arctan(self.cam_height / 2.0 / HAWOR_FOCAL_DEFAULT)
 
@@ -1114,10 +1230,13 @@ class HandObjectRenderer:
             self.logger.info(f"  相机焦距: 使用默认 {HAWOR_FOCAL_DEFAULT}px, FOV={np.degrees(self.cam_fov):.1f}°")
 
     def _render_to_sapien(self, pts_render):
-        """将 HaWoR render world 坐标系的点转换到 SAPIEN 坐标系
+        """将 HaWoR SLAM 坐标系的点转换到 SAPIEN 坐标系
+
+        pred_trans/顶点在 SLAM 世界 (z-forward, y-down), 用 RXWORLD_TO_SAPIEN
+        (= R_AXIS @ R_x) 转换到 SAPIEN. 这与手部/GLB 一致, 三者同帧.
 
         Args:
-            pts_render: (N, 3) 或 (3,) HaWoR render world 坐标
+            pts_render: (N, 3) 或 (3,) HaWoR SLAM 坐标
 
         Returns:
             np.ndarray: 同形状, SAPIEN 坐标系下的点
@@ -1681,8 +1800,13 @@ class HandObjectRenderer:
                     gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                         retargeting, retarget_qpos, "right")
 
-                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                    robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                    if self.fixed_base:
+                        tracked_base = arm_base_pos.copy()
+                        tracked_base_q = arm_base_q.copy()
+                    else:
+                        tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                        tracked_base_q = arm_base_q
+                    robot.set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                     scene.step()
 
                     for link in robot.get_links():
@@ -2019,8 +2143,13 @@ class HandObjectRenderer:
                 retarget_qpos = retargeting.retarget(ref_value, fixed_qpos)
                 gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                     retargeting, retarget_qpos, "right")
-                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                if self.fixed_base:
+                    tracked_base = arm_base_pos.copy()
+                    tracked_base_q = arm_base_q.copy()
+                else:
+                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                    tracked_base_q = arm_base_q
+                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                 scene.step()
                 for link in robot.get_links():
                     if "right_arm_base_link" == link.get_name():
@@ -2078,8 +2207,13 @@ class HandObjectRenderer:
                 gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                     retargeting, retarget_qpos, "right")
 
-                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                if self.fixed_base:
+                    tracked_base = arm_base_pos.copy()
+                    tracked_base_q = arm_base_q.copy()
+                else:
+                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                    tracked_base_q = arm_base_q
+                robot.set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                 scene.step()
 
                 for link in robot.get_links():
@@ -2249,9 +2383,9 @@ class HandObjectRenderer:
 
         arm_states = []
         for hi in self.hand_indices:
-            prefix = "left" if hi == 0 else "right"
-            urdf_path = FLOATING_LEFT_URDF if hi == 0 else FLOATING_RIGHT_URDF
-            arm_starting = LEFT_ARM_STARTING if hi == 0 else RIGHT_ARM_STARTING
+            prefix = "right"
+            urdf_path = FLOATING_RIGHT_URDF
+            arm_starting = RIGHT_ARM_STARTING
 
             arm_urdf_path = prepare_arm_urdf(urdf_path, arm_prefix=prefix)
             loader = scene.create_urdf_loader()
@@ -2278,7 +2412,7 @@ class HandObjectRenderer:
             scene.update_render()
 
             # Retargeting
-            hand_type = HandType.left if hi == 0 else HandType.right
+            hand_type = HandType.right
             config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, hand_type)
             override = dict(
                 add_dummy_free_joint=True,
@@ -2313,15 +2447,13 @@ class HandObjectRenderer:
                 right_setting_file_path=str(R1_RIGHT_SETTINGS),
                 tolerances=IK_TOLERANCES,
             )
-            if hi == 0:
-                ik_solver.relaxed_ik_left.reset(LEFT_ARM_STARTING)
-            else:
-                ik_solver.relaxed_ik_right.reset(RIGHT_ARM_STARTING)
+            ik_solver.relaxed_ik_right.reset(RIGHT_ARM_STARTING)
 
             # MANO layer
             hawor_data = all_hawor_data[hi]
             betas_mean = hawor_data["pred_betas"][start_frame].astype(np.float32)
-            mano_layer = MANOLayer(prefix, betas_mean)
+            mano_side = "left" if hi == 0 else "right"
+            mano_layer = MANOLayer(mano_side, betas_mean)
 
             arm_states.append({
                 "prefix": prefix,
@@ -2351,7 +2483,7 @@ class HandObjectRenderer:
         for arm in arm_states:
             hawor_data = arm["hawor_data"]
             mano_layer = arm["mano_layer"]
-            hand_type = HandType.left if arm["hand_idx"] == 0 else HandType.right
+            hand_type = HandType.right
             for probe_idx in range(num_frames):
                 g_idx = start_frame + probe_idx
                 if not hawor_data["pred_valid"][g_idx]:
@@ -2422,8 +2554,13 @@ class HandObjectRenderer:
                 sapien_qpos = retarget_qpos[arm["retarget2sapien"]]
                 gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                     arm["retargeting"], retarget_qpos, arm["prefix"])
-                tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                if self.fixed_base:
+                    tracked_base = arm_base_pos.copy()
+                    tracked_base_q = arm_base_q.copy()
+                else:
+                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                    tracked_base_q = arm_base_q
+                arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                 scene.step()
                 for link in arm["robot"].get_links():
                     if f"{arm['prefix']}_arm_base_link" == link.get_name():
@@ -2518,8 +2655,13 @@ class HandObjectRenderer:
                     gripper_pos_fk, R_ee_world_fk = self._get_gripper_pose_from_retargeting(
                         arm["retargeting"], retarget_qpos, arm["prefix"])
 
-                    tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
-                    arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), arm_base_q.tolist()))
+                    if self.fixed_base:
+                        tracked_base = arm_base_pos.copy()
+                        tracked_base_q = arm_base_q.copy()
+                    else:
+                        tracked_base = self._compute_tracking_base_pos(arm_base_pos, gripper_pos_fk, arm_base_q)
+                        tracked_base_q = arm_base_q
+                    arm["robot"].set_root_pose(sapien.Pose(tracked_base.tolist(), tracked_base_q.tolist()))
                     scene.step()
 
                     for link in arm["robot"].get_links():
@@ -2651,31 +2793,48 @@ def main():
     parser.add_argument("--smooth", type=int, default=1,
                         choices=[0, 1, 2],
                         help="平滑模式: 0=不平滑, 1=在线EMA平滑(默认), 2=后处理双向滤波+限幅")
+    parser.add_argument("--fixed-base", action="store_true", default=True,
+                        help="固定基座模式 (默认启用; 基座不跟随手腕移动)")
+    parser.add_argument("--no-fixed-base", action="store_true",
+                        help="禁用固定基座模式 (基座会小范围跟随手腕)")
+    parser.add_argument("--no-depth-align", action="store_true",
+                        help="不使用 *_depth_aligned.npz，改用原始 hawor_results_*.npz")
 
     args = parser.parse_args()
+    # --no-fixed-base 覆盖 --fixed-base
+    if args.no_fixed_base:
+        args.fixed_base = False
+    # --no-depth-align 禁用深度校正文件
+    if args.no_depth_align:
+        PREFER_DEPTH_ALIGNED = False
+        print("  使用原始 HaWoR 数据（无深度校正）")
+    else:
+        PREFER_DEPTH_ALIGNED = True
+        rec_dir = Path(args.hawor_dir) / "reconstruction"
+        aligned = list(rec_dir.glob("*_depth_aligned.npz"))
+        if aligned:
+            print(f"  使用深度校正后的 HaWoR 数据: {aligned[0].name}")
+        else:
+            print("  未找到 *_depth_aligned.npz，使用原始数据")
     if args.output is None:
         args.output = f"output/videos/hand_object_{args.mode}.mp4"
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    force_dual = False
     if args.hand_idx < -1:
-        # -2 = 强制双手
-        force_dual = True
+        # -2 = 强制双手 (仅对 robot_only 的旧行为兼容)
         detected_hands = _detect_hands(Path(args.hawor_dir))
         if len(detected_hands) == 2:
-            args.hand_idx = 0  # 默认左手作为 hand_idx
-            print(f"双手模式: 左手+右手")
+            args.hand_idx = 0
+            print(f"双手检测: 左手+右手, 使用左手数据 (idx=0) 驱动右臂")
         else:
             args.hand_idx = detected_hands[0] if detected_hands else 0
-            force_dual = False
             print(f"数据中未检测到双手, 退回单手模式 (idx={args.hand_idx})")
     elif args.hand_idx == -1:
         # 自动检测
         detected_hands = _detect_hands(Path(args.hawor_dir))
         if len(detected_hands) == 2:
             args.hand_idx = 0
-            force_dual = True
-            print(f"自动检测: 双手 (左手+右手)")
+            print(f"自动检测: 双手, 使用左手数据 (idx=0) 驱动右臂")
         elif len(detected_hands) == 1:
             args.hand_idx = detected_hands[0]
             hand_label = "左手" if detected_hands[0] == 0 else "右手"
@@ -2705,14 +2864,11 @@ def main():
                                   output=args.output, fps=args.fps, hand_idx=args.hand_idx, logger=logger,
                                   viewer=args.viewer, crf=args.crf,
                                   cam_width=args.width, cam_height=args.height,
-                                  view=args.view, smooth=args.smooth)
+                                  view=args.view, smooth=args.smooth, fixed_base=args.fixed_base)
 
-    # 设置 hand_indices: 根据检测结果决定单臂/双臂
+    # robot_only 固定单臂模式, 沿用 hand_idx (默认右臂)
     if args.mode == "robot_only":
-        if force_dual:
-            renderer.hand_indices = [0, 1]
-        else:
-            renderer.hand_indices = [args.hand_idx]
+        renderer.hand_indices = [args.hand_idx]
 
     if args.mode == "hand_only":
         renderer.run_hand_only(start_frame=args.start_frame, num_frames=args.num_frames)

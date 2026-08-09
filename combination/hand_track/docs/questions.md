@@ -629,3 +629,73 @@ python 00_run_pipeline.py \
 | svh     | 26 | 20 | 10 | 5 | Schunk SVH |
 
 ---
+
+## Q16: `002_render_scene.py` 的双臂加载、left 手腕提取与 `--view` 模式实现情况
+
+**日期**: 2026-07-10
+**分类**: 调试 / 架构
+
+### 问题
+
+1. `002_render_scene.py` 的双臂加载是否继承了 `hand_track/` 里的处理方式？遇到"无法提取 left 手腕位置"时，它为什么会失败？是有错误就不提取了吗？
+2. `002_render_scene.py` 是否继承了 `02_render_scene.py` 的功能？特别是与 `001_align_scene.py` 的坐标对齐，以及 `--view` 模式的输出。
+
+### 解答
+
+#### 1. 双臂加载与 left 手腕提取
+
+**002_render_scene.py 没有继承 hand_track 的双臂处理方式。**
+
+- `hand_track/render_auto.py` 对双手的处理是：分别调用 `render_robot_video(hand_idx=0)` 和 `render_robot_video(hand_idx=1)` 渲染左右臂，得到两个独立视频，最后用 `_combine_videos_side_by_side` 左右拼接成 `hawor_r1_dual_tracking.mp4`。
+- `002_render_scene.py` 则自己实现了 `render_dual_robot_video`（`002_render_scene.py` L1998 起）：在同一个 SAPIEN 场景中加载左右两条 R1 浮动臂，各用各的 IK solver，共享同一个相机。
+
+**关于"无法提取 left 手腕位置"：**
+
+在 `render_dual_robot_video` 的"放置机器人"阶段（约 L2161-2165），会对每只手调用：
+
+```python
+wrist_positions = _compute_wrist_positions_glb(
+    st["hawor_data"], st["mano_layer"], start_frame, num_frames, s, R_h2g, t_h2g)
+if not wrist_positions:
+    logger.error(f"无法提取 {prefix} 手腕位置")
+    return None
+```
+
+如果某只手（例如 left）在 `[start_frame, start_frame+num_frames)` 范围内没有任何一帧满足 `pred_valid=True` 且 `pred_trans` 非 NaN，`_compute_wrist_positions_glb` 就会返回空列表。此时代码会**直接 `return None`，整个双臂渲染中止**，而不是跳过左手、继续渲染右手。
+
+常见原因：
+- 数据集本身左手为无效手，或 `pred_valid` 全 False / `pred_trans` 全 NaN。
+- `load_hawor_data(hawor_dir, hand_idx=0)` 只按索引 0 取左手数据，内部 `_fill_nan_frames` 会把 NaN 帧标为 invalid，但不会拒绝整只手；渲染层也没有在计算腕部位置前再次兜底校验。
+
+#### 2. 与 `02_render_scene.py` / `001_align_scene.py` 的关系
+
+**坐标对齐：**
+
+- `002_render_scene.py` 确实以 `001_align_scene.py` 输出的 `transform_params.npz` 作为输入，但用的是**新坐标系**参数：
+  - `scale_ratio`
+  - `R_hand_to_glb`
+  - `t_hand_to_glb`
+- 而 `02_render_scene.py` 用的是旧坐标系参数：
+  - `s_inv`、`R_inv`、`t_inv`
+  - 再叠加 `RXWORLD_TO_SAPIEN` 把 HaWoR SLAM world 转到 SAPIEN。
+
+因此 `002_render_scene.py` 是 `001_align_scene.py` 的"新坐标系配套渲染脚本"，不是 `02_render_scene.py` 的直接继承者。它的核心变换是 `hand_to_glb(j, s, R_h2g, t_h2g)`，GLB 直接原样加载（`load_glb_direct`），不再做 `ZUP_TO_YUP` 或 `RXWORLD_TO_SAPIEN` 变换。
+
+**`--view` 模式：**
+
+- `002_render_scene.py` 保留了 `--view` 参数，支持 `"fpv", "behind", "front", "topdown"`（`002_render_scene.py` L2472），与 `02_render_scene.py` 的 `choices=["fpv", "topdown", "behind", "front"]` 基本一致。
+- `render_robot_video` 中实现了对应的相机位姿计算（`002_render_scene.py` L459-480）：`fpv` 使用 HaWoR 相机轨迹转换到 GLB 坐标系；`topdown/behind/front` 使用固定视角。
+
+**功能差异：**
+
+- `002_render_scene.py` 没有继承 `02_render_scene.py` 的 `TrajectorySmoother`（速度/加速度/jerk 限幅 + 双向滤波），只做了关节级 `LPFilter`。
+- 也没有 `hand_only / robot_only / robot_tracking` 三种模式划分，而是新增了 `gripper_only` 等模式，并在 `gripper_only` 下复用了 `hand_track/render_gripper_only.py` 的夹爪渲染逻辑。
+
+### 关键文件位置
+
+- `002_render_scene.py` 主入口与参数解析：L2461-2593
+- `render_dual_robot_video`：L1998 起
+- `hand_track/render_auto.py` 双手处理：L277 起
+- `hand_track/common.py` 中的 `detect_hands` / `load_hawor_data` / `_compute_wrist_positions_glb`
+
+---

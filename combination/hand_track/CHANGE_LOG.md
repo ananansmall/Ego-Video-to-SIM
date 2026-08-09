@@ -1,3 +1,33 @@
+## [2026-07-11] 002_render_scene.py 继承 hand_track 手部检测与单/双手渲染编排
+
+**类型**: 重构 / 增强
+**影响范围**: `example/combination/002_render_scene.py`
+
+### 修改内容
+- [002_render_scene.py] 新增 `_ensure_transform_params()`: 当 `--transform-params` 缺失时, 自动调用 `001_align_scene.py` 生成 `transform_params.npz`。
+- [002_render_scene.py] 新增 `_validate_hands()`: 在渲染前预校验每只手是否能提取有效手腕位置; 无效手自动剔除并降级, 避免之前"left wrist 提取失败导致整个渲染中止"的问题。
+- [002_render_scene.py] 新增 `_render_single_hand_set()`: 单手模式下依次渲染 tracking、gripper keypoint、gripper URDF, 输出到 `output/{hawor_name}/videos/hawor_r1_{side}_*`。
+- [002_render_scene.py] 新增 `_render_dual_hand_set()`: 双手模式下渲染同场景 dual tracking、左右 gripper keypoint 分别渲染并 side-by-side 合成 dual gripper keypoint、同场景 dual gripper URDF。
+- [002_render_scene.py] 改造 `parse_args()`:
+  - 新增 `--output-dir` (默认 `output/{hawor_dir_name}`), `--output` 作为兼容性别名。
+  - `--transform-params` 改为可选。
+  - `--mode` 简化为 `robot_tracking` / `topdown` / `gripper_only`, 移除未实现的 `hand_only` / `robot_only`。
+  - `--gripper-mode` 默认值改为 `both`。
+- [002_render_scene.py] 重写 `main()`: 采用 `hand_track/render_auto.py` 风格四步流程 (手部检测 → 变换参数 → 手部校验 → 渲染), 并调用新增 helper 完成单/双手分发。
+
+### 验证结果
+- 修复 `import time` 缺失: `main()` 使用 `time.time()` 统计总耗时, 之前未导入会导致 `NameError`, 已补上。
+- 语法检查: `python -m py_compile 002_render_scene.py` ✓
+- CLI 帮助: `/home/an/miniconda3/envs/dex/bin/python 002_render_scene.py --help` 正常显示新参数 ✓
+- Smoke test: 使用 `/home/an/data/hawor/7` + `/home/an/data/ras/7_vggt_omega/final_scene.glb`, `--hand-idx -1 --num-frames 8 --width 640 --height 360`, 流程完整跑过 `[1/4]`~`[4/4]` 并输出 `总耗时: 76.2 秒`, 生成 `hawor_r1_left_tracking.mp4`、`hawor_r1_left_gripper.mp4`、`hawor_r1_left_gripper_urdf.mp4`、`hawor_r1_left_gripper_urdf_arm.mp4` ✓
+
+### 行为变更
+- 默认输出路径从 `output/videos/002_{mode}.mp4` 变为 `output/{hawor_name}/videos/hawor_r1_*.{mp4,npy}`。
+- `--transform-params` 不再必填。
+- 无效手会被自动剔除, 不会导致整个双臂渲染中止。
+
+---
+
 ## [2026-06-26] 完善 README 灵巧手使用说明与代码解释
 
 **类型**: 文档

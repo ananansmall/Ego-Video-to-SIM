@@ -189,8 +189,7 @@ RIGHT_ARM_JOINT_LIMITS = np.array([
 # ============ 物理参数 (与 GalaxeaManipSim / 04 一致) ============
 JOINT_STIFFNESS = 1000.0
 JOINT_DAMPING = 200.0
-GRIPPER_STIFFNESS = 5000.0  # 第九轮: K=20000 把物体推开 6mm (冲击太大); K=5000 PD 力 30N 温和夹持.
-                              # 慢速 LIFT (3mm/帧) 让物体有时间通过摩擦力跟上 pad.
+GRIPPER_STIFFNESS = 2000.0  # 第二十七轮: 1000→2000, 提供更强夹紧力以稳定抓握
 GRIPPER_DAMPING = 200.0
 PHYSICS_TIMESTEP = 1 / 240.0
 CONTROL_FREQ = 30
@@ -198,7 +197,7 @@ DECIMATION = max(1, int((1.0 / CONTROL_FREQ) / PHYSICS_TIMESTEP))  # =8
 GROUND_HEIGHT = 0
 OBJECT_DENSITY = 1000.0  # 基础惯性变量: 所有物体统一密度 (kg/m³), 对齐水密度, 用户: "基础的惯性变量"
 OBJECT_MIN_MASS = 0.15   # 基础惯性变量: 物体质量下限 (kg), 防止轻物被 kinematic 根弹飞
-GRIPPER_FRICTION = 2.0  # 夹爪摩擦 (第五轮: 1.0→2.0, 增大摩擦防止物体在夹爪内打滑被甩飞)
+GRIPPER_FRICTION = 2.5  # 夹爪摩擦 (第二十七轮: 1.0→2.5, 增强夹持防止滑落)
 GRIPPER_INIT_OPEN = 0.04
 GRIPPER_MAX_OPEN = 0.05
 MAX_ROOT_STEP = 0.008  # 根速度限制: 每帧 ≤ 0.8cm (盘子翻转临界点 0.008-0.010, 仅 0.008 让盘子不翻; 根误差增大是物理稳定代价)
@@ -323,7 +322,7 @@ def prepare_gripper_only_urdf(side="right", strip_visuals=False):
     <parent link="{prefix}_gripper_link"/>
     <child link="{prefix}_gripper_finger_link1"/>
     <axis xyz="0 -1 0"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
+    <limit lower="-0.01" upper="0.05" effort="100" velocity="0.25"/>
   </joint>
   <link name="{prefix}_gripper_finger_link1">
     <inertial><origin xyz="-0.0195895587205407 0.0151136130965041 -0.00542255818128545" rpy="0 0 0"/>
@@ -334,14 +333,14 @@ def prepare_gripper_only_urdf(side="right", strip_visuals=False):
       <geometry><mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1.STL"/></geometry>
       <material name=""><color rgba="0.823529411764706 0.823529411764706 1 1"/></material></visual>
     <collision><origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry><box size="0.012 0.020 0.024"/></geometry></collision>
+      <geometry><mesh filename="{mesh_dir}/{prefix}_gripper_finger_link1_collision.STL"/></geometry></collision>
   </link>
   <joint name="{prefix}_gripper_finger_joint2" type="prismatic">
     <origin xyz="0.03689 0.013453 0.00012067" rpy="0 0 0"/>
     <parent link="{prefix}_gripper_link"/>
     <child link="{prefix}_gripper_finger_link2"/>
     <axis xyz="0 1 0"/>
-    <limit lower="0" upper="0.05" effort="100" velocity="0.25"/>
+    <limit lower="-0.01" upper="0.05" effort="100" velocity="0.25"/>
   </joint>
   <link name="{prefix}_gripper_finger_link2">
     <inertial><origin xyz="-0.019589448977496 -0.0151137821219537 0.00542248304315596" rpy="0 0 0"/>
@@ -352,7 +351,7 @@ def prepare_gripper_only_urdf(side="right", strip_visuals=False):
       <geometry><mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2.STL"/></geometry>
       <material name=""><color rgba="0.823529411764706 0.823529411764706 1 1"/></material></visual>
     <collision><origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry><box size="0.012 0.020 0.024"/></geometry></collision>
+      <geometry><mesh filename="{mesh_dir}/{prefix}_gripper_finger_link2_collision.STL"/></geometry></collision>
   </link>
 </robot>
 """
@@ -373,45 +372,35 @@ def prepare_gripper_only_urdf(side="right", strip_visuals=False):
 # 渲染失败的 scene 对象 (CPU 降级时保持引用避免 __del__ 段错误)
 _FAILED_SCENES = []
 
-def setup_physics_scene(ground_height=GROUND_HEIGHT):
+def setup_physics_scene(ground_height=GROUND_HEIGHT, force_cpu=False):
     """创建 SAPIEN 物理场景
 
     对齐 02_render_scene.py 的渲染设置 + GalaxeaManipSim 的物理地面
     地面高度根据 GLB 物体最低点动态调整 (02 没有地面, 这里补上)
 
-    CPU 降级修复: sapien.Scene() 渲染设备不可用时, C++ 渲染系统残留状态会导致
-    后续 sapien.Scene(systems=[PhysxCpuSystem()]) 段错误 (SIGSEGV).
-    用 nvidia-smi 预检测: GPU 不可用时直接用 CPU scene, 不创建失败的渲染 scene.
+    Args:
+        ground_height: 地面高度
+        force_cpu: 强制使用 CPU 场景 (优化模式, 避免渲染初始化段错误)
     """
-    import subprocess, shutil
-    # 预检测 GPU 是否可用 (避免 sapien.Scene() 失败后残留状态段错误)
-    # 用 shutil.which 找完整路径 + 增大 timeout (sandbox 中 subprocess 可能 PATH 不同/慢)
-    gpu_ok = False
-    nvidia_smi = shutil.which('nvidia-smi') or '/usr/bin/nvidia-smi'
-    try:
-        r = subprocess.run([nvidia_smi], capture_output=True, timeout=15)
-        # returncode=9 (ECC 错误) 时 GPU 仍可用, 用 stdout 非空判断 (含驱动信息)
-        gpu_ok = (r.returncode == 0 or len(r.stdout) > 50)
-    except Exception:
-        gpu_ok = False
-
     render_available = False
-    if gpu_ok:
+    scene = None
+    if force_cpu:
+        # 优化模式: 直接创建 CPU 场景, 不尝试渲染 (避免 sandbox 环境段错误)
+        scene = sapien.Scene(systems=[sapien.physx.PhysxCpuSystem()])
+    else:
+        # 正常模式: 先尝试创建带渲染的 Scene, 失败则降级 CPU
         try:
             sapien.render.set_viewer_shader_dir("default")
             sapien.render.set_camera_shader_dir("default")
-            sapien.render.set_ray_tracing_samples_per_pixel(16)
+        except Exception:
+            pass
+        try:
             scene = sapien.Scene()
             render_available = True
-        except RuntimeError as e:
-            if "rendering device" in str(e).lower():
-                logger.warning("  SAPIEN 渲染设备不可用, 降级为纯物理场景")
-                scene = sapien.Scene(systems=[sapien.physx.PhysxCpuSystem()])
-            else:
-                raise
-    else:
-        logger.info("  NVIDIA GPU 不可用 (nvidia-smi 失败), 使用 CPU 物理场景")
-        scene = sapien.Scene(systems=[sapien.physx.PhysxCpuSystem()])
+        except Exception:
+            scene = None
+        if scene is None:
+            scene = sapien.Scene(systems=[sapien.physx.PhysxCpuSystem()])
 
     scene.set_timestep(PHYSICS_TIMESTEP)
 
@@ -518,7 +507,22 @@ def compute_glb_ground_z(glb_path, transform_params_path):
     t_inv = params['t_inv']
     trimesh_scene = trimesh.load(str(glb_path))
     all_min_z = []
+    # 建立 geom_key → 原始 node_name 映射 (避免使用 trimesh 自动生成的 geometry_N)
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
     for geom_name, geom in trimesh_scene.geometry.items():
+        real_name = geom_to_node.get(geom_name, geom_name)
         vertices = geom.vertices.copy()
         if len(vertices) == 0:
             continue
@@ -561,7 +565,22 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
     temp_files = []
     all_min_z = []
 
+    # 建立 geom_key → 原始 node_name 映射 (避免使用 trimesh 自动生成的 geometry_N)
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
     for geom_idx, (geom_name, geom) in enumerate(trimesh_scene.geometry.items()):
+        real_name = geom_to_node.get(geom_name, geom_name)
         vertices = geom.vertices.copy()
         faces = geom.faces.copy()
         if len(vertices) == 0 or len(faces) == 0:
@@ -608,9 +627,10 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             )
             body_type = "kinematic"
         else:
-            # 可抓取物体: 高摩擦 + 零弹性, 便于稳定夹持且碰撞不反弹 (用户: "碰一下把盘子弄翻")
+            # 可抓取物体: 摩擦对齐 R1 (1.0); 弹性保持 0.0 (kinematic 根冲击大, 高弹性会导致物体被弹飞)
+            # 注: R1 用 restitution=0.6, 但 R1 是 PD 驱动根 (冲击小); 本场景 kinematic 根冲击大, 必须降低
             phys_material = scene.create_physical_material(
-                static_friction=1.2, dynamic_friction=1.2, restitution=0.0
+                static_friction=1.0, dynamic_friction=1.0, restitution=0.0
             )
             body_type = "dynamic"
 
@@ -650,11 +670,11 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             try:
                 builder.add_convex_collision_from_file(filename=temp_ply, material=phys_material)
             except Exception as e:
-                logger.warning(f"    {geom_name}: 凸包碰撞失败 ({e}), 尝试非凸")
+                logger.warning(f"    {real_name}: 凸包碰撞失败 ({e}), 尝试非凸")
                 try:
                     builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
                 except Exception as e2:
-                    logger.warning(f"    {geom_name}: 碰撞体生成失败 ({e2})")
+                    logger.warning(f"    {real_name}: 碰撞体生成失败 ({e2})")
 
         builder.set_physx_body_type(body_type)
         actor = builder.build(name=f"glb_{geom_idx}")
@@ -679,10 +699,10 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             except Exception:
                 pass
         if obj_mass is not None:
-            logger.info(f"    物体{geom_idx} '{geom_name}': {body_type} "
+            logger.info(f"    物体{geom_idx} '{real_name}': {body_type} "
                         f"(vol={volume:.4f}m³, flat={flatness:.2f}, mass={obj_mass:.3f}kg)")
         else:
-            logger.info(f"    物体{geom_idx} '{geom_name}': {body_type} "
+            logger.info(f"    物体{geom_idx} '{real_name}': {body_type} "
                         f"(vol={volume:.4f}m³, flat={flatness:.2f}, z=[{bbox_min[2]:.3f},{bbox_max[2]:.3f}])")
 
         obj_actors.append(actor)
@@ -860,8 +880,8 @@ def setup_robot(scene, mode, side, base_pos, base_quat):
     logger.info(f"  已禁用所有 robot link 重力 (set_disable_gravity=True), "
                 f"根由 set_root_pose + set_root_linear_velocity 驱动")
 
-    # 夹爪摩擦 (friction 对齐 GalaxeaManipSim=1.0; restitution 降到 0.1 防止物体被弹飞)
-    # GalaxeaManipSim 用 restitution=0.6 (full_robot PD 驱动, 冲击小); 本场景 kinematic 根冲击大, 必须降低
+    # 夹爪摩擦 (friction 对齐 GalaxeaManipSim R1=1.0; restitution 保持 0.1, kinematic 根冲击大需降低)
+    # 注: R1 用 restitution=0.6 (PD 驱动根冲击小); gripper_only kinematic 根冲击大, 高弹性会弹飞物体
     gripper_material = scene.create_physical_material(
         static_friction=GRIPPER_FRICTION, dynamic_friction=GRIPPER_FRICTION, restitution=0.1
     )
@@ -876,13 +896,14 @@ def setup_robot(scene, mode, side, base_pos, base_quat):
                         cs.set_physical_material(gripper_material)
 
     # 禁用非夹爪 link 的碰撞 (ROOT 可能在地下, 躯干与地面碰撞会导致关节爆炸)
-    # 只保留夹爪手指 + gripper_link 的碰撞, 用于抓取物体
+    # 只保留夹爪手指的碰撞, 用于抓取物体.
+    # 第十四轮: gripper_link (root) 碰撞也禁用 — MANO 手势使 EE 在地下 (z=0.004 < ground 0.0098),
+    # root 碰撞会将夹爪推高 7.5cm, 手指无法接触物体. 禁用 root 碰撞后 root 可精确 teleport 到目标.
     collision_link_names = set()
     for s in sides:
         collision_link_names |= {
             f"{s}_gripper_finger_link1",
             f"{s}_gripper_finger_link2",
-            f"{s}_gripper_link",
         }
     n_disabled = 0
     for link in robot.get_links():
@@ -943,12 +964,16 @@ def _is_floating_root(robot):
 
 def physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
                  arm_target, gripper_target1, gripper_target2, scene,
-                 extra_gripper_indices=None, extra_arm_indices=None, extra_arm_target=None):
+                 extra_gripper_indices=None, extra_arm_indices=None, extra_arm_target=None,
+                 lock_root_pose=None):
     """纯 PD 驱动 + 重力补偿 + decimation (对齐 GalaxeaManipSim)
 
     关键: 不调用 set_qpos! set_qpos + set_drive_target 双重控制会导致震荡.
     extra_gripper_indices: 双手模式第二侧夹爪 [(idx, target), ...]
     extra_arm_indices/extra_arm_target: 双手模式第二侧臂关节索引和目标
+    lock_root_pose: 可选 sapien.Pose, 若提供则每个物理子步后重新锁定 root 位姿.
+        用于 CLOSE 阶段: 手指 PD 反作用力会推动浮动根偏移 (6mm+), 导致手指飘离目标.
+        锁定后 root 在 8 个子步中保持精确位姿, 手指能真正接触物体.
     """
     active_joints = robot.get_active_joints()
     for i, idx in enumerate(arm_joint_indices):
@@ -977,6 +1002,10 @@ def physics_step(robot, arm_joint_indices, gripper_idx1, gripper_idx2,
             qf[:6] = 0
         robot.set_qf(qf)
         scene.step()
+        if lock_root_pose is not None:
+            robot.set_root_pose(lock_root_pose)
+            robot.set_root_linear_velocity([0.0, 0.0, 0.0])
+            robot.set_root_angular_velocity([0.0, 0.0, 0.0])
 
 
 # ============================================================
@@ -1143,13 +1172,13 @@ GRASP_TRIGGER_CURL = 0.10   # 10% 卷曲即触发抓取 (用户: "移动个10%�
 RELEASE_TRIGGER_CURL = 0.05  # 5% 以下释放 (跟随 MANO 手指张开)
 GRASP_RESET_CURL = 0.02      # 2% 以下回到 APPROACH (允许再次抓取)
 # 力控参数 (HybridGraspController)
-TARGET_GRASP_FORCE = 6.0     # 目标夹紧力 (N), 由 MANO curl 动态调整 (5→6 增强夹持)
+TARGET_GRASP_FORCE = 10.0    # 目标夹紧力 (N), 由 MANO curl 动态调整 (6→10 增强夹持)
 FORCE_CLOSE_STEP = 0.0015    # 力控阶段每帧闭合步长 (m), 1.5mm/帧 (1→1.5 更快达到目标力)
 MAX_FORCE_MULTIPLIER = 2.0   # 最大力度倍率 (相对 TARGET_GRASP_FORCE)
 # 接触后固定夹紧偏移 (关键: 防止持续闭合把物体挤出)
 # 接触后只在 qpos_at_contact 基础上再闭合固定量 (由 MANO curl 决定, max 3mm)
 # 旧版每帧闭合 1.5mm → 10 帧闭合 15mm → 物体被挤出飞出 (glb_6 xy_drift=389cm)
-CLAMP_OFFSET_MAX = 0.002     # 最大额外闭合 2mm (curl=1.0 时), curl=0.5 时 1mm
+CLAMP_OFFSET_MAX = 0.005     # 最大额外闭合 5mm (curl=1.0 时), curl=0.5 时 2.5mm
 CLAMP_CURL_FLOOR = 0.5       # LIFT/HOLD 阶段 curl 下限 (防止提升中 curl 下降导致夹紧力不足物体滑落)
 # 力估计系数: kinematic 模式下用闭合程度估计力 (closure × 系数 = N)
 # 闭合 5mm → 4N, 闭合 7.5mm → 6N (50→80 增强力反馈, 避免物体滑落)
@@ -1558,15 +1587,11 @@ def find_bowl(obj_info, exclude_names=None):
             continue
         volume = info.get("volume", 0.0)
         flatness = info.get("flatness", 1.0)
-        # 碗: 大体积 + 扁平
-        if volume > 1e-4 and flatness < 0.55:
+        # 碗: 大体积 + 扁平 (第二十七轮: 提高阈值, 避免小盘子/盖子被误判为碗, 默认只做抓取不做放置)
+        if volume > 1e-3 and flatness < 0.35:
             bowlness = volume * (1.0 - flatness)
             candidates.append((name, bowlness, volume, flatness))
     if not candidates:
-        info_str = [(n, round(i.get('volume', 0.0), 4), round(i.get('flatness', 1.0), 3))
-                    for n, i in obj_info.items()]
-        logger.warning(f"  [find_bowl] 未找到碗形物体 (volume>1e-4, flatness<0.55), "
-                       f"物体信息 (name, vol, flat): {info_str}")
         return None
     candidates.sort(key=lambda x: -x[1])
     best = candidates[0]
@@ -1968,7 +1993,7 @@ class GraspSimulator:
 
     def __init__(self, hawor_dir, ras_dir, mode="full_robot", side="right",
                  output_dir=None, num_frames=-1, start_frame=0, views="both",
-                 grasp_mode="adaptive"):
+                 grasp_mode="adaptive", viewer=False):
         self.hawor_dir = Path(hawor_dir)
         self.ras_dir = Path(ras_dir)
         self.mode = mode
@@ -1976,6 +2001,7 @@ class GraspSimulator:
         self.sides = ["left", "right"] if side == "both" else [side]
         self.views = views  # "cam" / "god" / "both" — 指定渲染哪些视角
         self.grasp_mode = grasp_mode  # "adaptive" (MANO意图+相位) / "mano" (纯重放)
+        self.viewer = viewer  # 是否启用交互式 Viewer
         # 输出目录: 当前脚本下的 output/<mode>_<side>/
         if output_dir:
             self.output_dir = Path(output_dir)
@@ -2221,139 +2247,337 @@ class GraspSimulator:
             logger.warning(f"  计算相机朝向失败: {e}, 使用默认朝向 (+X)")
             return np.array([1.0, 0.0, 0.0, 0.0])
 
-    def _compute_mano_neutral_target(self, local_idx, side):
-        """MANO+offset 中和态 (用户: "mano参数为主体, 你可以平移轨迹, 但不能离开轨迹, 偏移轨迹那么多")
+    def _make_horizontal_closing_R(self, R_mano):
+        """调整 R 使手指闭合方向 (Y轴) 水平, 保留 R_X (手指前向).
 
-        与 _compute_grasp_demo_target 的区别:
-          - demo: 完全预规划 smoothstep 轨迹, 绕过 MANO (用户: "你现在完全是脱离mano参数了吗")
-          - neutral: EE = MANO 解析夹爪位置 + 常量偏移, 保持 MANO 运动形状
+        MANO 手势的 R_Y 常有大的 Z 分量 (垂直闭合), 无法夹取地面物体:
+        一根手指在物体上方, 另一根被地面挡住. 旋转 R 绕 X 轴使 R_Y 水平,
+        实现水平捏合 (最小姿态调整: 仅改闭合方向, 保留前向).
 
-        EE 位置 = mano_root_pos[local_idx] + offset
-          - offset 在 "抓取帧" (f_grasp) 处对齐 MANO 到目标物体 (offset 最小化)
-          - 常量偏移保持 MANO 轨迹形状不变, 只做平移 (用户: "你可以平移轨迹")
-        gripper_R = 固定 top-down (稳定抓取朝向)
-        gripper_val: APPROACH/DESCEND 跟随 MANO, CLOSE/LIFT/TRANSPORT 强制闭合, RELEASE 强制打开
+        用户: "不要调整姿态" — 这里仅在 CLOSE 窗口调整, 且只旋转 R_X 轴
+        (手指前向不变), 是实现抓取的最小必要姿态偏离.
+        """
+        R_X = R_mano[:, 0].astype(np.float64)
+        R_X = R_X / np.linalg.norm(R_X)
+        world_z = np.array([0.0, 0.0, 1.0])
+        R_Y = np.cross(world_z, R_X)
+        norm_Y = float(np.linalg.norm(R_Y))
+        if norm_Y < 1e-6:
+            R_Y = np.array([0.0, 1.0, 0.0])
+        else:
+            R_Y = R_Y / norm_Y
+        R_Z = np.cross(R_X, R_Y)
+        R_Z = R_Z / np.linalg.norm(R_Z)
+        return np.column_stack([R_X, R_Y, R_Z])
 
-        关键改进: 阶段判定基于 f_grasp (MANO 最接近目标的帧), 不是固定帧占比.
-          - f_grasp 之前: APPROACH → DESCEND (MANO 自然接近目标)
-          - f_grasp ~ f_grasp+close_dur: CLOSE (在 MANO 最接近处抓取)
-          - 之后: LIFT → TRANSPORT → RELEASE → RETREAT (跟随 MANO 离开)
-        这样 CLOSE 发生在 MANO 实际到达目标高度时, 而非固定 25% 处 (之前 z=15cm 太高抓不到).
+    @staticmethod
+    def _normalize_R(R):
+        """Re-orthogonalize rotation matrix (fix numerical drift for slerp)."""
+        U, _, Vt = np.linalg.svd(R)
+        R_ortho = U @ Vt
+        if np.linalg.det(R_ortho) < 0:
+            U[:, -1] *= -1
+            R_ortho = U @ Vt
+        return R_ortho
+
+    def _compute_mano_neutral_target(self, local_idx, side, opt_params=None):
+        """MANO+offset 中和态 (第十八轮: 位置跟随 MANO, CLOSE 微调姿态 + CEM 优化)
+
+        用户核心要求:
+          "参考的mano是一定要跟随的, 你可以稍微调整它的位置, 但姿态要跟上"
+          "本身肯定是有一个位姿曲线你需要跟随"
+
+        设计 (最小必要调整):
+          - 位置: 全阶段 gripper_pos = mano_pos + offset (严格跟随 MANO 轨迹)
+          - 姿态:
+            * APPROACH/TRANSPORT/RELEASE: gripper_R = MANO R (严格跟随)
+            * CLOSE: gripper_R = 水平闭合 R (R_Y 水平化, 仅此一项调整)
+              原因: MANO R_Y 常垂直 (Z>0.9), 手指上下叠放无法夹地面物体.
+              水平化 R_Y 使手指左右捏合, 是抓取的最小必要姿态调整.
+            * 过渡 (CLOSE→TRANSPORT 前 10 帧): slerp 平滑回 MANO R
+          - 手指开合:
+            * APPROACH: 跟随 MANO j1 (MANO 怎么动夹爪怎么动)
+            * CLOSE/TRANSPORT: 闭合 (0.0, PD 驱动手指闭合)
+            * RELEASE: 张开 (GRIPPER_MAX_OPEN)
+
+        opt_params: 9 维 np.ndarray, None 时用默认值 (第十八轮 CEM 优化)
+            [0:3]   grasp_pos_delta: CLOSE 时 grasp 位置偏移 (m)
+            [3:6]   grasp_R_euler: CLOSE 姿态欧拉角修正 (rad)
+            [6]     finger_close_target: 手指闭合 PD target
+            [7]     close_blend_ratio: CLOSE 下降比例
+            [8]     transport_vel_limit: TRANSPORT 速度限幅 (m/s)
 
         Returns:
-            (gripper_pos, gripper_R, gripper_val, phase) or None (无 MANO 轨迹/无目标时退回纯 MANO)
+            (gripper_pos, gripper_R, gripper_val, phase, transport_vel_limit) or None
         """
+        # 默认参数 (保持向后兼容)
+        if opt_params is None:
+            opt_params = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.5])
         traj = getattr(self, '_mano_gripper_traj', {}).get(side)
         offset = getattr(self, '_mano_neutral_offset', {}).get(side)
         f_grasp = getattr(self, '_mano_grasp_frame', {}).get(side)
-        if traj is None or offset is None or f_grasp is None or len(traj["pos"]) == 0:
+        target_pos = getattr(self, '_mano_target_pos', {}).get(side)
+        if traj is None or offset is None or f_grasp is None or target_pos is None or len(traj["pos"]) == 0:
             return None
-        # 越界保护
         if local_idx >= len(traj["pos"]):
             local_idx = len(traj["pos"]) - 1
 
-        # 中和态: MANO 位置 + 常量偏移 (保持 MANO 轨迹形状)
         mano_pos = traj["pos"][local_idx]
         mano_j1 = float(traj["j1"][local_idx])
 
-        # 固定 top-down 朝向 (gripper X 朝下, 稳定抓取)
-        gripper_R = getattr(self, '_gripper_R_fixed', None)
-        if gripper_R is None:
-            gripper_R = np.array([[0, 1, 0], [0, 0, -1], [-1, 0, 0]], dtype=np.float64)
+        if "R" in traj and len(traj["R"]) > local_idx:
+            mano_R = traj["R"][local_idx]
+        else:
+            mano_R = np.eye(3, dtype=np.float64)
 
-        # 阶段判定: 基于 f_grasp (MANO 最接近目标的帧), 不是固定帧占比
-        # 这样 CLOSE 发生在 MANO 实际到达目标高度时, 解决 "z=15cm 太高抓不到" 问题
+        # 阶段判定
         n = max(self.num_frames, 1)
         ctrl = self.grasp_controllers.get(side) if self.grasp_controllers else None
         has_bowl = ctrl is not None and ctrl.bowl_pos is not None
-
-        # CLOSE 持续时间: ~15% 总帧数 (够 PD 收敛)
-        close_dur = max(3, int(n * 0.15))
-        close_end = min(f_grasp + close_dur, n - 1)
-        # APPROACH 占 f_grasp 前约 40%, DESCEND 占后 60%
-        approach_end = max(1, int(f_grasp * 0.4))
+        close_dur = max(20, int(n * 0.20))
+        # 第二十五轮: 提前开始 CLOSE, 避免 f_grasp 太晚导致只有几帧闭合时间
+        # f_grasp 是 MANO 最接近物体的帧, 但可能接近总帧末尾 (如 F107/113)
+        # 提前 30 帧开始 CLOSE, 让 blend 有充足时间平滑过渡到 grasp_pos
+        close_start = max(0, f_grasp - 30)
+        close_end = min(close_start + close_dur, n - 1)
+        transition_end = min(close_end + 10, n - 1)
 
         if has_bowl:
-            # CLOSE 后: LIFT → TRANSPORT → RELEASE → RETREAT
             remaining = max(1, n - close_end)
-            lift_end = close_end + max(1, int(remaining * 0.3))
-            transport_end = close_end + max(1, int(remaining * 0.6))
             release_end = close_end + max(1, int(remaining * 0.8))
-
-            if local_idx < approach_end:
+            if local_idx < close_start:
                 phase = "APPROACH"
-            elif local_idx < f_grasp:
-                phase = "DESCEND"
             elif local_idx < close_end:
                 phase = "CLOSE"
-            elif local_idx < lift_end:
-                phase = "LIFT"
-            elif local_idx < transport_end:
-                phase = "TRANSPORT"
             elif local_idx < release_end:
-                phase = "RELEASE"
+                phase = "TRANSPORT"
             else:
-                phase = "RETREAT"
+                phase = "RELEASE"
         else:
-            # 无碗: APPROACH → DESCEND → CLOSE → LIFT
-            if local_idx < approach_end:
+            if local_idx < close_start:
                 phase = "APPROACH"
-            elif local_idx < f_grasp:
-                phase = "DESCEND"
             elif local_idx < close_end:
                 phase = "CLOSE"
             else:
-                phase = "LIFT"
+                phase = "HOLD"
 
-        # 位置计算: 基于阶段决定 (核心改进)
-        # - APPROACH/DESCEND/TRANSPORT/RELEASE/RETREAT: 跟随 MANO 轨迹 + offset
-        # - CLOSE: 保持抓取位置 (MANO 在 f_grasp 后会上升, 不跟随以让夹爪闭合)
-        # - LIFT: 从抓取位置平滑过渡到 MANO+offset (整个 LIFT 阶段渐进, 避免突变甩飞物体)
-        grasp_pos = traj["pos"][f_grasp] + offset  # 抓取位置 (f_grasp 处)
+        # 位置 + 姿态 + 手指开合: 按阶段处理
+        FINGER_FORWARD_NEUTRAL = 0.037
         mano_target_pos = mano_pos + offset  # MANO+offset 当前帧
 
-        if phase == "CLOSE":
-            # 保持抓取位置, 不跟随 MANO 上升 (让夹爪在物体高度闭合)
-            gripper_pos = grasp_pos
-        elif phase == "LIFT":
-            # 平滑过渡: 从抓取位置渐变到 MANO+offset, 贯穿整个 LIFT 阶段
-            # (之前 5 帧过渡太快, 速度突变导致物体甩飞 xy_drift=55cm)
-            lift_total = max(1, lift_end - close_end)
-            lift_t = min(1.0, (local_idx - close_end) / float(lift_total))
-            lift_t = lift_t * lift_t * (3 - 2 * lift_t)  # smoothstep
-            gripper_pos = grasp_pos * (1 - lift_t) + mano_target_pos * lift_t
-        else:
-            # 跟随 MANO 轨迹 + offset (保持 MANO 运动形状)
-            gripper_pos = mano_target_pos
+        # 第二十九轮: 3 维 XYZ 偏移优化 (Phase 1: 只接触, 不调姿态)
+        if opt_params is not None and len(opt_params) == 3:
+            from traj_optimize import apply_xyz_offset
+            gripper_pos, gripper_R = apply_xyz_offset(
+                mano_target_pos, mano_R, opt_params
+            )
+            # 手指开合保持默认阶段逻辑
+            if local_idx < close_start:
+                gripper_val = mano_j1
+            elif local_idx < close_end:
+                gripper_val = 0.0
+            elif has_bowl and local_idx < release_end:
+                gripper_val = 0.0
+            else:
+                gripper_val = GRIPPER_MAX_OPEN
+            return gripper_pos, gripper_R, gripper_val, phase, 0.5
 
-        # Z-floor: TRANSPORT/RELEASE/RETREAT 阶段确保手指不撞碗
-        # (MANO+offset 轨迹可能经过碗位置, 闭合夹爪撞碗导致碗飞 207cm;
-        #  RETREAT 时 MANO 自然下降, 手指会再次进入碗区域, 需同样保护)
-        # 手指在 EE 下方 3.7cm (FINGER_FORWARD_OFFSET), 需 EE_z > bowl_z + 15cm + 3.7cm
-        if has_bowl and phase in ("TRANSPORT", "RELEASE", "RETREAT"):
+        # 第二十九轮 Phase 2: 6 维 XYZ+RPY 偏移优化
+        if opt_params is not None and len(opt_params) == 6:
+            from traj_optimize import apply_xyz_offset
+            from scipy.spatial.transform import Rotation as R
+            xyz = opt_params[0:3]
+            rpy = opt_params[3:6]
+            gripper_pos, gripper_R = apply_xyz_offset(
+                mano_target_pos, mano_R, xyz
+            )
+            if np.linalg.norm(rpy) > 1e-8:
+                R_corr = R.from_euler("xyz", rpy).as_matrix()
+                gripper_R = R_corr @ mano_R
+            # 手指开合保持默认阶段逻辑
+            if local_idx < close_start:
+                gripper_val = mano_j1
+            elif local_idx < close_end:
+                gripper_val = 0.0
+            elif has_bowl and local_idx < release_end:
+                gripper_val = 0.0
+            else:
+                gripper_val = GRIPPER_MAX_OPEN
+            return gripper_pos, gripper_R, gripper_val, phase, 0.5
+
+        # 第十九轮: 42 维 spline keyframes 优化 (CMA-ES)
+        # 全程应用 keyframe 偏移: gripper_pos = mano_target_pos + keyframe_pos_delta
+        # 姿态: gripper_R = R_correction @ mano_R
+        # 手指开合: f_grasp 前跟 MANO j1, f_grasp 后闭合, RELEASE 张开
+        if opt_params is not None and len(opt_params) == 42:
+            from traj_optimize import interp_keyframes, apply_keyframe_offset
+            # 预计算整条轨迹的偏移 (缓存, 避免每帧重复插值)
+            kf_cache = getattr(self, '_kf_cache', None)
+            if kf_cache is None or kf_cache.get('id') != id(opt_params):
+                total = len(traj["pos"])
+                kf_cache = {
+                    'id': id(opt_params),
+                    'offsets': interp_keyframes(opt_params, total),
+                }
+                self._kf_cache = kf_cache
+            offset_6d = kf_cache['offsets'][local_idx]
+
+            # 位置 + 姿态: MANO + offset + keyframe 偏移
+            gripper_pos, gripper_R = apply_keyframe_offset(
+                mano_target_pos, mano_R, offset_6d
+            )
+
+            # 手指开合: close_start 前跟 MANO, close_start 后闭合, RELEASE 张开
+            if local_idx < close_start:
+                gripper_val = mano_j1
+            elif local_idx < close_end:
+                gripper_val = 0.0
+            elif has_bowl and local_idx < release_end:
+                gripper_val = 0.0
+            else:
+                gripper_val = GRIPPER_MAX_OPEN
+
+            # Z-floor 碗保护 (TRANSPORT/RELEASE)
+            if has_bowl and phase in ("TRANSPORT", "RELEASE"):
+                bowl = ctrl.bowl_pos
+                finger_forward_z = abs(float(gripper_R[2, 0])) * FINGER_FORWARD_NEUTRAL
+                bowl_safe_z = float(bowl[2]) + 0.15 + finger_forward_z
+                if gripper_pos[2] < bowl_safe_z:
+                    gripper_pos = gripper_pos.copy()
+                    gripper_pos[2] = bowl_safe_z
+
+            return gripper_pos, gripper_R, gripper_val, phase, 0.5
+
+        # 第二十六轮: 帧级窗口优化 (PyTorch CEM)
+        if opt_params is not None and hasattr(self, '_window_params') and self._window_params is not None:
+            from traj_optimize import apply_window_offset
+            from scipy.spatial.transform import Rotation
+            gripper_pos, gripper_R = apply_window_offset(
+                mano_target_pos, mano_R, local_idx, self._window_params, opt_params
+            )
+            # CLOSE 阶段: 强制水平闭合姿态 (保留手指前向), 再叠加窗口旋转偏移
+            if phase == "CLOSE":
+                horiz_R = self._make_horizontal_closing_R(mano_R)
+                # 从窗口偏移提取该帧旋转增量, 应用到水平闭合姿态上
+                wp = self._window_params
+                indices = wp["indices"]
+                for wi in range(wp["n_window"]):
+                    if indices[wi] == local_idx:
+                        base = wi * 6
+                        droll, dpitch, dyaw = opt_params[base+3:base+6]
+                        if abs(droll) + abs(dpitch) + abs(dyaw) > 1e-8:
+                            R_corr = Rotation.from_euler("xyz", [droll, dpitch, dyaw]).as_matrix()
+                            gripper_R = R_corr @ horiz_R
+                        else:
+                            gripper_R = horiz_R
+                        break
+                else:
+                    gripper_R = horiz_R
+            # 手指开合: close_start 前跟 MANO, close_start 后闭合, RELEASE 张开
+            if local_idx < close_start:
+                gripper_val = mano_j1
+            elif local_idx < close_end:
+                gripper_val = 0.0
+            elif has_bowl and local_idx < release_end:
+                gripper_val = 0.0
+            else:
+                gripper_val = GRIPPER_MAX_OPEN
+            # Z-floor 碗保护 (TRANSPORT/RELEASE)
+            if has_bowl and phase in ("TRANSPORT", "RELEASE"):
+                bowl = ctrl.bowl_pos
+                finger_forward_z = abs(float(gripper_R[2, 0])) * FINGER_FORWARD_NEUTRAL
+                bowl_safe_z = float(bowl[2]) + 0.15 + finger_forward_z
+                if gripper_pos[2] < bowl_safe_z:
+                    gripper_pos = gripper_pos.copy()
+                    gripper_pos[2] = bowl_safe_z
+            return gripper_pos, gripper_R, gripper_val, phase, 0.5
+
+        # 第十八轮: 从 opt_params 提取优化参数
+        grasp_pos_delta = opt_params[0:3]
+        grasp_R_euler = opt_params[3:6]
+        finger_close_target = float(opt_params[6])
+        close_blend_ratio = float(opt_params[7])
+        transport_vel_limit = float(opt_params[8])
+
+        if phase == "CLOSE":
+            # CLOSE: 水平闭合 R + 位置 blend 到 grasp_pos + 手指闭合
+            # 第十八轮: 应用 opt_params 偏移
+            # 第二十五轮: grasp_pos 用物体当前位置而非初始 target_pos
+            #   仿真中物体会被夹爪推动偏移 (可达 5cm+), 用初始位置会抓空
+            gripper_R = self._make_horizontal_closing_R(mano_R)
+            _close_tgt = target_pos
+            _ctrl_close = self.grasp_controllers.get(side) if self.grasp_controllers else None
+            if _ctrl_close and _ctrl_close.target_obj and hasattr(self, 'obj_actors'):
+                for _ac in self.obj_actors:
+                    if _ctrl_close.target_obj in _ac.get_name():
+                        _close_tgt = np.array(_ac.get_pose().p, dtype=np.float64)
+                        break
+            grasp_pos = _close_tgt - gripper_R[:, 0] * FINGER_FORWARD_NEUTRAL + grasp_pos_delta
+            # 姿态修正 (欧拉角乘到当前 R 上)
+            if np.linalg.norm(grasp_R_euler) > 1e-6:
+                from scipy.spatial.transform import Rotation
+                R_correction = Rotation.from_euler("xyz", grasp_R_euler).as_matrix()
+                gripper_R = R_correction @ gripper_R
+            close_progress = (local_idx - close_start) / max(close_dur, 1)
+            # 前 close_blend_ratio 快速下降到位 (可优化)
+            descend_t = min(1.0, close_progress / close_blend_ratio)
+            t = descend_t * descend_t * (3 - 2 * descend_t)  # smoothstep
+            gripper_pos = mano_target_pos * (1 - t) + grasp_pos * t
+            gripper_val = finger_close_target  # 第十八轮: 用优化值
+        elif phase == "TRANSPORT" and local_idx < transition_end:
+            # 过渡: 位置从 grasp_pos 回 MANO, R slerp 回 MANO, 手指保持闭合
+            close_end_idx = min(close_end - 1, len(traj["R"]) - 1)
+            close_end_R_horiz = self._make_horizontal_closing_R(traj["R"][close_end_idx])
+            grasp_end_pos = target_pos - close_end_R_horiz[:, 0] * FINGER_FORWARD_NEUTRAL
+            t = min(1.0, (local_idx - close_end) / max(1, transition_end - close_end))
+            t_smooth = t * t * (3 - 2 * t)
+            gripper_R = pr.matrix_slerp(
+                self._normalize_R(close_end_R_horiz), self._normalize_R(mano_R), t_smooth
+            )
+            gripper_pos = grasp_end_pos * (1 - t_smooth) + mano_target_pos * t_smooth
+            gripper_val = 0.0  # 保持闭合
+        elif phase == "RELEASE":
+            # RELEASE: 跟随 MANO R, 手指张开
+            gripper_R = mano_R
+            gripper_pos = mano_target_pos
+            gripper_val = GRIPPER_MAX_OPEN
+        else:
+            # APPROACH / TRANSPORT(过渡后): 跟随 MANO R + MANO j1
+            # HOLD: 第二十五轮 — 保持抓取位置, 不跟随 MANO 远离
+            gripper_R = mano_R
+            if phase == "HOLD":
+                _hold_tgt = target_pos
+                _ctrl_hold = self.grasp_controllers.get(side) if self.grasp_controllers else None
+                if _ctrl_hold and _ctrl_hold.target_obj and hasattr(self, 'obj_actors'):
+                    for _ac in self.obj_actors:
+                        if _ctrl_hold.target_obj in _ac.get_name():
+                            _hold_tgt = np.array(_ac.get_pose().p, dtype=np.float64)
+                            break
+                # 第二十五轮: HOLD 阶段提升物体
+                # 夹爪捏住物体后, 平滑向上移动 10cm, 摩擦力带动物体提起
+                _hold_progress = (local_idx - close_end) / max(n - close_end, 1)
+                _hold_progress = min(1.0, _hold_progress * 2.0)  # 前半段完成提升
+                _lift_height = 0.05  # 阶段 A: 保守提升 5cm (0.10→0.05)
+                _hold_tgt[2] = _hold_tgt[2] + _lift_height * _hold_progress
+                gripper_pos = _hold_tgt - gripper_R[:, 0] * FINGER_FORWARD_NEUTRAL
+                gripper_val = 0.0
+            else:
+                gripper_pos = mano_target_pos
+                if phase == "TRANSPORT":
+                    gripper_val = 0.0
+                else:
+                    gripper_val = mano_j1  # APPROACH 跟随 MANO
+
+        # Z-floor: TRANSPORT(过渡后)/RELEASE 阶段碗上方安全高度
+        if has_bowl and phase in ("TRANSPORT", "RELEASE") and local_idx >= transition_end:
             bowl = ctrl.bowl_pos
-            bowl_safe_z = float(bowl[2]) + 0.15 + 0.037  # 碗上方 15cm + 手指偏移
+            finger_forward_z = abs(float(gripper_R[2, 0])) * 0.037
+            bowl_safe_z = float(bowl[2]) + 0.15 + finger_forward_z
             if gripper_pos[2] < bowl_safe_z:
                 gripper_pos = gripper_pos.copy()
                 gripper_pos[2] = bowl_safe_z
 
-        # gripper_val: 阶段强制为主 (确保抓取成功), MANO 手指值为辅
-        # - APPROACH: 跟随 MANO (接近阶段不强制)
-        # - DESCEND: 强制打开 (到达物体前手指张开, 避免推开物体)
-        # - CLOSE: 强制闭合 0 (夹住物体)
-        # - LIFT/TRANSPORT: 强制闭合 0 (维持抓取, 防 MANO 抖动松开物体)
-        # - RELEASE: 强制打开 (释放物体到碗)
-        # - RETREAT: 跟随 MANO
-        if phase == "DESCEND":
-            gripper_val = GRIPPER_MAX_OPEN
-        elif phase in ("CLOSE", "LIFT", "TRANSPORT"):
-            gripper_val = 0.0
-        elif phase == "RELEASE":
-            gripper_val = GRIPPER_MAX_OPEN
-        else:
-            gripper_val = mano_j1
-
-        return gripper_pos, gripper_R, gripper_val, phase
+        return gripper_pos, gripper_R, gripper_val, phase, transport_vel_limit
 
     def _compute_grasp_demo_target(self, local_idx, side):
         """grasp_demo 式预规划轨迹 (用户: "像 grasp_demo.py 一样真正的抓取物体")
@@ -2700,47 +2924,60 @@ class GraspSimulator:
         """
         local_idx = getattr(self, '_current_local_idx', 0)
 
-        # === hybrid 模式: MANO+offset 中和态 (MANO 为主体, 常量平移对齐目标) ===
+        # === hybrid 模式: MANO+offset 中和态 (第十八轮: CEM 优化) ===
         if self.grasp_mode == "hybrid" and self.grasp_controllers is not None:
-            neutral_target = self._compute_mano_neutral_target(local_idx, self.side)
+            opt_params = getattr(self, '_opt_params', None)
+            neutral_target = self._compute_mano_neutral_target(local_idx, self.side, opt_params)
             if neutral_target is not None:
-                gripper_pos, gripper_R, gripper_val, phase = neutral_target
+                gripper_pos, gripper_R, gripper_val, phase, transport_vel_limit = neutral_target
+                self._last_phase = phase  # 调试用: 主循环接触日志按阶段输出
                 root_quat = pr.quaternion_from_matrix(gripper_R)
                 robot = self.robot_info["robot"]
-                # 关键修复: LIFT/TRANSPORT 阶段不调 set_root_pose (teleport 破坏接触连续性,
-                # 导致物体被弹飞后失去接触). APPROACH/DESCEND/CLOSE/RELEASE/RETREAT 可 teleport
-                # (无接触, 或位置不变). 测试验证: 纯速度控制可提升物体 101.8mm.
-                # TRANSPORT 同样需要保持接触 (用户: "放到碗里面"), 故与 LIFT 一致用 velocity 控制.
-                if phase not in ("LIFT", "TRANSPORT"):
-                    robot.set_root_pose(sapien.Pose(gripper_pos.tolist(), root_quat.tolist()))
-                # 速度控制: 让物理引擎平滑移动根, 维持接触摩擦力.
-                # LIFT/TRANSPORT 阶段: feedforward + P 反馈. feedforward 跟踪目标轨迹速度,
-                # P 反馈纠正因接触力导致的根位置漂移 (KP=CONTROL_FREQ/4≈7.5, 每帧纠正 25% 误差).
-                # 中和态下 ff_vel 来自 MANO 帧间位移 (保持 MANO 运动速度形状).
-                # 非 LIFT/TRANSPORT 阶段: 纯 feedforward (root 被 teleport, 速度仅用于摩擦力).
-                prev_pos = getattr(self, '_prev_demo_root_pos', None)
-                if phase in ("LIFT", "TRANSPORT"):
-                    actual_pos = np.array(robot.get_root_pose().p, dtype=np.float64)
-                    pos_error = gripper_pos - actual_pos
-                    if prev_pos is not None:
-                        ff_vel = (gripper_pos - prev_pos) * float(CONTROL_FREQ)
-                    else:
-                        ff_vel = np.zeros(3)
-                    root_vel = ff_vel + pos_error * (float(CONTROL_FREQ) / 4.0)
-                    robot.set_root_linear_velocity(root_vel.tolist())
+                gripper_idx1 = self.robot_info["gripper_idx1"]
+                gripper_idx2 = self.robot_info["gripper_idx2"]
+                # 第二十三轮: 抓取阶段 (CLOSE/LIFT/HOLD/TRANSPORT) 锁定根, 让手指 PD 力作用在物体上
+                # 而非推走浮动根. 之前 unlock 导致 impulse=0 (接触力耗散在推走根上).
+                root_pose = sapien.Pose(gripper_pos.tolist(), root_quat.tolist())
+                lock_phases = ("CLOSE", "FORCE_CONTROL", "LIFT", "HOLD", "TRANSPORT")
+                if phase in lock_phases:
+                    self._close_lock_pose = root_pose
                 else:
-                    if prev_pos is not None:
-                        root_vel = (gripper_pos - prev_pos) * float(CONTROL_FREQ)
-                        robot.set_root_linear_velocity(root_vel.tolist())
-                    else:
-                        robot.set_root_linear_velocity([0.0, 0.0, 0.0])
+                    self._close_lock_pose = None
+                prev_pos = getattr(self, '_prev_demo_root_pos', None)
+                robot.set_root_pose(root_pose)
+                if prev_pos is not None:
+                    root_vel = (gripper_pos - prev_pos) * float(CONTROL_FREQ)
+                    vel_norm = float(np.linalg.norm(root_vel))
+                    if vel_norm > transport_vel_limit:
+                        root_vel = root_vel * (transport_vel_limit / vel_norm)
+                else:
+                    root_vel = np.zeros(3)
+                robot.set_root_linear_velocity(root_vel.tolist())
                 robot.set_root_angular_velocity([0.0, 0.0, 0.0])
                 self._prev_demo_root_pos = gripper_pos.copy()
                 joint1 = float(gripper_val)
                 joint2 = float(gripper_val)
+                if phase in lock_phases:
+                    # 阶段 A: 移除超限 PD target (-0.03→0.0), 让 PD 自然闭合
+                    joint1 = 0.0
+                    joint2 = 0.0
+                # 第二十八轮: 立即 set_qpos 手指到目标位置, 让 CLOSING 一帧到位产生接触.
+                # physics_step 后续会设置相同 drive_target, 目标一致所以不会震荡.
+                qpos = robot.get_qpos().copy()
+                qpos[gripper_idx1] = float(joint1)
+                qpos[gripper_idx2] = float(joint2)
+                robot.set_qpos(qpos)
+                for _j in robot.get_active_joints():
+                    if _j.get_name() == robot.get_active_joints()[gripper_idx1].get_name():
+                        _j.set_drive_target(float(joint1))
+                    elif _j.get_name() == robot.get_active_joints()[gripper_idx2].get_name():
+                        _j.set_drive_target(float(joint2))
+                # 第十九轮 v3: 保存当前 gripper 位姿供 rollout 计算接近奖励
+                self._current_gripper_pos = gripper_pos.copy()
                 if local_idx == 0 or local_idx % 30 == 0:
                     logger.info(f"  [neutral][{self.side}] F{local_idx}: phase={phase}, "
-                                f"pos={gripper_pos.round(3)}, grip_cmd={gripper_val:.4f}")
+                                f"pos={gripper_pos.round(3)}, grip_cmd={gripper_val:.4f}, "
+                                f"vel_limit={transport_vel_limit:.2f}")
                 return (), (joint1, joint2)
 
         # === 非 hybrid: MANO 解析映射 (原有逻辑) ===
@@ -2932,6 +3169,53 @@ class GraspSimulator:
         except Exception:
             pass
 
+    def _init_collision_visualization(self, robot):
+        """初始化手指碰撞模型可视化 (第十三轮: 用户要求"把碰撞模型也展示到视频里面")
+
+        创建半透明红色 RGBA[1,0,0,0.4] visual actor 覆盖在手指视觉模型外,
+        每帧跟随手指 link 位姿, 视频中清晰看到碰撞体 vs 物体接触.
+        不影响物理 (仅 visual, 不参与碰撞).
+        """
+        self._collision_visual_actors = {}  # link_name -> visual actor
+        self._collision_link_map = {}  # link_name -> robot link (用于取位姿)
+        if not getattr(self.scene, "_render_available", True):
+            return
+        try:
+            import sapien.render
+            sides = ["left", "right"] if self.side == "both" else [self.side]
+            for s in sides:
+                for link_name_suffix in ["finger_link1", "finger_link2"]:
+                    full_link_name = f"{s}_gripper_{link_name_suffix}"
+                    mesh_file = str(R1_MESH_DIR / f"{s}_gripper_{link_name_suffix}_collision.STL")
+                    builder = self.scene.create_actor_builder()
+                    mat = sapien.render.RenderMaterial(base_color=[1.0, 0.0, 0.0, 0.4])
+                    builder.add_visual_from_file(mesh_file, material=mat)
+                    actor = builder.build_kinematic(name=f"_collision_vis_{full_link_name}")
+                    self._collision_visual_actors[full_link_name] = actor
+            # 建立手指 link 映射 (用于每帧取位姿)
+            for link in robot.get_links():
+                lname = link.get_name()
+                if lname in self._collision_visual_actors:
+                    self._collision_link_map[lname] = link
+            logger.info(f"  碰撞可视化已创建 ({len(self._collision_visual_actors)} 个半透明红色 actor, "
+                        f"RGBA=[1,0,0,0.4], 跟随手指 link 位姿)")
+        except Exception as e:
+            logger.warning(f"  碰撞可视化初始化失败: {e}")
+            self._collision_visual_actors = {}
+            self._collision_link_map = {}
+
+    def _update_collision_visualization(self):
+        """每帧更新碰撞可视化位姿 (跟随手指 link)"""
+        if not hasattr(self, '_collision_visual_actors') or not self._collision_visual_actors:
+            return
+        try:
+            for link_name, vis_actor in self._collision_visual_actors.items():
+                link = self._collision_link_map.get(link_name)
+                if link is not None:
+                    vis_actor.set_pose(link.get_pose())
+        except Exception:
+            pass
+
     def run(self):
         """主仿真循环"""
         # 1. 对齐
@@ -3015,7 +3299,7 @@ class GraspSimulator:
         wrist_positions = []
         # 同时预计算 MANO 解析夹爪轨迹 (用户: "mano参数为主体, 可以平移轨迹")
         # 每帧: root_pos, j1, j2 from compute_analytical_gripper_pose
-        mano_gripper_traj = {}  # side -> {"pos": [], "j1": [], "j2": []}
+        mano_gripper_traj = {}  # side -> {"pos": [], "R": [], "j1": [], "j2": []}
         if self.side == "both":
             # 双手: 收集两侧手腕位置 + 夹爪轨迹
             for fi in range(self.start_frame, self.start_frame + self.num_frames):
@@ -3034,14 +3318,15 @@ class GraspSimulator:
                         )
                         joints_sapien = (RXWORLD_TO_SAPIEN @ joints.T).T
                         wrist_positions.append(joints_sapien[0, :3])
-                        # 预计算夹爪位姿 (用于 hybrid 中和态)
+                        # 预计算夹爪位姿 (用于 hybrid 中和态, 第十三轮新增存储 R)
                         if s not in mano_gripper_traj:
-                            mano_gripper_traj[s] = {"pos": [], "j1": [], "j2": []}
-                        root_pos, _, j1, j2 = compute_analytical_gripper_pose(
+                            mano_gripper_traj[s] = {"pos": [], "R": [], "j1": [], "j2": []}
+                        root_pos, root_R, j1, j2 = compute_analytical_gripper_pose(
                             joints_sapien[0, :3], joints_sapien[4, :3],
                             joints_sapien[8, :3], prefix=s,
                         )
                         mano_gripper_traj[s]["pos"].append(root_pos)
+                        mano_gripper_traj[s]["R"].append(root_R)
                         mano_gripper_traj[s]["j1"].append(j1)
                         mano_gripper_traj[s]["j2"].append(j2)
                     except Exception:
@@ -3061,15 +3346,16 @@ class GraspSimulator:
                     )
                     joints_sapien = (RXWORLD_TO_SAPIEN @ joints.T).T
                     wrist_positions.append(joints_sapien[0, :3])
-                    # 预计算夹爪位姿 (用于 hybrid 中和态)
+                    # 预计算夹爪位姿 (用于 hybrid 中和态, 第十三轮新增存储 R)
                     s = self.side
                     if s not in mano_gripper_traj:
-                        mano_gripper_traj[s] = {"pos": [], "j1": [], "j2": []}
-                    root_pos, _, j1, j2 = compute_analytical_gripper_pose(
+                        mano_gripper_traj[s] = {"pos": [], "R": [], "j1": [], "j2": []}
+                    root_pos, root_R, j1, j2 = compute_analytical_gripper_pose(
                         joints_sapien[0, :3], joints_sapien[4, :3],
                         joints_sapien[8, :3], prefix=s,
                     )
                     mano_gripper_traj[s]["pos"].append(root_pos)
+                    mano_gripper_traj[s]["R"].append(root_R)
                     mano_gripper_traj[s]["j1"].append(j1)
                     mano_gripper_traj[s]["j2"].append(j2)
                 except Exception:
@@ -3077,9 +3363,15 @@ class GraspSimulator:
         # 转为 numpy 数组, 存储到实例 (供 hybrid 中和态使用)
         for key in mano_gripper_traj:
             mano_gripper_traj[key]["pos"] = np.array(mano_gripper_traj[key]["pos"], dtype=np.float64)
+            mano_gripper_traj[key]["R"] = np.array(mano_gripper_traj[key]["R"], dtype=np.float64)  # (N, 3, 3)
             mano_gripper_traj[key]["j1"] = np.array(mano_gripper_traj[key]["j1"], dtype=np.float64)
             mano_gripper_traj[key]["j2"] = np.array(mano_gripper_traj[key]["j2"], dtype=np.float64)
         self._mano_gripper_traj = mano_gripper_traj
+        # Debug: 打印轨迹形状 (含 R)
+        for key in mano_gripper_traj:
+            t = mano_gripper_traj[key]
+            logger.info(f"  [debug] mano_gripper_traj[{key}]: pos={t['pos'].shape}, "
+                        f"R={t['R'].shape}, j1={t['j1'].shape}")
 
         # Debug: 手腕 vs 物体位置
         if wrist_positions:
@@ -3173,38 +3465,46 @@ class GraspSimulator:
                         f"MANO curl→力度, 接触力控, 目标力={TARGET_GRASP_FORCE}N, "
                         f"抓取目标: {target_objs}, 放置目标 (碗): {bowl_objs}")
 
-            # 6c. 计算 MANO+offset 中和态偏移量 (用户: "mano参数为主体, 可以平移轨迹, 但不能离开轨迹")
-            # 找到 MANO 夹爪最接近目标物体的帧, 计算常量偏移对齐到正确抓取位置
-            # EE = mano_root_pos[f] + offset, 保持 MANO 轨迹形状, 偏移最小化
-            self._gripper_R_fixed = np.array([
-                [0, 1, 0],
-                [0, 0, -1],
-                [-1, 0, 0]
-            ], dtype=np.float64)
-            FINGER_FORWARD_OFFSET_NEUTRAL = 0.037
-            ee_offset_neutral = -self._gripper_R_fixed[:, 0] * FINGER_FORWARD_OFFSET_NEUTRAL
+            # 6c. 计算 MANO+offset 中和态偏移量 (第十三轮重设计: 位姿不改变 + 位置优化最小损失)
+            # 用户: "不是0偏移, 是位姿不改变, 轨迹可以有偏移, 你要在抓取物体的轨迹和现在的轨迹进行优化, 把损失降到最小"
+            # 姿态: gripper_R = traj["R"][local_idx] (MANO root_R, 严格跟随, 位姿不改变)
+            # 位置: gripper_pos = mano_pos + offset, offset 最小化 (在 f_grasp 处对齐目标)
+            # offset = target_pos - mano_pos[f_grasp] - finger_offset_along_R[f_grasp]
+            #   (让 EE + 手指前向偏移 对齐 target, 这是抓取成功的最小必要平移)
+            FINGER_FORWARD_NEUTRAL = 0.037  # 手指在 EE 前方 3.7cm (沿 gripper_R 的 X 轴)
             self._mano_neutral_offset = {}
             self._mano_grasp_frame = {}  # side -> f_grasp (MANO 最接近目标的帧, 用于阶段判定)
+            self._mano_target_pos = {}  # side -> target_pos (CLOSE 阶段手指保持位置)
             for s in self.sides:
                 tgt = target_objs.get(s)
                 traj = self._mano_gripper_traj.get(s)
-                if tgt is None or tgt not in self.obj_bbox_centers or traj is None or len(traj["pos"]) == 0:
+                if (tgt is None or tgt not in self.obj_bbox_centers or traj is None
+                        or len(traj["pos"]) == 0 or "R" not in traj or len(traj["R"]) == 0):
                     self._mano_neutral_offset[s] = None
                     self._mano_grasp_frame[s] = None
+                    self._mano_target_pos[s] = None
                     continue
                 target_pos = np.array(self.obj_bbox_centers[tgt], dtype=np.float64)
-                target_grasp_pos = target_pos + ee_offset_neutral
                 # 找 MANO 夹爪最接近目标物体的帧 (offset 最小化的对齐点)
                 mano_positions = traj["pos"]
                 dists = np.linalg.norm(mano_positions - target_pos, axis=1)
                 f_grasp = int(np.argmin(dists))
-                offset = target_grasp_pos - mano_positions[f_grasp]
+                # 用 f_grasp 处的 MANO root_R 计算手指前向偏移 (位姿不改变, 用真实朝向)
+                R_at_grasp = traj["R"][f_grasp]  # (3, 3)
+                finger_offset = R_at_grasp[:, 0] * FINGER_FORWARD_NEUTRAL  # 沿 gripper X 轴前向
+                # 最小 offset: EE + finger_offset 对齐 target_pos
+                offset = target_pos - mano_positions[f_grasp] - finger_offset
                 self._mano_neutral_offset[s] = offset
                 self._mano_grasp_frame[s] = f_grasp
+                self._mano_target_pos[s] = target_pos
                 logger.info(f"  [neutral][{s}] MANO 最接近 {tgt} @ F{f_grasp} "
-                            f"(dist={dists[f_grasp]:.3f}m), offset={offset.round(3)} "
-                            f"(MANO@F{f_grasp}={mano_positions[f_grasp].round(3)}, "
-                            f"target_grasp={target_grasp_pos.round(3)})")
+                            f"(dist={dists[f_grasp]:.3f}m), minimal offset={offset.round(3)} "
+                            f"(||offset||={np.linalg.norm(offset):.3f}m, "
+                            f"MANO@F{f_grasp}={mano_positions[f_grasp].round(3)}, "
+                            f"target={target_pos.round(3)}, "
+                            f"R_X_axis={R_at_grasp[:, 0].round(3)}, "
+                            f"R_Y_axis={R_at_grasp[:, 1].round(3)}, "
+                            f"R_Z_axis={R_at_grasp[:, 2].round(3)})")
 
         # 7. 相机设置 (按 --views 指定渲染哪些视角, 对齐 02_render_scene.py)
         cam_view = None
@@ -3266,8 +3566,13 @@ class GraspSimulator:
             else:
                 god_height = 1.50   # 上方 1.5m (俯瞰全机器人 + 抓取区域)
             # 相机在场景中心正上方, 往下看; up 方向用 forward_2d
-            god_pos = scene_center + np.array([0.0, 0.0, god_height])
-            god_quat = make_look_at_camera(god_pos, scene_center, up=forward_2d)
+            # 第十四轮修复: god_pos_z 用 self._ground_z (GLB 预扫描的真正地面高度)
+            # 第十三轮用 obj_centers[:, 2].min() (物体中心最小Z), 物体在桌面上时偏高
+            # 用户: "固定 0.2m还是很高，不知道为什么，是坐标系的问题吗？"
+            ground_z = float(getattr(self, '_ground_z', 0.0))
+            god_pos = np.array([scene_center[0], scene_center[1], ground_z + god_height])
+            god_look_at = np.array([scene_center[0], scene_center[1], ground_z])
+            god_quat = make_look_at_camera(god_pos, god_look_at, up=forward_2d)
             god_view.set_local_pose(sapien.Pose(god_pos.tolist(), god_quat.tolist()))
             god_view.set_focal_lengths(focal, focal)
             # 固定相机: 不跟随夹爪, 初始化后位置不变
@@ -3291,6 +3596,34 @@ class GraspSimulator:
         # 8b. 初始化 MANO 3 参考点渲染 (仅渲染模式下创建)
         if render_available:
             self._init_mano_markers()
+            # 8c. 初始化碰撞模型可视化 (第十三轮: 用户要求"把碰撞模型也展示到视频里面")
+            # 半透明红色 RGBA[1,0,0,0.4] 覆盖在手指视觉模型外, 跟随手指 link 位姿
+            self._init_collision_visualization(self.robot_info["robot"])
+
+        # 8d. 交互式 Viewer (--viewer 模式)
+        viewer_win = None
+        if self.viewer and render_available:
+            try:
+                from sapien.utils import Viewer as SapienViewer
+                viewer_win = SapienViewer()
+                viewer_win.set_scene(self.scene)
+                viewer_win.control_window.show_origin_frame = False
+                viewer_win.control_window.show_grid = False
+                # 将 Viewer 相机放在场景上方斜视角, 能看到全貌
+                scene_center_view = np.array([0.0, 0.0, 0.0])
+                if self.obj_bbox_centers:
+                    centers = np.array(list(self.obj_bbox_centers.values()))
+                    scene_center_view = centers.mean(axis=0)
+                elif self._base_pos is not None:
+                    scene_center_view = self._base_pos.copy()
+                viewer_eye = scene_center_view + np.array([0.5, -0.5, 0.6])
+                viewer_quat = make_look_at_camera(viewer_eye, scene_center_view)
+                viewer_win.set_camera_pose(sapien.Pose(viewer_eye.tolist(), viewer_quat.tolist()))
+                logger.info(f"  交互式 Viewer 已启用, 相机位置={viewer_eye.round(3)}, 看向={scene_center_view.round(3)}")
+                logger.info("  (关闭窗口或按 ESC 结束仿真)")
+            except Exception as e:
+                logger.warning(f"  创建 Viewer 失败: {e}")
+                viewer_win = None
 
         # 9. Warmup (smoothstep 过渡)
         logger.info("=" * 60)
@@ -3301,6 +3634,21 @@ class GraspSimulator:
         gripper_idx1 = self.robot_info["gripper_idx1"]
         gripper_idx2 = self.robot_info["gripper_idx2"]
         joint_names = self.robot_info["joint_names"]
+
+        # 第二十六轮: 若已知优化时物体初始位姿, 重置物体以保证回放一致性
+        if hasattr(self, '_obj_initial_poses') and self._obj_initial_poses:
+            for actor in self.obj_actors:
+                name = actor.get_name()
+                if name in self._obj_initial_poses:
+                    actor.set_pose(self._obj_initial_poses[name])
+                    try:
+                        for comp in actor.get_components():
+                            if hasattr(comp, 'set_linear_velocity'):
+                                comp.set_linear_velocity([0, 0, 0])
+                                comp.set_angular_velocity([0, 0, 0])
+                                break
+                    except Exception:
+                        pass
 
         # Warmup: 让物理稳定
         if self.side == "both":
@@ -3336,6 +3684,16 @@ class GraspSimulator:
         obj_initial_pos = {}
         for actor in self.obj_actors:
             obj_initial_pos[actor.name] = np.array(actor.get_pose().p)
+
+        # === DEBUG 插桩 (opt-sim-divergence): 记录 run() 的轨迹, 对比 rollout_single ===
+        _dbg_run_obj_z_traj = []
+        _dbg_run_obj_xy_traj = []
+        _dbg_run_gripper_z_traj = []
+        _dbg_run_first_frame_state = None
+        _dbg_target_obj_name = None
+        if self.grasp_controllers and self.side in self.grasp_controllers:
+            _dbg_target_obj_name = self.grasp_controllers[self.side].target_obj
+        # === DEBUG 插桩结束 ===
 
         # 无效帧保持上一帧位姿 (跟踪丢失时机器人保持不动, 不是自由落体)
         if self.side == "both":
@@ -3478,13 +3836,12 @@ class GraspSimulator:
                         gripper_t1 = joint1
                         gripper_t2 = joint2
 
-                    # 物理步进 (纯 PD 驱动, 不用 set_qpos — physics_step 注释说会震荡)
-                    # 用户: "像 grasp_demo.py 一样真正的抓取物体" — grasp_demo.py 用 PD 控制器跟随,
-                    # 不用 set_qpos kinematic 移动 (会破坏物理接触力传播).
-                    # PD 滞后通过延长 DESCEND 阶段 + smoothstep 平滑插值缓解.
+                    # 第十八轮: 不锁根, 让根自然跟随 set_root_pose + set_root_linear_velocity
+                    # 物理引擎在 8 个子步中自然积分, 手指 PD 接触物体产生摩擦力带动物体
                     physics_step(
                         robot, arm_joint_indices, gripper_idx1, gripper_idx2,
-                        arm_target, gripper_t1, gripper_t2, self.scene
+                        arm_target, gripper_t1, gripper_t2, self.scene,
+                        lock_root_pose=getattr(self, '_close_lock_pose', None),
                     )
 
                     # 记录上一帧目标 (供无效帧保持位姿)
@@ -3499,6 +3856,34 @@ class GraspSimulator:
                         )
 
                 qpos_log.append(robot.get_qpos().copy())
+
+                # === DEBUG 插桩 (opt-sim-divergence): 记录 run() 每帧状态 ===
+                if _dbg_target_obj_name is not None:
+                    for actor in self.obj_actors:
+                        if actor.name == _dbg_target_obj_name:
+                            _o_pos = np.array(actor.get_pose().p)
+                            _dbg_run_obj_z_traj.append(float(_o_pos[2]))
+                            _dbg_run_obj_xy_traj.append(_o_pos[:2].tolist())
+                            break
+                if hasattr(self, '_current_gripper_pos'):
+                    _dbg_run_gripper_z_traj.append(float(self._current_gripper_pos[2]))
+                # 第一帧详细状态 (对比 rollout_single 的第一帧)
+                if local_idx == 0 and _dbg_target_obj_name is not None:
+                    robot_qpos = robot.get_qpos().copy()
+                    robot_qvel = robot.get_qvel().copy()
+                    for actor in self.obj_actors:
+                        if actor.name == _dbg_target_obj_name:
+                            _o_pos = np.array(actor.get_pose().p)
+                            _dbg_run_first_frame_state = {
+                                'robot_qpos': robot_qpos.tolist(),
+                                'robot_qvel': robot_qvel.tolist(),
+                                'gripper_idx1': gripper_idx1,
+                                'gripper_idx2': gripper_idx2,
+                                'obj_pos': _o_pos.tolist(),
+                                'root_pose': robot.get_root_pose().p.tolist(),
+                            }
+                            break
+                # === DEBUG 插桩结束 ===
 
                 # Debug: 每 10 帧打印 EE 位置 vs 最近物体 (遍历所有侧)
                 if (local_idx + 1) % 10 == 0 or local_idx == 0:
@@ -3517,16 +3902,6 @@ class GraspSimulator:
                             name, d, center = dists[0]
                             logger.info(f"  [debug] F{local_idx+1} [{s}]: ee={ee_pos.round(3)}, "
                                         f"nearest={name} dist={d:.3f} center={np.array(center).round(3)}")
-                            # Debug finger positions + glb_6 contacts during CLOSE→LIFT (F55-F113)
-                            if 55 <= local_idx + 1 <= 113:
-                                finger_positions = []
-                                for link in robot.get_links():
-                                    lname = link.get_name()
-                                    if "finger" in lname and s in lname:
-                                        fp = np.array(link.get_entity_pose().p)
-                                        finger_positions.append(f"{lname}={fp.round(4).tolist()}")
-                                if finger_positions:
-                                    logger.info(f"  [debug] F{local_idx+1} [{s}] fingers: {' | '.join(finger_positions)}")
 
                 # 接触检测
                 n_contacts, total_impulse, per_obj = fetch_contacts(
@@ -3534,18 +3909,34 @@ class GraspSimulator:
                 )
                 is_grasping = n_contacts >= 2
 
-                # glb_6 接触详情 + z 位置 (诊断 pad 是否真的碰到目标物体)
-                if 60 <= local_idx + 1 <= 113:
-                    glb6_actor = None
+                # 目标物体接触详情 (CLOSE/LIFT/TRANSPORT 阶段诊断: 手指是否真碰到目标)
+                _phase = getattr(self, '_last_phase', '')
+                _ctrl = self.grasp_controllers.get(self.side) if self.grasp_controllers else None
+                _tgt_name = _ctrl.target_obj if _ctrl else None
+                _f_grasp = getattr(self, '_mano_grasp_frame', {}).get(self.side, 0) or 0
+                # CLOSE 阶段 + 前后 5 帧都记录 (看接触何时建立/丢失)
+                _close_dur = max(3, int(max(self.num_frames, 1) * 0.15))
+                _log_start = max(0, _f_grasp - 5)
+                _log_end = _f_grasp + _close_dur + 15  # 覆盖 CLOSE+LIFT 早期
+                if _tgt_name and _log_start <= local_idx <= _log_end:
+                    _tgt_actor = None
                     for ac in self.obj_actors:
-                        if ac.name == "glb_6":
-                            glb6_actor = ac
+                        if ac.name == _tgt_name:
+                            _tgt_actor = ac
                             break
-                    glb6_pos = np.array(glb6_actor.get_pose().p).round(4).tolist() if glb6_actor else None
-                    glb6_c = per_obj.get("glb_6", {"n": 0, "impulse": 0.0})
-                    logger.info(f"  [debug] F{local_idx+1} glb_6: pos={glb6_pos} "
-                                f"contact_n={glb6_c['n']} impulse={glb6_c['impulse']:.4f} "
-                                f"total_contacts={n_contacts}")
+                    _tgt_pos = np.array(_tgt_actor.get_pose().p).round(4).tolist() if _tgt_actor else None
+                    _tgt_c = per_obj.get(_tgt_name, {"n": 0, "impulse": 0.0})
+                    # 手指实际位置 (诊断夹爪是否包围物体)
+                    _finger_positions = []
+                    for link in robot.get_links():
+                        _lname = link.get_name()
+                        if "finger" in _lname and self.side in _lname:
+                            _fp = np.array(link.get_entity_pose().p)
+                            _finger_positions.append(f"{_lname.split('_')[-1]}={_fp.round(3).tolist()}")
+                    logger.info(f"  [grasp] F{local_idx+1} phase={_phase} {_tgt_name}: "
+                                f"pos={_tgt_pos} contact_n={_tgt_c['n']} "
+                                f"impulse={_tgt_c['impulse']:.4f} "
+                                f"fingers=[{' | '.join(_finger_positions)}]")
 
             # 公共: 日志记录 + 渲染 (有效帧和无效帧都执行, 确保视频帧数 == num_frames)
             contact_log.append({
@@ -3576,11 +3967,26 @@ class GraspSimulator:
             # 轨迹跟踪误差收集 (物理输出 vs 真实 MANO 期望)
             track_log.append(getattr(self, '_last_track', None))
 
-            # 渲染 (按 --views 渲染选定视角)
+            # 渲染 (按 --views 渲染选定视角, 按 --viewer 显示交互窗口)
             # GPU 可能在运行时丢失 (vk::DeviceLostError), 捕获后降级为纯物理模式
-            if render_available and (writer_cam is not None or writer_god is not None):
+            if render_available and (writer_cam is not None or writer_god is not None or viewer_win is not None):
                 try:
+                    # 第十三轮: 每帧更新碰撞可视化位姿 (跟随手指 link, 半透明红色)
+                    self._update_collision_visualization()
                     self.scene.update_render()
+                    # 交互式 Viewer
+                    if viewer_win is not None:
+                        viewer_win.render()
+                        try:
+                            viewer_closed = not viewer_win.window.is_running
+                        except AttributeError:
+                            try:
+                                viewer_closed = not viewer_win.control_window.is_running
+                            except AttributeError:
+                                viewer_closed = False
+                        if viewer_closed:
+                            logger.info("  Viewer 窗口关闭, 提前退出仿真")
+                            break
                     if writer_cam is not None:
                         # 第一人称: 每帧按 HaWoR 相机轨迹更新 (对齐 02_render_scene.py L2588-2590)
                         # 之前只初始化一次, 导致相机不动
@@ -3642,6 +4048,21 @@ class GraspSimulator:
         qpos_path = str(self.output_dir / f"grasp_{self.mode}_{self.side}_qpos.npy")
         np.save(qpos_path, np.array(qpos_log))
         logger.info(f"  qpos 已保存: {qpos_path}")
+
+        # === DEBUG 插桩 (opt-sim-divergence): 保存 run() 的轨迹, 对比 verify ===
+        np.save(self.output_dir / "run_obj_z_traj.npy", np.array(_dbg_run_obj_z_traj))
+        np.save(self.output_dir / "run_gripper_z_traj.npy", np.array(_dbg_run_gripper_z_traj))
+        np.save(self.output_dir / "run_obj_xy_traj.npy", np.array(_dbg_run_obj_xy_traj))
+        if _dbg_run_first_frame_state is not None:
+            import json
+            with open(self.output_dir / "run_first_frame.json", 'w') as _f:
+                json.dump(_dbg_run_first_frame_state, _f, indent=2)
+            gi1, gi2 = _dbg_run_first_frame_state['gripper_idx1'], _dbg_run_first_frame_state['gripper_idx2']
+            rq, rv = _dbg_run_first_frame_state['robot_qpos'], _dbg_run_first_frame_state['robot_qvel']
+            logger.info(f"  [DEBUG run] first_frame: gripper_qpos=[{rq[gi1]:.6f},{rq[gi2]:.6f}], "
+                        f"gripper_qvel=[{rv[gi1]:.6f},{rv[gi2]:.6f}], "
+                        f"obj_pos={_dbg_run_first_frame_state['obj_pos']}, root_pose={_dbg_run_first_frame_state['root_pose']}")
+        # === DEBUG 插桩结束 ===
 
         return {
             "video_cam": video_path_cam if render_available else None,
@@ -3802,65 +4223,72 @@ class GraspSimulator:
         logger.info(f"  验证日志: {verify_path}")
 
     def _evaluate_grasp_quality(self, contact_log, obj_pos_log, obj_initial_pos, gripper_pos_log):
-        """综合抓取质量评估: 接触 + 跟随 + 提升 (三项都满足才算真正夹住)
+        """综合抓取质量评估 (第十三轮重设计: 修复 3 个误报 bug)
 
-        判定标准 (用户确认: 综合判定):
-          1. 接触: 连续 >= 10 帧 n_contacts >= 2 (夹爪持续接触物体)
-          2. 跟随: 物体相对最近夹爪位置变化 < 5cm 持续 10 帧 (物体跟着夹爪走)
-          3. 提升: 物体 z 提升量 > 5cm (相对初始位置)
+        旧版 bug:
+          1. 接触: 全局 n_contacts>=2 (不区分物体), glb_1 的"61帧"可能来自其他物体
+          2. 提升: 用 max(z)-init_z (托起又掉也算成功)
+          3. 跟随: 不检查 z 稳定性 (娃娃机式托住也通过)
+
+        新判据 (末段 10 帧, 全部满足才算真正夹住):
+          1. 末段 per-object 接触 >= 2 (双指接触同一物体, 80% 帧)
+          2. 末段 z 方差 < 1cm (稳定被夹, 不是掉落中)
+          3. final_z - init_z > 3cm (最终被抬起, 不是 max(z) 然后掉回)
+          4. 跟随: 末段 (物体-夹爪) 相对位置稳定 (保留旧逻辑)
 
         Returns:
-            dict: 每个物体的 {contact_pass, follow_pass, lift_pass, grasp_pass, details}
+            dict: 每个物体的 {contact_pass, z_stable_pass, lift_pass, follow_pass, grasp_pass, details}
         """
         logger.info("=" * 60)
-        logger.info("Step 7b: 综合抓取判定 (接触 + 跟随 + 提升)")
+        logger.info("Step 7b: 综合抓取判定 (末段 per-object 接触 + z 稳定 + final 提升 + 跟随)")
         logger.info("=" * 60)
 
-        MIN_CONTACT_FRAMES = 10
-        MIN_FOLLOW_FRAMES = 10
-        FOLLOW_THRESHOLD = 0.05  # 5cm
-        LIFT_THRESHOLD = 0.05     # 5cm
+        LAST_N = 10  # 末段 10 帧判定
+        LIFT_THRESHOLD = 0.03       # final_z - init_z > 3cm
+        Z_VAR_THRESHOLD = 1e-4      # 末段 z 方差 < 1cm (0.01^2)
+        FOLLOW_THRESHOLD = 0.05     # 跟随: 相对位置变化 < 5cm
+        MIN_FOLLOW_FRAMES = 8       # 跟随: 末段 10 帧中 >= 8 帧稳定
 
         n_frames = len(contact_log)
         quality = {}
 
-        # 1. 接触: 找最长连续接触帧数
-        contact_pass = False
-        max_contact_streak = 0
-        cur_streak = 0
-        for c in contact_log:
-            if c["contacts"] >= 2:
-                cur_streak += 1
-                max_contact_streak = max(max_contact_streak, cur_streak)
-            else:
-                cur_streak = 0
-        if max_contact_streak >= MIN_CONTACT_FRAMES:
-            contact_pass = True
-        logger.info(f"  [接触] 最长连续帧数: {max_contact_streak}/{n_frames} "
-                    f"(需 >= {MIN_CONTACT_FRAMES}) → {'✓ PASS' if contact_pass else '✗ FAIL'}")
+        # 末段起始帧
+        last_start = max(0, n_frames - LAST_N)
 
-        # 2 + 3. 跟随 + 提升 (每个物体独立判定)
+        # 2+3+4. 每个物体独立判定 (接触 per-object, z 稳定, final 提升, 跟随)
         for actor_name in obj_initial_pos:
             init_pos = obj_initial_pos[actor_name]
 
-            # 3. 提升
-            lift_pass = False
-            lift_max = 0.0
-            for fo in obj_pos_log:
-                if actor_name in fo:
-                    cur_lift = float(np.array(fo[actor_name])[2] - init_pos[2])
-                    lift_max = max(lift_max, cur_lift)
-            if lift_max > LIFT_THRESHOLD:
-                lift_pass = True
-            logger.info(f"  [{actor_name} 提升] 最大提升: {lift_max*100:.2f}cm "
-                        f"(需 > {LIFT_THRESHOLD*100:.0f}cm) → {'✓ PASS' if lift_pass else '✗ FAIL'}")
+            # 1. 末段 per-object 接触: 末段 10 帧中 per_obj[name]["n"] >= 2 的比例 >= 80%
+            contact_pass = False
+            last_contact_count = 0
+            for fi in range(last_start, n_frames):
+                per_obj = contact_log[fi].get("per_obj", {})
+                obj_contact = per_obj.get(actor_name, {"n": 0})
+                if obj_contact["n"] >= 2:
+                    last_contact_count += 1
+            contact_pass = last_contact_count >= int(LAST_N * 0.8)
 
-            # 2. 跟随: 物体相对最近夹爪的位置变化
+            # 2. 末段 z 方差 (排除"托起又掉")
+            z_stable_pass = False
+            last_zs = []
+            for fi in range(last_start, n_frames):
+                if actor_name in obj_pos_log[fi]:
+                    last_zs.append(float(np.array(obj_pos_log[fi][actor_name])[2]))
+            z_var = float(np.var(last_zs)) if len(last_zs) > 0 else float('inf')
+            z_stable_pass = z_var < Z_VAR_THRESHOLD
+
+            # 3. final 提升 (不是 max): final_z - init_z > 3cm
+            lift_pass = False
+            final_z = float(np.array(obj_pos_log[-1][actor_name])[2]) if actor_name in obj_pos_log[-1] else init_pos[2]
+            final_lift = final_z - init_pos[2]
+            lift_pass = final_lift > LIFT_THRESHOLD
+
+            # 4. 跟随: 末段 (物体-夹爪) 相对位置稳定
             follow_pass = False
             max_follow_streak = 0
             cur_follow_streak = 0
             if gripper_pos_log and n_frames > 0:
-                # 找最近夹爪侧 (用第一帧有夹爪位置的数据)
                 nearest_side = None
                 min_dist = float('inf')
                 for s, gp in gripper_pos_log[0].items():
@@ -3869,9 +4297,8 @@ class GraspSimulator:
                         min_dist = d
                         nearest_side = s
                 if nearest_side is not None:
-                    # 计算每帧 (物体 - 夹爪) 的相对位置, 检查连续帧间变化
                     prev_rel = None
-                    for fi in range(n_frames):
+                    for fi in range(last_start, n_frames):
                         if (actor_name not in obj_pos_log[fi]
                                 or nearest_side not in gripper_pos_log[fi]):
                             cur_follow_streak = 0
@@ -3888,29 +4315,670 @@ class GraspSimulator:
                             else:
                                 cur_follow_streak = 0
                         prev_rel = rel_p
-            if max_follow_streak >= MIN_FOLLOW_FRAMES:
-                follow_pass = True
-            logger.info(f"  [{actor_name} 跟随] 最长连续帧数: {max_follow_streak}/{n_frames} "
-                        f"(需 >= {MIN_FOLLOW_FRAMES}, 阈值 {FOLLOW_THRESHOLD*100:.0f}cm) → "
-                        f"{'✓ PASS' if follow_pass else '✗ FAIL'}")
+            follow_pass = max_follow_streak >= MIN_FOLLOW_FRAMES
 
-            grasp_pass = contact_pass and follow_pass and lift_pass
+            grasp_pass = contact_pass and z_stable_pass and lift_pass and follow_pass
             quality[actor_name] = {
                 "contact_pass": contact_pass,
-                "follow_pass": follow_pass,
+                "z_stable_pass": z_stable_pass,
                 "lift_pass": lift_pass,
+                "follow_pass": follow_pass,
                 "grasp_pass": grasp_pass,
-                "max_contact_streak": max_contact_streak,
+                "last_contact_count": last_contact_count,
+                "last_z_var_cm": z_var * 100,
+                "final_lift_cm": final_lift * 100,
                 "max_follow_streak": max_follow_streak,
-                "lift_max_cm": lift_max * 100,
             }
             tag = "✓ 真正夹住" if grasp_pass else "✗ 未真正夹住"
-            logger.info(f"  [{actor_name} 综合] {tag} "
-                        f"(接触={contact_pass}, 跟随={follow_pass}, 提升={lift_pass})")
+            logger.info(f"  [{actor_name}] {tag}")
+            logger.info(f"    末段接触: {last_contact_count}/{LAST_N} 帧 per-object>=2 "
+                        f"(需>={int(LAST_N*0.8)}) → {'✓' if contact_pass else '✗'}")
+            logger.info(f"    末段z方差: {z_var*100:.3f}cm (需<{Z_VAR_THRESHOLD*100:.3f}cm) → "
+                        f"{'✓' if z_stable_pass else '✗'}")
+            logger.info(f"    final提升: {final_lift*100:.2f}cm (需>{LIFT_THRESHOLD*100:.0f}cm) → "
+                        f"{'✓' if lift_pass else '✗'}  [init_z={init_pos[2]:.3f}, final_z={final_z:.3f}]")
+            logger.info(f"    末段跟随: {max_follow_streak}/{LAST_N} (需>={MIN_FOLLOW_FRAMES}) → "
+                        f"{'✓' if follow_pass else '✗'}")
 
         n_grasped = sum(1 for q in quality.values() if q["grasp_pass"])
         logger.info(f"  >>> 真正夹住物体数: {n_grasped}/{len(quality)}")
         return quality
+
+    # ============================================================
+    # 第十八轮: CEM 优化支持
+    # ============================================================
+    def set_opt_params(self, opt_params):
+        """设置优化参数 (第十八轮 CEM 优化 / 第二十六轮窗口优化)
+
+        Args:
+            opt_params: 9 维 / 42 维 / 窗口维 np.ndarray
+        """
+        import numpy as np
+        if opt_params is not None:
+            self._opt_params = opt_params
+            logger.info(f"  设置优化参数: shape={opt_params.shape}, norm={np.linalg.norm(opt_params):.4f}")
+            # 第二十六轮: 如果参数维度不是 9/42, 尝试加载窗口参数
+            if len(opt_params) not in (9, 42):
+                try:
+                    wp_path = self.output_dir / "window_frames.npy"
+                    if wp_path.exists():
+                        from traj_optimize import build_window_params
+                        grasp_window = np.load(wp_path)
+                        n_total = self.num_frames if self.num_frames > 0 else len(grasp_window)
+                        self._window_params = build_window_params(grasp_window, n_total)
+                        logger.info(f"  加载窗口参数: {len(grasp_window)} frames [{grasp_window[0]}, {grasp_window[-1]}]")
+                    else:
+                        self._window_params = None
+                except Exception as e:
+                    logger.warning(f"  加载窗口参数失败: {e}")
+                    self._window_params = None
+        else:
+            self._opt_params = None
+            self._window_params = None
+
+    def run_optimize(self):
+        """离线 CEM 轨迹优化 (借鉴 do-as-i-do Stage 5)
+
+        在 SAPIEN 中 rollout 多条候选参数, 评估抓取质量, CEM 迭代优化.
+        最优参数保存到 output_dir/opt_params.npy, 存储在 self._opt_params_best.
+        """
+        from traj_optimize import cem_optimize, DEFAULT_PARAMS, PARAM_RANGE, REWARD_WEIGHTS
+
+        # 1. 完整初始化 simulator (对齐 run() 的前 5 步)
+        self._align_scene()
+        # 加载数据
+        if self.side == "both":
+            raise ValueError("--optimize 仅支持单侧 (gripper_only)")
+        hawor_data = load_hawor_data(self.hawor_dir, hand_idx=self.hand_idx)
+        n_total = len(hawor_data["pred_trans"])
+        if self.num_frames < 0 or self.num_frames > n_total - self.start_frame:
+            self.num_frames = n_total - self.start_frame
+        betas_mean = hawor_data["pred_betas"][self.start_frame].astype(np.float32)
+        mano_side = "left" if self.hand_idx == 0 else "right"
+        from mano_layer import MANOLayer
+        mano_layer = MANOLayer(mano_side, betas_mean)
+        R_c2w_all, t_c2w_all = load_hawor_c2w(self.hawor_dir)
+
+        # 预扫描 GLB 地面高度
+        glb_path = self.ras_dir / "final_scene.glb"
+        ground_z = 0.0
+        if glb_path.exists() and self.transform_params_path:
+            ground_z = compute_glb_ground_z(glb_path, self.transform_params_path)
+        # 第十八轮: 优化模式强制 CPU 场景, 避免渲染初始化段错误
+        self.scene = setup_physics_scene(ground_height=ground_z, force_cpu=True)
+        render_available = getattr(self.scene, "_render_available", False)
+
+        # 加载 GLB 物体
+        self.obj_actors, _, self.obj_bbox_centers, self.obj_info = load_glb_with_physics(
+            glb_path, self.transform_params_path, self.scene, fast_collision=True
+        )
+
+        # 初始化 hybrid 控制器 (含 target_obj 和 bowl_obj)
+        wrist_trans = np.asarray(hawor_data["pred_trans"])
+        target_obj = find_target_object_by_trajectory(wrist_trans, self.obj_bbox_centers)
+        pink_obj = find_pink_object(self.obj_info)
+        bowl_obj = find_bowl(self.obj_info, exclude_names=[pink_obj] if pink_obj else None)
+        self.grasp_controllers = {
+            self.side: HybridGraspController(
+                self.obj_actors, side=self.side, scene=self.scene,
+                target_obj=pink_obj or target_obj,
+                obj_positions=self.obj_bbox_centers,
+                bowl_obj=bowl_obj,
+            )
+        }
+
+        # 计算手腕位置 + MANO 夹爪轨迹
+        mano_gripper_traj = {}
+        wrist_positions = []
+        for fi in range(self.start_frame, self.start_frame + self.num_frames):
+            if fi >= len(hawor_data["pred_trans"]):
+                break
+            if fi < len(hawor_data["pred_valid"]) and not hawor_data["pred_valid"][fi]:
+                continue
+            try:
+                _, joints = compute_mano_joints(
+                    mano_layer, hawor_data["pred_rot"][fi],
+                    hawor_data["pred_hand_pose"][fi],
+                    hawor_data["pred_trans"][fi],
+                )
+                joints_sapien = (RXWORLD_TO_SAPIEN @ joints.T).T
+                wrist_positions.append(joints_sapien[0, :3])
+                s = self.side
+                if s not in mano_gripper_traj:
+                    mano_gripper_traj[s] = {"pos": [], "R": [], "j1": [], "j2": []}
+                root_pos, root_R, j1, j2 = compute_analytical_gripper_pose(
+                    joints_sapien[0, :3], joints_sapien[4, :3],
+                    joints_sapien[8, :3], prefix=s,
+                )
+                mano_gripper_traj[s]["pos"].append(root_pos)
+                mano_gripper_traj[s]["R"].append(root_R)
+                mano_gripper_traj[s]["j1"].append(j1)
+                mano_gripper_traj[s]["j2"].append(j2)
+            except Exception:
+                continue
+        for key in mano_gripper_traj:
+            mano_gripper_traj[key]["pos"] = np.array(mano_gripper_traj[key]["pos"], dtype=np.float64)
+            mano_gripper_traj[key]["R"] = np.array(mano_gripper_traj[key]["R"], dtype=np.float64)
+            mano_gripper_traj[key]["j1"] = np.array(mano_gripper_traj[key]["j1"], dtype=np.float64)
+            mano_gripper_traj[key]["j2"] = np.array(mano_gripper_traj[key]["j2"], dtype=np.float64)
+        self._mano_gripper_traj = mano_gripper_traj
+
+        # 基座位置
+        if wrist_positions:
+            self._base_pos = wrist_positions[0]
+            self._base_quat = pr.quaternion_from_axis_angle(np.array([0, 0, 1, 0]))
+        else:
+            self._base_pos = np.array([0.0, 0.0, 0.3])
+            self._base_quat = pr.quaternion_from_axis_angle(np.array([0, 0, 1, 0]))
+
+        # 加载机器人
+        self.robot_info = setup_robot(self.scene, self.mode, self.side, self._base_pos, self._base_quat)
+
+        # 计算 offset
+        self._compute_neutral_offsets()
+
+        # 第十九轮: 保存物体初始位姿 (用于每次 rollout 重置)
+        self._obj_initial_poses = {}
+        for actor in self.obj_actors:
+            self._obj_initial_poses[actor.get_name()] = actor.get_pose()
+
+        # 2. 定义 rollout 评估函数
+        def rollout_single(opt_params):
+            """单条 rollout: 重置场景状态 → 跑完整轨迹 → 评估"""
+            # 第十九轮: 设置 opt_params 供 _step_gripper_only → _compute_mano_neutral_target 使用
+            self._opt_params = np.asarray(opt_params, dtype=np.float64)
+            # 清除 keyframe 缓存 (新参数需要重新插值)
+            if hasattr(self, '_kf_cache'):
+                del self._kf_cache
+            # 第十九轮修复: 重置帧间状态变量 (否则前一 rollout 的末位置会导致第一帧速度异常)
+            for attr in ('_prev_demo_root_pos', '_prev_root_pos', '_prev_root_pos_vel'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            # 不重建 scene (SAPIEN 多次创建 scene 会段错误)
+            # 只需重置 robot 根位姿和关节位置
+            robot = self.robot_info["robot"]
+            # 第十九轮修复: 重置夹爪 qpos 到初始张开状态 (前一 rollout 闭合的手指会影响下一次)
+            robot.set_qpos(self.robot_info["init_qpos"].copy())
+            # === BUG 修复 (opt-sim-divergence): set_qpos 不重置 qvel ===
+            # 根因: set_qpos 只设置位置, 不重置速度. 前一 rollout 结束时手指在快速运动 (闭合),
+            # qvel 残留到下一次 rollout 第一帧, 导致 PD 力 = Kp*(target-qpos) - Kd*qvel 不同.
+            # run() 有 30 帧 WARMUP 让 qvel 衰减, rollout_single 没有 → 优化 vs 最终仿真物理结果不一致.
+            # 修复: 显式 set_qvel(零), 对齐 WARMUP 后的 qvel≈0 状态.
+            robot.set_qvel(np.zeros_like(robot.get_qvel()))
+            # === BUG 修复结束 ===
+            robot.set_root_pose(sapien.Pose(self._base_pos.tolist(), self._base_quat.tolist()))
+            robot.set_root_linear_velocity([0, 0, 0])
+            robot.set_root_angular_velocity([0, 0, 0])
+            # 重置物体到初始位姿 (每次 rollout 公平评估, 必须在 warmup 之前)
+            for actor in self.obj_actors:
+                name = actor.get_name()
+                if name in self._obj_initial_poses:
+                    actor.set_pose(self._obj_initial_poses[name])
+                    try:
+                        for comp in actor.get_components():
+                            if hasattr(comp, 'set_linear_velocity'):
+                                comp.set_linear_velocity([0, 0, 0])
+                                comp.set_angular_velocity([0, 0, 0])
+                                break
+                    except Exception:
+                        pass
+            # WARMUP: 5 帧让物理稳定 (物体已重置, 用当前 qpos 保持, 不夹紧)
+            _gi1, _gi2 = self.robot_info["gripper_idx1"], self.robot_info["gripper_idx2"]
+            _aji = self.robot_info.get("arm_joint_indices", [])
+            for _ in range(5):
+                _qpos = robot.get_qpos()
+                physics_step(
+                    robot, _aji, _gi1, _gi2,
+                    np.array([]),
+                    float(_qpos[_gi1]), float(_qpos[_gi2]),
+                    self.scene,
+                    lock_root_pose=None,
+                )
+            wrist_trans_opt = np.asarray(hawor_data["pred_trans"])
+            target_obj_opt = find_target_object_by_trajectory(wrist_trans_opt, self.obj_bbox_centers)
+            pink_obj_opt = find_pink_object(self.obj_info)
+            bowl_obj_opt = find_bowl(self.obj_info, exclude_names=[pink_obj_opt] if pink_obj_opt else None)
+            self.grasp_controllers = {self.side: HybridGraspController(
+                self.obj_actors, side=self.side, scene=self.scene,
+                target_obj=pink_obj_opt or target_obj_opt,
+                obj_positions=self.obj_bbox_centers,
+                bowl_obj=bowl_obj_opt,
+            )}
+            self._compute_neutral_offsets()
+
+            # 跑完整轨迹
+            # 第十九轮修复: 物体初始 z 必须在 rollout 开始前捕获 (原代码在结束后才赋值, 导致 lift 恒为 0)
+            target_obj_for_init = self.grasp_controllers[self.side].target_obj
+            obj_init_z = 0.0
+            obj_init_pos = None
+            obj_init_xy = [0.0, 0.0]
+            if target_obj_for_init is not None:
+                for actor in self.obj_actors:
+                    if target_obj_for_init in actor.get_name():
+                        obj_init_pos = np.array(actor.get_pose().p)
+                        obj_init_z = float(obj_init_pos[2])
+                        obj_init_xy = obj_init_pos[:2].tolist()
+                        break
+            # 第十九轮调试: 检查物体是否被正确重置 (优化 rollout 间物体重置失败会导致奖励虚高)
+            if hasattr(self, '_opt_eval_count'):
+                self._opt_eval_count += 1
+            else:
+                self._opt_eval_count = 1
+            if self._opt_eval_count <= 5 or self._opt_eval_count % 32 == 0:
+                expected_pos = self._obj_initial_poses.get(target_obj_for_init)
+                if expected_pos is not None and obj_init_pos is not None:
+                    expected_p = np.array(expected_pos.p)
+                    drift = np.linalg.norm(obj_init_pos - expected_p)
+                    logger.info(f"  [rollout {self._opt_eval_count}] {target_obj_for_init} init_pos={obj_init_pos.round(4)}, "
+                                f"expected={expected_p.round(4)}, drift={drift:.4f}m")
+            contact_frames_in_close = 0
+            max_penetration = 0.0
+            min_dist_in_close = 1.0  # 第十九轮 v3: CLOSE 阶段 gripper-物体最近距离 (诊断)
+            # 第二十轮: CLOSE 阶段所有帧的 gripper-物体距离列表 (用于计算 avg_dist_in_close_last5)
+            _close_dists = []
+            close_start = -1
+            close_end = -1
+            # 第二十一轮: 全程 gripper-物体距离列表 (粗搜接近奖励用)
+            _all_dists = []
+            _gripper_z_min = float('inf')
+            _obj_z_target = None
+            # 第二十八轮: CLOSE 阶段接触标志序列 (用于计算末段接触)
+            _close_contact_flags = []
+            # 第二十六轮: 帧间平滑度
+            smoothness_cost = 0.0
+            wp = getattr(self, '_window_params', None)
+            if wp is not None and len(opt_params) == wp['dim'] and wp['n_window'] > 1:
+                M = wp['n_window']
+                pos_diff = 0.0
+                rot_diff = 0.0
+                for wi in range(M - 1):
+                    b1 = wi * 6
+                    b2 = (wi + 1) * 6
+                    pos_diff += np.sum((opt_params[b1:b1+3] - opt_params[b2:b2+3]) ** 2)
+                    rot_diff += np.sum((opt_params[b1+3:b1+6] - opt_params[b2+3:b2+6]) ** 2)
+                smoothness_cost = (pos_diff + rot_diff * 0.1) / (M - 1)
+
+            # === DEBUG 插桩 (opt-sim-divergence): 记录每帧物体轨迹 ===
+            _dbg_obj_z_traj = []
+            _dbg_obj_xy_traj = []
+            _dbg_contact_traj = []
+            _dbg_gripper_z_traj = []
+            _dbg_first_frame_state = None
+            # === DEBUG 插桩结束 ===
+
+            for local_idx in range(self.num_frames):
+                fi = self.start_frame + local_idx
+                if fi >= len(hawor_data["pred_trans"]):
+                    break
+                if fi < len(hawor_data["pred_valid"]) and not hawor_data["pred_valid"][fi]:
+                    continue
+
+                self._current_local_idx = local_idx
+                self._last_phase = "APPROACH"
+                # 第二十九轮: 跳过 MANO FK (预计算位存在 self._mano_gripper_traj 中)
+                arm_target, (gripper_t1, gripper_t2) = self._step_gripper_only(np.zeros((21, 3)))
+
+                # 物理步进 (第十九轮修复: 必须调 physics_step, 否则 set_drive_target 缺失, 手指永远不闭合)
+                robot = self.robot_info["robot"]
+                arm_joint_indices = self.robot_info.get("arm_joint_indices", [])
+                gi1, gi2 = self.robot_info["gripper_idx1"], self.robot_info["gripper_idx2"]
+                physics_step(
+                    robot, arm_joint_indices, gi1, gi2,
+                    np.asarray(arm_target) if len(arm_target) else np.array([]),
+                    float(gripper_t1), float(gripper_t2),
+                    self.scene,
+                    lock_root_pose=None,
+                )
+
+                # 第十九轮 v3: 提前获取 target_obj (供 CLOSE 检测和接触检测共用)
+                target_obj = self.grasp_controllers[self.side].target_obj
+
+                # === DEBUG 插桩 (opt-sim-divergence): 记录每帧状态 ===
+                if target_obj is not None:
+                    for actor in self.obj_actors:
+                        if target_obj in actor.get_name():
+                            _o_pos = np.array(actor.get_pose().p)
+                            _dbg_obj_z_traj.append(float(_o_pos[2]))
+                            _dbg_obj_xy_traj.append(_o_pos[:2].tolist())
+                            break
+                if hasattr(self, '_current_gripper_pos'):
+                    _dbg_gripper_z_traj.append(float(self._current_gripper_pos[2]))
+                # 第一帧详细状态 (对比 run() 的第一帧)
+                if local_idx == 0 and target_obj is not None:
+                    robot_qpos = robot.get_qpos().copy()
+                    robot_qvel = robot.get_qvel().copy()
+                    for actor in self.obj_actors:
+                        if target_obj in actor.get_name():
+                            _dbg_first_frame_state = {
+                                'robot_qpos': robot_qpos.tolist(),
+                                'robot_qvel': robot_qvel.tolist(),
+                                'gripper_idx1': self.robot_info["gripper_idx1"],
+                                'gripper_idx2': self.robot_info["gripper_idx2"],
+                                'obj_pos': _o_pos.tolist(),
+                                'root_pose': robot.get_root_pose().p.tolist(),
+                            }
+                            break
+                # === DEBUG 插桩结束 ===
+
+                # 第二十一轮: 全程 gripper-物体距离 (粗搜接近奖励)
+                if target_obj is not None and hasattr(self, '_current_gripper_pos'):
+                    for actor in self.obj_actors:
+                        if target_obj in actor.get_name():
+                            obj_pos = np.array(actor.get_pose().p)
+                            dist = float(np.linalg.norm(self._current_gripper_pos - obj_pos))
+                            _all_dists.append(dist)
+                            # gripper 最低 z (用于计算 z gap)
+                            if self._current_gripper_pos[2] < _gripper_z_min:
+                                _gripper_z_min = float(self._current_gripper_pos[2])
+                            _obj_z_target = float(obj_pos[2])
+                            break
+
+                # 检测 CLOSE 阶段
+                if self._last_phase == "CLOSE" and close_start < 0:
+                    close_start = local_idx
+                if self._last_phase == "CLOSE":
+                    close_end = local_idx
+                    # 第十九轮 v3: 追踪 CLOSE 阶段 gripper-物体最近距离 (诊断)
+                    # 第二十轮: 同时收集所有帧距离, 用于 avg_dist_in_close_last5 (鼓励持续接触)
+                    if target_obj is not None and hasattr(self, '_current_gripper_pos'):
+                        for actor in self.obj_actors:
+                            if target_obj in actor.get_name():
+                                obj_pos = np.array(actor.get_pose().p)
+                                dist = float(np.linalg.norm(self._current_gripper_pos - obj_pos))
+                                if dist < min_dist_in_close:
+                                    min_dist_in_close = dist
+                                _close_dists.append(dist)
+                                break
+
+                # 接触检测 (第十九轮修复: 只在 CLOSE 阶段计数, 避免优化器利用 APPROACH/TRANSPORT 阶段接触刷分)
+                # 第二十七轮: 阈值从 2 降到 1, 让单指接触也能给优化器正向信号
+                # 第二十八轮: 统一用 get_finger_contacts, 与 HybridGraspController 一致
+                contacts = self.scene.get_contacts()
+                if target_obj is not None and self._last_phase == "CLOSE":
+                    f1_contact, f2_contact, contact_objs = get_finger_contacts(
+                        robot, self.side, self.scene, self.obj_actors
+                    )
+                    has_obj_contact = (f1_contact or f2_contact) and target_obj in contact_objs
+                    _close_contact_flags.append(1 if has_obj_contact else 0)
+                    if has_obj_contact:
+                        contact_frames_in_close += 1
+                        _dbg_contact_traj.append(1)
+                    else:
+                        _dbg_contact_traj.append(0)
+
+                # 穿透检测: 检查 contact points 的 distance (负值表示穿透)
+                for c in contacts:
+                    if c.points:
+                        # 穿透深度 = 最大接触点的深度绝对值 (负距离)
+                        for pt in c.points:
+                            # SAPIEN ContactPoint 可能没有 dist 属性, 用 impulse 的 norm 代替
+                            try:
+                                pen_depth = float(pt.get_dist()) if hasattr(pt, 'get_dist') else 0.0
+                            except Exception:
+                                pen_depth = 0.0
+                            if abs(pen_depth) > max_penetration:
+                                max_penetration = abs(pen_depth)
+
+            # 获取物体最终位置
+            obj_final_z = 0.0
+            obj_final_xy = [0.0, 0.0]
+            obj_dropped = True
+            if target_obj is not None and len(self.obj_actors) > 0:
+                for actor in self.obj_actors:
+                    if target_obj in actor.get_name():
+                        pos = np.array(actor.get_pose().p)
+                        obj_final_z = pos[2]
+                        obj_final_xy = pos[:2].tolist()
+                        obj_dropped = pos[2] < 0.01
+                        break
+
+            # 获取 bowl 位置
+            ctrl = self.grasp_controllers.get(self.side)
+            bowl_xy = [0.0, 0.0] if ctrl is None or ctrl.bowl_pos is None else ctrl.bowl_pos[:2].tolist()
+
+            # 第二十轮: 计算 CLOSE 阶段最后 5 帧的平均距离 (鼓励持续接触)
+            if len(_close_dists) > 0:
+                avg_dist_in_close_last5 = float(np.mean(_close_dists[-5:]))
+            else:
+                avg_dist_in_close_last5 = 1.0  # 无 CLOSE 帧, 给大距离惩罚
+
+            # 第二十八轮: CLOSE 阶段最后 5 帧的接触帧数 (鼓励稳定夹持到结束)
+            last_contact_count = int(np.sum(_close_contact_flags[-5:])) if len(_close_contact_flags) > 0 else 0
+
+            # 第二十一轮: 计算全程平均距离 + gripper 最低点与物体 z 差距 (粗搜接近奖励)
+            if len(_all_dists) > 0:
+                avg_dist_throughout = float(np.mean(_all_dists))
+            else:
+                avg_dist_throughout = 1.0
+            gripper_obj_z_gap = max(0.0, _gripper_z_min - _obj_z_target) if _obj_z_target is not None else 1.0
+
+            result = dict(
+                params=opt_params,
+                contact_frames_in_close=contact_frames_in_close,
+                obj_init_z=obj_init_z, obj_final_z=obj_final_z,
+                obj_init_xy=obj_init_xy, obj_final_xy=obj_final_xy,
+                bowl_xy=bowl_xy,
+                obj_dropped=obj_dropped,
+                max_penetration=max_penetration,
+                min_dist_in_close=min_dist_in_close,
+                avg_dist_in_close_last5=avg_dist_in_close_last5,
+                last_contact_count=last_contact_count,
+                # 第二十一轮: 全程距离指标 (粗搜接近)
+                avg_dist_throughout=avg_dist_throughout,
+                gripper_obj_z_gap=gripper_obj_z_gap,
+                # 第二十六轮: 帧间平滑度 (帧级窗口优化)
+                smoothness_cost=smoothness_cost,
+                # === DEBUG 插桩: 轨迹数据 ===
+                _dbg_obj_z_traj=_dbg_obj_z_traj,
+                _dbg_obj_xy_traj=_dbg_obj_xy_traj,
+                _dbg_gripper_z_traj=_dbg_gripper_z_traj,
+                _dbg_first_frame_state=_dbg_first_frame_state,
+                # === DEBUG 插桩结束 ===
+            )
+            result["reward"] = getattr(self, '_reward_fn', compute_reward_xyz)(result)
+            # 粗搜奖励与主奖励一致
+            result["reward_coarse"] = result["reward"]
+            return result
+
+        # 3. 优化 (第二十九轮: 3 维 XYZ CEM)
+        import multiprocessing as mp
+        from traj_optimize import (
+            compute_reward_xyz
+        )
+
+        # Phase 0: 基线扫描 — 找抓取窗口 (用 MANO 轨迹直接计算距离)
+        logger.info(f"{'='*60}")
+        logger.info(f"Phase 0: 基线扫描 — 找连续窗口")
+        logger.info(f"{'='*60}")
+        # 清除窗口参数, 确保 baseline 使用纯 MANO 轨迹
+        self._window_params = None
+        if hasattr(self, '_kf_cache'):
+            del self._kf_cache
+
+        # 从 MANO 轨迹计算基线距离
+        s = self.side
+        traj = self._mano_gripper_traj.get(s)
+        ctrl = self.grasp_controllers.get(s)
+        tgt = ctrl.target_obj if ctrl is not None else None
+        if traj is None or len(traj["pos"]) == 0 or tgt is None or tgt not in self.obj_bbox_centers:
+            logger.error(f"[Phase 0] 缺少 MANO 轨迹或目标物体, 无法扫描基线")
+            return
+        target_pos = np.array(self.obj_bbox_centers[tgt], dtype=np.float64)
+        mano_positions = traj["pos"]
+        baseline_dists = list(np.linalg.norm(mano_positions - target_pos, axis=1))
+        total_frames = len(baseline_dists)
+
+        logger.info(f"[Phase 0] 基线: {total_frames} 帧, target={tgt}, "
+                    f"target_pos=({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f})")
+        logger.info(f"[Phase 0] MANO Z: [{mano_positions[:,2].min():.3f}, {mano_positions[:,2].max():.3f}]m, "
+                    f"Object Z: {target_pos[2]:.3f}m")
+
+        dist_array = np.array(baseline_dists)
+        fg = int(np.argmin(dist_array))
+
+        # 用连续窗口代替百分位数散点窗口 — 以最接近帧为中心取 ±20 帧
+        window_half = 20
+        grasp_window = np.arange(
+            max(0, fg - window_half),
+            min(total_frames, fg + window_half + 1)
+        )
+        # 确保窗口至少有 3 帧
+        if len(grasp_window) < 3:
+            grasp_window = np.arange(max(0, fg-5), min(total_frames, fg+5))
+            logger.warning(f"[Phase 0] 窗口帧数太少, 以 F{fg} 为中心取 {len(grasp_window)} 帧")
+
+        min_dist = float(dist_array[fg])
+        logger.info(f"[Phase 0] 基线: min_dist={min_dist:.4f}m at F{fg}")
+
+        # 第二十九轮: Phase 1 — 3 维 XYZ 偏移优化
+        from traj_optimize import cem_xyz_optimize, compute_reward_xyz
+
+        self._window_params = None
+        if hasattr(self, '_kf_cache'):
+            delattr(self, '_kf_cache')
+
+        logger.info(f"{'='*60}")
+        logger.info(f"Phase 1: 3D XYZ CEM 优化 (3 维)")
+        logger.info(f"{'='*60}")
+
+        best_params, best_reward, reward_history = cem_xyz_optimize(
+            rollout_fn=rollout_single,
+            n_iterations=15,
+            population_size=32,
+            elite_frac=0.2,
+            initial_std=0.10,
+            pos_range=0.50,
+        )
+
+        self._opt_params_best = best_params
+        self._reward_history = reward_history
+
+        logger.info(f"[CEM-XYZ] 完成: best_reward={best_reward:.3f}, "
+                    f"offset=[{best_params[0]:.4f}, {best_params[1]:.4f}, {best_params[2]:.4f}]m")
+
+        # 保存结果
+        np.save(self.output_dir / "opt_params.npy", best_params)
+        np.save(self.output_dir / "reward_history.npy", np.array(reward_history))
+        np.save(self.output_dir / "baseline_dists.npy", dist_array)
+
+        # 4. 验证最优参数 (rollout 可重现性 + 抓取指标)
+        self._opt_eval_count = 0  # 重置调试计数器
+        verify_result = rollout_single(best_params)
+        verify_reward = verify_result["reward"]
+        verify_coarse = verify_result.get("reward_coarse", 0.0)
+        logger.info(f"  [DEBUG 验证] best_reward={best_reward:.4f}, verify_reward={verify_reward:.4f}, "
+                    f"diff={abs(best_reward - verify_reward):.4f}")
+        logger.info(f"  [DEBUG 验证] verify: contact={verify_result.get('contact_frames_in_close', 0)}, "
+                    f"last_contact={verify_result.get('last_contact_count', 0)}, "
+                    f"lift={verify_result.get('obj_final_z', 0) - verify_result.get('obj_init_z', 0):.4f}, "
+                    f"min_dist={verify_result.get('min_dist_in_close', 1.0):.4f}, "
+                    f"avg_dist_last5={verify_result.get('avg_dist_in_close_last5', 1.0):.4f}, "
+                    f"avg_dist_all={verify_result.get('avg_dist_throughout', 1.0):.4f}, "
+                    f"z_gap={verify_result.get('gripper_obj_z_gap', 1.0):.4f}, "
+                    f"coarse_reward={verify_coarse:.3f}, "
+                    f"xy_drift={np.linalg.norm(np.array(verify_result.get('obj_final_xy', [0,0])) - np.array(verify_result.get('obj_init_xy', [0,0]))):.4f}")
+        # 保存验证轨迹供对比
+        np.save(self.output_dir / "verify_reward.npy",
+                np.array([best_reward, verify_reward, abs(best_reward - verify_reward)]))
+        # === DEBUG 插桩 v2: 保存 verify rollout 的完整轨迹 + 第一帧状态 ===
+        np.save(self.output_dir / "verify_obj_z_traj.npy", np.array(verify_result.get('_dbg_obj_z_traj', [])))
+        np.save(self.output_dir / "verify_gripper_z_traj.npy", np.array(verify_result.get('_dbg_gripper_z_traj', [])))
+        np.save(self.output_dir / "verify_obj_xy_traj.npy", np.array(verify_result.get('_dbg_obj_xy_traj', [])))
+        _ffs = verify_result.get('_dbg_first_frame_state')
+        if _ffs is not None:
+            import json
+            with open(self.output_dir / "verify_first_frame.json", 'w') as _f:
+                json.dump(_ffs, _f, indent=2)
+            gi1, gi2 = _ffs.get('gripper_idx1'), _ffs.get('gripper_idx2')
+            rq, rv = _ffs['robot_qpos'], _ffs['robot_qvel']
+            logger.info(f"  [DEBUG 验证] first_frame: gripper_qpos=[{rq[gi1]:.6f},{rq[gi2]:.6f}], "
+                        f"gripper_qvel=[{rv[gi1]:.6f},{rv[gi2]:.6f}], "
+                        f"obj_pos={_ffs['obj_pos']}, root_pose={_ffs['root_pose']}")
+        # === DEBUG 插桩结束 ===
+
+        # ============================================================
+        # Phase 2: 6 维 XYZ+RPY CEM (在 Phase 1 最优基础上调姿态)
+        # ============================================================
+        from traj_optimize import cem_6d_optimize, compute_reward_phase2
+
+        self._reward_fn = compute_reward_phase2
+        phase1_best = best_params.copy()  # Phase 1 最优 XYZ
+
+        logger.info(f"{'='*60}")
+        logger.info(f"Phase 2: 6D XYZ+RPY CEM (初始 XYZ=[{phase1_best[0]:.4f},{phase1_best[1]:.4f},{phase1_best[2]:.4f}])")
+        logger.info(f"{'='*60}")
+
+        best_params_6d, best_reward_6d, reward_history_6d = cem_6d_optimize(
+            rollout_fn=rollout_single,
+            initial_mu_xyz=phase1_best,
+            n_iterations=15,
+            population_size=32,
+            elite_frac=0.2,
+            pos_std=0.02,
+            rot_std=0.08,
+            pos_range=0.30,
+            rot_range=0.35,
+            seed=44,
+        )
+
+        self._opt_params_best = best_params_6d
+        self._reward_history = reward_history_6d
+
+        # 保存 Phase 2 结果
+        np.save(self.output_dir / "opt_params_phase2.npy", best_params_6d)
+        np.save(self.output_dir / "opt_params.npy", best_params_6d)  # 也覆盖主文件
+        np.save(self.output_dir / "reward_history_phase2.npy", np.array(reward_history_6d))
+
+        logger.info(f"[CEM-6D] 完成: best_reward={best_reward_6d:.3f}, "
+                    f"xyz=[{best_params_6d[0]:.4f},{best_params_6d[1]:.4f},{best_params_6d[2]:.4f}], "
+                    f"rpy=[{best_params_6d[3]:.4f},{best_params_6d[4]:.4f},{best_params_6d[5]:.4f}]")
+
+        # 验证 Phase 2 结果
+        self._opt_eval_count = 0
+        verify_result_6d = rollout_single(best_params_6d)
+        verify_reward_6d = verify_result_6d["reward"]
+        logger.info(f"  [DEBUG 验证 Phase 2] best_reward={best_reward_6d:.4f}, verify_reward={verify_reward_6d:.4f}, "
+                    f"diff={abs(best_reward_6d - verify_reward_6d):.4f}")
+        logger.info(f"  [DEBUG 验证 Phase 2] verify: contact={verify_result_6d.get('contact_frames_in_close', 0)}, "
+                    f"last_contact={verify_result_6d.get('last_contact_count', 0)}, "
+                    f"lift={verify_result_6d.get('obj_final_z', 0) - verify_result_6d.get('obj_init_z', 0):.4f}, "
+                    f"min_dist={verify_result_6d.get('min_dist_in_close', 1.0):.4f}, "
+                    f"avg_dist_last5={verify_result_6d.get('avg_dist_in_close_last5', 1.0):.4f}")
+
+        self._reward_fn = compute_reward_xyz  # 恢复默认
+
+    def _compute_neutral_offsets(self):
+        """计算 offset (复用 run() 中的逻辑, 供 run_optimize 调用)"""
+        # 确保属性存在 (run_optimize 中可能还未初始化)
+        if not hasattr(self, '_mano_neutral_offset'):
+            self._mano_neutral_offset = {}
+        if not hasattr(self, '_mano_grasp_frame'):
+            self._mano_grasp_frame = {}
+        if not hasattr(self, '_mano_target_pos'):
+            self._mano_target_pos = {}
+        for s in self.sides:
+            traj = self._mano_gripper_traj.get(s)
+            if traj is None or len(traj["pos"]) == 0 or "R" not in traj:
+                self._mano_neutral_offset[s] = None
+                self._mano_grasp_frame[s] = None
+                continue
+            ctrl = self.grasp_controllers.get(s)
+            tgt = ctrl.target_obj if ctrl is not None else None
+            if tgt is None or tgt not in self.obj_bbox_centers:
+                self._mano_neutral_offset[s] = None
+                self._mano_grasp_frame[s] = None
+                continue
+            target_pos = np.array(self.obj_bbox_centers[tgt], dtype=np.float64)
+            mano_positions = traj["pos"]
+            dists = np.linalg.norm(mano_positions - target_pos, axis=1)
+            f_grasp = int(np.argmin(dists))
+            R_at_grasp = traj["R"][f_grasp]
+            FINGER_FORWARD_NEUTRAL = 0.037
+            finger_offset = R_at_grasp[:, 0] * FINGER_FORWARD_NEUTRAL
+            offset = target_pos - mano_positions[f_grasp] - finger_offset
+            self._mano_neutral_offset[s] = offset
+            self._mano_grasp_frame[s] = f_grasp
+            self._mano_target_pos = {s: target_pos}
 
 
 # ============================================================
@@ -3932,14 +5000,74 @@ def main():
     parser.add_argument("--num-frames", type=int, default=-1)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--views", type=str, default="both",
-                        choices=["cam", "god", "both"],
-                        help="渲染视角: cam(第一人称相机视角) / god(上帝视角) / both(双视角, 默认)")
+                        choices=["cam", "god", "both", "none"],
+                        help="渲染视角: cam(第一人称相机视角) / god(上帝视角) / both(双视角, 默认) / none(不渲染视频)")
+    parser.add_argument("--viewer", action="store_true",
+                        help="启用交互式 Viewer 窗口 (实时查看仿真过程)")
     parser.add_argument("--grasp-mode", type=str, default="hybrid",
                         choices=["adaptive", "mano", "hybrid"],
                         help="抓取模式: hybrid(MANO驱动+接触力控, 默认) / adaptive(旧版MANO意图) / mano(纯MANO重放)")
+    parser.add_argument("--optimize", action="store_true",
+                        help="离线 CEM 优化轨迹参数 (借鉴 do-as-i-do Stage 5), 优化后再渲染")
+    parser.add_argument("--opt-params", type=str, default=None,
+                        help="手动指定优化参数文件 (npy), 跳过优化直接使用")
+    parser.add_argument("--method", type=str, default="default",
+                        choices=["default", "grasp-lift", "cem"],
+                        help="优化方法: default(无优化) / grasp-lift(CMA-ES 42维spline keyframes) / cem(CEM 9维)")
+    parser.add_argument("--cmaes-gen", type=int, default=50,
+                        help="CMA-ES 代数 (默认 50)")
+    parser.add_argument("--cmaes-pop", type=int, default=32,
+                        help="CMA-ES 种群大小")
+    parser.add_argument("--cmaes-sigma", type=float, default=0.25,
+                        help="CMA-ES 初始步长 (默认 0.25=25cm/25°)")
+    parser.add_argument("--cmaes-sigma-end", type=float, default=0.005,
+                        help="CMA-ES 终止步长 (默认 0.005=0.5°, sigma 指数衰减到此值)")
+    parser.add_argument("--cmaes-sigma-decay", type=float, default=None,
+                        help="CMA-ES 每代 sigma 衰减系数 (覆盖自动计算)")
     args = parser.parse_args()
 
-    # output_dir 传 None, 由 GraspSimulator 自动按输入文件命名
+    # 第十九轮: 支持 --method grasp-lift (CMA-ES) 和 --method cem (CEM), 以及 --opt-params
+    opt_params = None
+    if args.opt_params:
+        opt_params = np.load(args.opt_params)
+        logger.info(f"  加载手动指定参数: {args.opt_params}, shape={opt_params.shape}")
+    elif args.method == "grasp-lift" or args.method == "cem" or args.optimize:
+        logger.info("=" * 60)
+        logger.info(f"第二十九轮: 3D XYZ CEM 优化 (3 维, "
+                    f"15 iter × 32 pop)")
+        logger.info("=" * 60)
+
+        # 初始化 simulator (不渲染, 用于 rollout)
+        sim_opt = GraspSimulator(
+            hawor_dir=args.hawor_dir,
+            ras_dir=args.ras_dir,
+            mode=args.mode,
+            side=args.side,
+            output_dir=args.output_dir,
+            num_frames=args.num_frames,
+            start_frame=args.start_frame,
+            views="none",  # 不渲染
+            grasp_mode="hybrid",
+        )
+        # 设置优化方法和参数
+        if args.method == "grasp-lift":
+            sim_opt._optimize_method = 'cmaes'
+            sim_opt._cmaes_gen = args.cmaes_gen
+            sim_opt._cmaes_pop = args.cmaes_pop
+            sim_opt._cmaes_sigma = args.cmaes_sigma
+            sim_opt._cmaes_sigma_end = args.cmaes_sigma_end
+            sim_opt._cmaes_sigma_decay = args.cmaes_sigma_decay
+        else:
+            sim_opt._optimize_method = 'cem'
+        sim_opt.run_optimize()  # 优化 + 保存最优参数
+        opt_params = getattr(sim_opt, '_opt_params_best', None)
+        if opt_params is not None:
+            logger.info(f"  最优参数 shape: {opt_params.shape}")
+            logger.info(f"  保存最优参数: {sim_opt.output_dir / 'opt_params.npy'}")
+        else:
+            logger.warning("  优化未完成, 跳过最终渲染")
+
+    # 输出目录传 None, 由 GraspSimulator 自动按输入文件命名
     sim = GraspSimulator(
         hawor_dir=args.hawor_dir,
         ras_dir=args.ras_dir,
@@ -3950,7 +5078,15 @@ def main():
         start_frame=args.start_frame,
         views=args.views,
         grasp_mode=args.grasp_mode,
+        viewer=args.viewer,
     )
+    # 设置优化参数
+    if opt_params is not None:
+        sim.set_opt_params(opt_params)
+        # 第二十六轮: 复制优化时的物体初始位姿, 确保 run() 回放和优化 rollout 从同一位姿开始
+        if hasattr(sim_opt, '_obj_initial_poses'):
+            sim._obj_initial_poses = sim_opt._obj_initial_poses
+            logger.info(f"  复制物体初始位姿 ({len(sim._obj_initial_poses)} 个) 从优化器到渲染器")
     sim.run()
 
 

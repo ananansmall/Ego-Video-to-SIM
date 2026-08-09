@@ -15,6 +15,7 @@ common.py — 从 02_render_scene.py 提取的核心渲染逻辑 (自适应单/�
     render_robot_video(hawor_dir, ras_dir, transform_params_path, output, hand_indices, ...)
 """
 
+import gc
 import os
 _nvidia_icd = '/usr/share/vulkan/icd.d/nvidia_icd.json'
 if os.path.exists(_nvidia_icd):
@@ -83,13 +84,33 @@ COMFORTABLE_REACH = 0.35
 COMFORT_TARGET_IN_BASE = np.array([0.30, 0.0, -0.30])
 BASE_TRACKING_RANGE = 0.04
 BASE_TRACKING_ALPHA = 0.15
-LP_ALPHA_JOINT = 0.5
+LP_ALPHA_JOINT = 0.15  # 降低 alpha = 更强平滑 (与 02 离线平滑器效果接近)
 IK_TOLERANCES = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 IK_SOLVE_PER_FRAME = 20
 HAWOR_FOCAL_DEFAULT = 600.0
 
+# ─── Transform params (set by 002 at module load) ───
+_RENDER_R_h2g = None
+_RENDER_t_h2g = None
+_RENDER_Rx_hand = None
+_RENDER_s = 1.0
 
-# ─── 手部检测 ────────────────────────────────────────────────────────────────
+
+def set_render_transform_params(R_h2g, t_h2g, Rx_hand, s):
+    """设置渲染变换参数 (在 002 加载 transform_params 后调用)
+    
+    Args:
+        R_h2g: HaWoR → GLB 旋转
+        t_h2g: HaWoR → GLB 平移
+        Rx_hand: 手部坐标 flip (SLAM→OpenGL), 默认 diag([1,-1,-1])
+        s: 尺度因子
+    """
+    global _RENDER_R_h2g, _RENDER_t_h2g, _RENDER_Rx_hand, _RENDER_s
+    _RENDER_R_h2g = R_h2g
+    _RENDER_t_h2g = t_h2g
+    _RENDER_Rx_hand = Rx_hand
+    _RENDER_s = s
+
 
 def detect_hands(hawor_dir):
     """自动检测 HaWoR 数据中的活跃手 (左手/右手/双手)
@@ -198,6 +219,9 @@ def _find_reconstruction_file(hawor_path):
     rec_dir = hawor_path / "reconstruction"
     if not rec_dir.exists():
         return None
+    # 优先查找深度校正后的文件
+    for f in rec_dir.glob("hawor_results_*_depth_aligned.npz"):
+        return f
     for f in rec_dir.glob("hawor_results_*.npz"):
         return f
     return None
@@ -295,6 +319,50 @@ def load_hawor_c2w(hawor_dir):
     return rec['R_c2w'], rec['t_c2w']
 
 
+def load_ras_cameras(ras_dir):
+    """加载 RAS 相机位姿 (已在 GLB 空间, Z-UP)
+
+    返回:
+        R_c2w: (N, 3, 3) 相机→GLB世界 的旋转
+        t_c2w: (N, 3)   相机在 GLB 世界的位置
+    """
+    ext_dir = Path(ras_dir) / 'extrinsics'
+    files = sorted(ext_dir.glob('*.txt'), key=lambda x: int(x.stem))
+    R_all, t_all = [], []
+    for f in files:
+        ext = np.loadtxt(str(f))
+        if ext.shape == (3, 4):
+            ext = np.vstack([ext, [0, 0, 0, 1]])
+        R_w2c = ext[:3, :3]
+        t_w2c = ext[:3, 3]
+        R_all.append(R_w2c.T)               # R_c2w = R_w2c.T
+        t_all.append(-R_w2c.T @ t_w2c)      # t_c2w = -R_w2c.T @ t_w2c
+    return np.array(R_all), np.array(t_all)
+
+
+def ras_cam_to_sapien_pose(t_c2w_ras, R_c2w_ras):
+    """RAS 相机位姿 (GLB 空间) → SAPIEN 相机位姿
+
+    RAS 相机已在 GLB 空间, 使用 OpenCV 约定 (col0=right, col1=down, col2=forward).
+    需要与 hawor_cam_to_sapien_pose 一致的 SAPIEN 相机约定转换.
+    """
+    sapien_pos = R_AXIS @ t_c2w_ras
+    sapien_R = R_AXIS @ R_c2w_ras
+
+    # SAPIEN 相机约定: col0=forward, col1=left, col2=up
+    forward = sapien_R[:, 2]   # OpenCV Z = forward
+    left = -sapien_R[:, 0]     # OpenCV -X = left
+    up = -sapien_R[:, 1]       # OpenCV -Y = up
+    cam_R = np.eye(3)
+    cam_R[:, 0] = forward
+    cam_R[:, 1] = left
+    cam_R[:, 2] = up
+    if np.linalg.det(cam_R) < 0:
+        U, _, VH = np.linalg.svd(cam_R)
+        cam_R = U @ VH
+    return sapien_pos, pr.quaternion_from_matrix(cam_R)
+
+
 def compute_mano_joints(mano_layer, rot, hand_pose, trans):
     """MANO FK: 计算顶点和关节点"""
     p = torch.from_numpy(np.concatenate([rot, hand_pose]).astype(np.float32)).unsqueeze(0)
@@ -337,7 +405,22 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
     trimesh_scene = trimesh.load(str(glb_path))
     obj_actors = []
     temp_files = []
+    # 建立 geom_key → 原始 node_name 映射 (避免使用 trimesh 自动生成的 geometry_N)
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
     for geom_name, geom in trimesh_scene.geometry.items():
+        real_name = geom_to_node.get(geom_name, geom_name)
         if not hasattr(geom, 'faces'):
             continue
         vertices = geom.vertices.copy()
@@ -354,7 +437,7 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
             if len(vc) > 0:
                 avg_rgb = vc[:, :3].mean(axis=0)
                 avg_color = [avg_rgb[0]/255.0, avg_rgb[1]/255.0, avg_rgb[2]/255.0, 1.0]
-        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{geom_name.replace(" ", "_")}.ply'
+        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{real_name.replace(" ", "_")}.ply'
         geom_transformed = trimesh.Trimesh(vertices=vertices_sapien, faces=faces, visual=geom.visual)
         geom_transformed.export(temp_ply)
         temp_files.append(temp_ply)
@@ -364,7 +447,7 @@ def load_glb_transformed(glb_path, transform_params_path, scene, logger=None):
             builder.add_visual_from_file(filename=temp_ply, material=material)
         else:
             builder.add_visual_from_file(filename=temp_ply)
-        actor = builder.build_kinematic(name=geom_name)
+        actor = builder.build_kinematic(name=real_name)
         actor.set_pose(sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]))
         obj_actors.append(actor)
     for tf in temp_files:
@@ -398,31 +481,53 @@ def prepare_arm_urdf(src_urdf_path, arm_prefix="right"):
 
 # ─── 坐标变换 ────────────────────────────────────────────────────────────────
 
-def _render_to_sapien(pts):
-    """HaWoR SLAM 坐标 → SAPIEN 世界坐标
+def _render_to_sapien(pts, R_h2g=None, t_h2g=None, Rx_hand=None, s=1.0):
+    """HaWoR SLAM 手部关节点 → SAPIEN 世界坐标 (与 render_quick.py 一致)
 
-    pred_trans/顶点在 SLAM 世界 (z-forward, y-down), 用 RXWORLD_TO_SAPIEN
-    (= R_AXIS @ R_x) 转换到 SAPIEN. 这与手部/GLB 一致, 三者同帧.
+    变换链:
+      1. SLAM → OpenGL: p_opengl = Rx_hand @ p_slam
+      2. HaWoR → GLB: p_glb = s * R_h2g @ p_opengl + t_h2g
+      3. GLB → SAPIEN: p_sapien = R_AXIS @ p_glb
+
+    当传入参数时, 使用显式变换.
+    当不传入时, 自动使用全局 set_render_transform_params 设置的参数.
+    如果都没设置, 使用旧变换 (backward compatible):
+      RXWORLD_TO_SAPIEN @ pts
     """
+    if R_h2g is not None and t_h2g is not None:
+        Rx = Rx_hand if Rx_hand is not None else np.eye(3)
+        pts_glb = s * (R_h2g @ Rx @ pts.T).T + t_h2g
+        return (R_AXIS @ pts_glb.T).T
+    if _RENDER_R_h2g is not None and _RENDER_t_h2g is not None:
+        Rx = _RENDER_Rx_hand if _RENDER_Rx_hand is not None else np.eye(3)
+        pts_glb = _RENDER_s * (_RENDER_R_h2g @ Rx @ pts.T).T + _RENDER_t_h2g
+        return (R_AXIS @ pts_glb.T).T
     return (RXWORLD_TO_SAPIEN @ pts.T).T
 
 
-def hawor_cam_to_sapien_pose(R_c2w, t_c2w):
-    """HaWoR 相机位姿 → SAPIEN 相机位姿
+def hawor_cam_to_sapien_pose(R_c2w, t_c2w, R_h2g=None, t_h2g=None, s=1.0):
+    """HaWoR 相机位姿 → SAPIEN 相机位姿 (与 render_quick.py 一致)
 
-    R_c2w/t_c2w 已应用 R_x (SLAM→OpenGL 世界), 但相机约定仍为 OpenCV
-    (col0=right, col1=down, col2=forward). SAPIEN 相机约定: col0=forward,
-    col1=left, col2=up.
+    变换链 (与 render_quick.py 完全一致):
+      相机位置: cam_glb = s * R_h2g @ t_c2w + t_h2g  (无 Rx_hand)
+      相机朝向: R_cam_glb = R_h2g @ R_c2w            (无 Rx_hand)
+      GLB → SAPIEN: R_AXIS @ cam_glb / R_AXIS @ R_cam_glb
 
-    关键: 相机 transform 必须用 R_AXIS (而非 RXWORLD_TO_SAPIEN), 才能与
-    手部/GLB (用 RXWORLD_TO_SAPIEN @ SLAM_data = R_AXIS @ OpenGL_data) 同帧.
-    手部 = R_AXIS @ R_x @ SLAM = R_AXIS @ OpenGL, 相机 = R_AXIS @ stored
-    (stored = R_x @ SLAM = OpenGL), 两者均在 R_AXIS @ OpenGL 帧中.
-
-    OpenCV 提取: forward = +col2, left = -col0, up = -col1
+    当不传入 R_h2g/t_h2g 时, 自动使用全局 set_render_transform_params 设置的参数.
     """
-    cam_pos_sapien = R_AXIS @ t_c2w
-    cam_R_sapien = R_AXIS @ R_c2w
+    if R_h2g is not None and t_h2g is not None:
+        cam_pos_glb = s * R_h2g @ t_c2w + t_h2g
+        R_cam_glb = R_h2g @ R_c2w
+    elif _RENDER_R_h2g is not None and _RENDER_t_h2g is not None:
+        cam_pos_glb = _RENDER_s * _RENDER_R_h2g @ t_c2w + _RENDER_t_h2g
+        R_cam_glb = _RENDER_R_h2g @ R_c2w
+    else:
+        cam_pos_glb = t_c2w
+        R_cam_glb = R_c2w
+    cam_pos_sapien = R_AXIS @ cam_pos_glb
+    cam_R_sapien = R_AXIS @ R_cam_glb
+
+    # SAPIEN 相机约定: col0=forward, col1=left, col2=up
     forward = cam_R_sapien[:, 2]
     left = -cam_R_sapien[:, 0]
     up = -cam_R_sapien[:, 1]
@@ -1174,3 +1279,246 @@ def render_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
 
     logger.info(f"\n✓ 夹爪视频已保存: {final_path}")
     return final_path
+
+
+# ─── 新坐标系工具函数 (002_render_scene.py 使用) ──────────────────────────
+
+def load_glb_direct(glb_path, scene):
+    """将 GLB 顶点原样加载到 SAPIEN, 不应用任何坐标变换
+
+    仿真坐标系 = GLB 原始 RAS 坐标系, 去掉旧版的 ZUP_TO_YUP / R_AXIS / RXWORLD_TO_SAPIEN 变换。
+
+    Args:
+        glb_path: GLB 文件路径
+        scene: SAPIEN 场景实例
+
+    Returns:
+        list: SAPIEN actor 列表
+    """
+    glb_path = Path(glb_path)
+    if trimesh is None:
+        return []
+
+    trimesh_scene = trimesh.load(str(glb_path))
+    obj_actors = []
+    temp_files = []
+
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
+    for geom_name, geom in trimesh_scene.geometry.items():
+        real_name = geom_to_node.get(geom_name, geom_name)
+        if not hasattr(geom, 'faces'):
+            continue
+        vertices = np.array(geom.vertices, dtype=np.float32)
+        faces = np.array(geom.faces, dtype=np.uint32)
+        if len(vertices) == 0 or len(faces) == 0:
+            continue
+
+        avg_color = None
+        if hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
+            vc = geom.visual.vertex_colors
+            if len(vc) > 0:
+                avg_rgb = vc[:, :3].mean(axis=0)
+                avg_color = [avg_rgb[0]/255.0, avg_rgb[1]/255.0, avg_rgb[2]/255.0, 1.0]
+
+        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{real_name.replace(" ", "_")}.ply'
+        geom_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=geom.visual)
+        geom_mesh.export(temp_ply)
+        temp_files.append(temp_ply)
+
+        builder = scene.create_actor_builder()
+        if avg_color is not None:
+            material = sapien.render.RenderMaterial(base_color=avg_color, metallic=0.0, roughness=0.7, specular=0.3)
+            builder.add_visual_from_file(filename=temp_ply, material=material)
+        else:
+            builder.add_visual_from_file(filename=temp_ply)
+        actor = builder.build_kinematic(name=real_name)
+        actor.set_pose(sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]))
+        obj_actors.append(actor)
+
+        gc.collect()
+
+    for temp_file in temp_files:
+        try:
+            os.remove(temp_file)
+        except Exception:
+            pass
+
+    return obj_actors
+
+
+def hand_to_glb(pts, scale_ratio, R_hand_to_glb, t_hand_to_glb):
+    """将手部关节点从 HaWoR 坐标系变换到 GLB 坐标系
+
+    替代旧版 _render_to_sapien(pts) 的 (RXWORLD_TO_SAPIEN @ pts.T).T
+
+    Args:
+        pts: (N, 3) 或 (3,) 手部关节坐标 (HaWoR 坐标系)
+        scale_ratio: 尺度因子
+        R_hand_to_glb: (3, 3) 旋转矩阵
+        t_hand_to_glb: (3,) 平移向量
+
+    Returns:
+        np.ndarray: 同形状, GLB 坐标系下的点
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    return scale_ratio * (R_hand_to_glb @ pts.T).T + t_hand_to_glb
+
+
+def hawor_cam_to_glb_pose(R_c2w, t_c2w, scale_ratio, R_hand_to_glb, t_hand_to_glb):
+    """将 HaWoR 相机位姿转换到 GLB 坐标系下的 SAPIEN 相机位姿
+
+    替代旧版 hawor_cam_to_sapien_pose 的 R_AXIS @ t / R_AXIS @ R + OpenCV→SAPIEN 重排
+
+    cam_R 在 OpenGL 约定中: col0=右矢量, col1=上矢量, col2=后矢量
+    SAPIEN 相机约定: X=前, Y=左, Z=上
+    从 OpenGL -col2(-后=前) → SAPIEN X(前), OpenGL -col0(-右=左) → SAPIEN Y(左), OpenGL +col1(+上=上) → SAPIEN Z(上)
+
+    Args:
+        R_c2w: (3, 3) HaWoR 相机旋转矩阵 (camera-to-world)
+        t_c2w: (3,) HaWoR 相机平移向量
+        scale_ratio: 尺度因子
+        R_hand_to_glb: (3, 3) 手部到 GLB 旋转矩阵
+        t_hand_to_glb: (3,) 手部到 GLB 平移向量
+
+    Returns:
+        tuple: (cam_pos, cam_quat)
+    """
+    # R_c2w/t_c2w 与 HaWoR 手部数据同坐标系 (OpenCV 约定), 用 R_hand_to_glb 直接转换
+    # 001_align_scene.py 已验证 R_X = I, 无需额外 R_x 转换
+    R_render_to_glb = R_hand_to_glb
+    cam_pos = scale_ratio * (R_render_to_glb @ t_c2w) + t_hand_to_glb
+    cam_R = R_render_to_glb @ R_c2w
+
+    # cam_R 是 OpenCV 约定: col0=right, col1=down, col2=forward
+    # SAPIEN 相机约定: X=forward, Y=left, Z=up
+    # OpenCV → SAPIEN: forward=+col2, left=-col0, up=-col1
+    forward = cam_R[:, 2]
+    left = -cam_R[:, 0]
+    up = -cam_R[:, 1]
+    sapien_R = np.column_stack([forward, left, up])
+
+    if np.linalg.det(sapien_R) < 0:
+        U, _, Vh = np.linalg.svd(sapien_R)
+        sapien_R = U @ Vh
+
+    return cam_pos, pr.quaternion_from_matrix(sapien_R)
+
+
+def _render_to_sapien_raw(pts_render):
+    """将 HaWoR SLAM 坐标系的点转换到 SAPIEN 坐标系 (无 Rx_hand 翻转)
+
+    用于相机位姿等不需要 Rx_hand 翻转的数据。
+    HaWoR 相机 R_c2w/t_c2w 已经是 OpenCV 约定，只需 R_AXIS 转到 SAPIEN。
+
+    Args:
+        pts_render: (N, 3) 或 (3,) HaWoR SLAM 坐标
+
+    Returns:
+        np.ndarray: 同形状, SAPIEN 坐标系下的点
+    """
+    return (R_AXIS @ np.asarray(pts_render, dtype=np.float64).T).T
+
+
+def load_glb_to_sapien(glb_path, scale_ratio, R_h2g, t_h2g, scene, logger=None):
+    """将 GLB 场景加载到 SAPIEN 坐标系 (与 render_quick.py 一致)
+
+    GLB 顶点已经在正确的 GLB 坐标系中 (RAS 重建结果)。
+    加载时不做变换, 渲染时通过 R_AXIS 转换到 SAPIEN.
+
+    变换链 (与手部/相机完全一致):
+      GLB 顶点 (GLB 空间) → R_AXIS → SAPIEN
+    """
+    if trimesh is None:
+        if logger:
+            logger.error("  ✗ trimesh 未安装, 无法加载 GLB")
+        return []
+
+    glb_path = Path(glb_path)
+
+    if logger:
+        size_mb = glb_path.stat().st_size / 1024 / 1024
+        logger.info(f"  GLB 文件: {glb_path} ({size_mb:.1f} MB)")
+        logger.info(f"  变换: GLB 空间 → R_AXIS → SAPIEN (与手部/相机一致)")
+
+    trimesh_scene = trimesh.load(str(glb_path))
+
+    geom_to_node = {}
+    for _node_name in trimesh_scene.graph.nodes:
+        if _node_name == "world":
+            continue
+        try:
+            _data = trimesh_scene.graph[_node_name]
+            if isinstance(_data, tuple) and len(_data) == 2:
+                _, _geom_key = _data
+                if _geom_key:
+                    geom_to_node[_geom_key] = _node_name
+        except Exception:
+            pass
+
+    obj_actors = []
+    temp_files = []
+
+    for geom_name, geom in trimesh_scene.geometry.items():
+        real_name = geom_to_node.get(geom_name, geom_name)
+        if not hasattr(geom, 'faces'):
+            continue
+        vertices = geom.vertices.copy()
+        faces = geom.faces.copy()
+        if len(vertices) == 0 or len(faces) == 0:
+            continue
+
+        # GLB → SAPIEN: R_AXIS @ p_glb (与手部/相机一致)
+        vertices_sapien = (R_AXIS @ vertices.T).T
+
+        avg_color = None
+        if hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
+            vertex_colors = geom.visual.vertex_colors
+            if len(vertex_colors) > 0:
+                avg_rgb = vertex_colors[:, :3].mean(axis=0)
+                avg_color = [avg_rgb[0]/255.0, avg_rgb[1]/255.0, avg_rgb[2]/255.0, 1.0]
+
+        temp_ply = f'/tmp/glb_actor_{os.getpid()}_{real_name.replace(" ", "_")}.ply'
+        geom_transformed = trimesh.Trimesh(
+            vertices=vertices_sapien,
+            faces=faces,
+            visual=geom.visual
+        )
+        geom_transformed.export(temp_ply)
+        temp_files.append(temp_ply)
+
+        builder = scene.create_actor_builder()
+        if avg_color is not None:
+            material = sapien.render.RenderMaterial(
+                base_color=avg_color, metallic=0.0, roughness=0.7, specular=0.3
+            )
+            builder.add_visual_from_file(filename=temp_ply, material=material)
+        else:
+            builder.add_visual_from_file(filename=temp_ply)
+
+        actor = builder.build_kinematic(name=real_name)
+        actor.set_pose(sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]))
+        obj_actors.append(actor)
+
+        gc.collect()
+
+    for temp_file in temp_files:
+        try:
+            os.remove(temp_file)
+        except Exception:
+            pass
+
+    if logger:
+        logger.info(f"  ✓ GLB 加载完成: {len(obj_actors)} 个物体")
+    return obj_actors

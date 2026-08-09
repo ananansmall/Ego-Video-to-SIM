@@ -43,11 +43,14 @@ if 'VK_ICD_FILENAMES' not in os.environ:
     else:
         os.environ['VK_ICD_FILENAMES'] = _intel_icd
 
+import os
 import sys
 import gc
 import re
 import logging
 import tempfile
+import datetime
+import pickle
 from pathlib import Path
 
 import cv2
@@ -167,13 +170,15 @@ FINGER_GROUP_COLORS = [
     np.array([1.0, 0.5, 0.0, 1.0]),
 ]
 
-# PD 驱动参数: 与 GalaxeaManipSim 一致 (stiffness=1000, damping=200)
-# 高刚度(100000)配合set_qpos会导致PD力与位置约束冲突，产生震荡
-# 纯PD驱动模式下，合理的刚度让关节平滑跟踪目标，允许柔顺性
+# PD 驱动参数
 JOINT_STIFFNESS = 1000.0
 JOINT_DAMPING = 200.0
+# 夹爪 PD 驱动: 轻质量连杆需要接近临界阻尼以实现快速收敛
+#   m = 0.027kg, k = 1000, d = 10
+#   ζ = d / (2 * √(k * m)) = 10 / (2 * √(1000 * 0.027)) = 10 / 10.39 = 0.96 (接近临界阻尼)
+#   10 步 * 1/240s ≈ 0.042s 内收敛到 <0.01mm 误差
 GRIPPER_STIFFNESS = 1000.0
-GRIPPER_DAMPING = 200.0
+GRIPPER_DAMPING = 10.0
 PHYSICS_TIMESTEP = 1 / 240.0
 CONTROL_FREQ = 30
 DECIMATION = max(1, int((1.0 / CONTROL_FREQ) / PHYSICS_TIMESTEP))
@@ -187,6 +192,253 @@ _FINGER2_ORIGIN = np.array([0.03689, 0.013453, 0.00012067])
 _FINGER2_AXIS = np.array([0, 1, 0])  # prismatic axis
 _FINGER_BASE_DIST = abs(_FINGER1_ORIGIN[1] - _FINGER2_ORIGIN[1])  # 0.026906
 GRIPPER_INIT_OPEN = 0.04
+
+# 夹爪 URDF 几何偏移
+# base_link(=gripper_base_link) --0.03689m--> finger_center (开合中点)
+_GRIPPER_DEPTH_OFFSET = 0.03689  # 与 GalaxeaManipSim 一致
+
+# 桌面碰撞检测安全系数
+_FINGER_MESH_EXTENT = 0.025      # 手指网格从关节原点向下延伸约 2.5cm
+_FINGER_GROUND_MARGIN = 0.005    # 额外安全余量 5mm
+
+# 平滑参数
+_GRIPPER_SMOOTH_ALPHA_POS = 0.3    # 位置 EMA (中等平滑)
+_GRIPPER_SMOOTH_ALPHA_ROT = 0.2    # 旋转 EMA (更强平滑, 用户要求)
+_GRIPPER_SMOOTH_ALPHA_JOINT = 0.5  # 手指 EMA (快响应)
+
+
+class GripperIKOptimizer:
+    """单夹爪 IK 优化器: 解析法 + LM 迭代优化 + EMA 平滑 (对 MANO 输入点平滑)
+
+    设计原则:
+      - URDF 刚性: 手腕(base_link)和夹爪(gripper_link)是 fixed joint, 始终一起移动
+      - 只有 2 个控制量: root_pose (6 DOF) + finger joint (1 DOF, 对称)
+      - 夹爪指尖跟踪 MANO 参考点位置 (高权重)
+      - 手腕朝向跟踪 MANO 手腕朝向 (中权重, 手腕没有位置参考点)
+      - 手腕在夹爪中心正交垂直 (硬约束, URDF 几何保证)
+
+    三阶段:
+    1. EMA 平滑: 对 MANO 三个输入点做平滑 (保证位置-旋转几何对齐不被破坏)
+    2. 解析法: finger joint (精确) + root_pose (X轴=MANO wrist→指尖方向, Gram-Schmidt)
+    3. LM 迭代: 3 DOF (仅旋转), joint 固定为解析解, root_pos 从 finger_center - R @ offset 计算
+       - 10 * |finger1_pred - MANO4|^2  (夹爪指尖跟随, 高权重)
+       - 10 * |finger2_pred - MANO8|^2  (夹爪指尖跟随, 高权重)
+       - 3  * angle(R_pred, R_mano)^2   (手腕朝向跟踪, 中权重)
+
+    FK (URDF 刚性约束内, joint 固定为解析解, 不参与优化):
+      finger1 = root_pos + R @ (FINGER1_ORIGIN + joint * FINGER1_AXIS)
+      finger2 = root_pos + R @ (FINGER2_ORIGIN + joint * FINGER2_AXIS)
+    """
+
+    def __init__(self, robot, prefix="right", finger_joint_limits=(0.0, 0.05),
+                 max_iter=5, lm_lambda=0.01):
+        self.robot = robot
+        self.prefix = prefix
+        self.joint_limits = finger_joint_limits
+        self.max_iter = max_iter
+        self.lm_lambda = lm_lambda
+        # 平滑状态: 对 MANO 输入点做平滑 (而非对输出 pos/quat 做平滑)
+        # 这样位置和旋转始终匹配, 几何对齐 (X⊥Y, 指尖对齐) 不被破坏
+        self.smooth_wrist = None
+        self.smooth_finger1 = None
+        self.smooth_finger2 = None
+
+        # 缓存 link 索引
+        self.gripper_link_name = f"{prefix}_gripper_link"
+        self.link_name_to_idx = {link.get_name(): i for i, link in enumerate(robot.get_links())}
+        self.gripper_link_idx = self.link_name_to_idx[self.gripper_link_name]
+
+        # 缓存 active joint 索引
+        active_joints = robot.get_active_joints()
+        self.joint_names = [j.name for j in active_joints]
+        self.gripper_idx1 = self.joint_names.index(f"{prefix}_gripper_finger_joint1")
+        self.gripper_idx2 = self.joint_names.index(f"{prefix}_gripper_finger_joint2")
+
+        # FK 常量 (URDF 几何)
+        self._finger1_offset_base = _FINGER1_ORIGIN.copy()
+        self._finger1_axis = _FINGER1_AXIS.copy()
+        self._finger2_offset_base = _FINGER2_ORIGIN.copy()
+        self._finger2_axis = _FINGER2_AXIS.copy()
+
+    @staticmethod
+    def _rotvec_to_R(rotvec):
+        angle = np.linalg.norm(rotvec)
+        if angle < 1e-10:
+            return np.eye(3)
+        axis = rotvec / angle
+        return pr.matrix_from_axis_angle(np.array([axis[0], axis[1], axis[2], angle]))
+
+    @staticmethod
+    def _R_to_rotvec(R):
+        a = pr.axis_angle_from_matrix(R)
+        return a[:3] * a[3]
+
+    @staticmethod
+    def _orientation_error(R_pred, R_target):
+        """计算两个旋转矩阵之间的角度误差 (弧度)"""
+        R_err = R_pred.T @ R_target
+        angle = np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1, 1))
+        return angle
+
+    def _fk_fingertips(self, root_pos, R, joint):
+        """前向运动学: 从 root_pose + joint 计算两指尖世界位置 (URDF 刚性)"""
+        off1 = self._finger1_offset_base + joint * self._finger1_axis
+        off2 = self._finger2_offset_base + joint * self._finger2_axis
+        finger1 = root_pos + R @ off1
+        finger2 = root_pos + R @ off2
+        return finger1, finger2
+
+    def _compute_residual(self, params, mano_finger1, mano_finger2, R_target, finger_center, joint):
+        """加权残差向量 (7维): 10*finger1 + 10*finger2 + sqrt(3)*orientation
+        params: [rotvec_x, rotvec_y, rotvec_z] (3 DOF, 仅旋转)
+        joint 固定为解析解 (精确匹配 MANO 指尖距离)
+        """
+        R = self._rotvec_to_R(params[:3])
+        root_pos = finger_center - R @ np.array([_GRIPPER_DEPTH_OFFSET, 0.0, 0.0])
+        f1_pred, f2_pred = self._fk_fingertips(root_pos, R, joint)
+        w_finger = np.sqrt(10.0)
+        r1 = w_finger * (f1_pred - mano_finger1)
+        r2 = w_finger * (f2_pred - mano_finger2)
+        # 手腕朝向误差 (MANO 手腕朝向)
+        w_rot = np.sqrt(3.0)
+        angle = self._orientation_error(R, R_target)
+        r3 = np.array([w_rot * angle])
+        residual = np.concatenate([r1, r2, r3])
+        cost = 0.5 * np.dot(residual, residual)
+        return cost, residual
+
+    def _numerical_jacobian(self, params, mano_finger1, mano_finger2, R_target, finger_center, joint):
+        """数值雅可比 (7 x 3)"""
+        eps = 1e-6
+        n = len(params)
+        _, base_r = self._compute_residual(params, mano_finger1, mano_finger2, R_target, finger_center, joint)
+        jac = np.zeros((len(base_r), n))
+        for i in range(n):
+            p = params.copy()
+            p[i] += eps
+            _, r_plus = self._compute_residual(p, mano_finger1, mano_finger2, R_target, finger_center, joint)
+            jac[:, i] = (r_plus - base_r) / eps
+        return jac
+
+    def _lm_optimize(self, finger_center, init_R, joint, mano_finger1, mano_finger2, R_target):
+        """LM 迭代优化: 3 DOF (仅旋转), joint 固定为解析解
+
+        手腕在夹爪中心: root_pos = finger_center - R @ offset (几何硬约束)
+        joint 固定为解析解: 精确匹配 MANO 指尖距离, 不参与优化
+        """
+        params = self._R_to_rotvec(init_R)  # 3 DOF 仅旋转
+        for _ in range(self.max_iter):
+            cost, residual = self._compute_residual(
+                params, mano_finger1, mano_finger2, R_target, finger_center, joint)
+            if cost < 1e-12:
+                break
+            jac = self._numerical_jacobian(
+                params, mano_finger1, mano_finger2, R_target, finger_center, joint)
+            JTJ = jac.T @ jac
+            JTr = jac.T @ residual
+            try:
+                delta = np.linalg.solve(JTJ + self.lm_lambda * np.eye(3), -JTr)
+            except np.linalg.LinAlgError:
+                break
+            params += delta
+        opt_R = self._rotvec_to_R(params[:3])
+        opt_root_pos = finger_center - opt_R @ np.array([_GRIPPER_DEPTH_OFFSET, 0.0, 0.0])
+        return opt_root_pos, opt_R, joint  # joint 固定为解析解
+
+    def _apply_smooth(self, mano_wrist, mano_finger1, mano_finger2):
+        """对 MANO 三个输入点做 EMA 平滑 (保证几何对齐不被破坏)"""
+        if self.smooth_wrist is None:
+            self.smooth_wrist = mano_wrist.copy()
+            self.smooth_finger1 = mano_finger1.copy()
+            self.smooth_finger2 = mano_finger2.copy()
+        else:
+            a = _GRIPPER_SMOOTH_ALPHA_POS
+            self.smooth_wrist = a * mano_wrist + (1 - a) * self.smooth_wrist
+            self.smooth_finger1 = a * mano_finger1 + (1 - a) * self.smooth_finger1
+            self.smooth_finger2 = a * mano_finger2 + (1 - a) * self.smooth_finger2
+        return self.smooth_wrist, self.smooth_finger1, self.smooth_finger2
+
+    def solve(self, mano_wrist, mano_finger1, mano_finger2, R_target):
+        """EMA 平滑 (MANO 点) + 解析法 + LM 优化
+
+        Args:
+            mano_wrist: MANO 关节 0 (手腕), shape (3,)
+            mano_finger1: MANO 关节 4 (拇指尖), shape (3,)
+            mano_finger2: MANO 关节 8 (食指尖), shape (3,)
+            R_target: MANO 手腕朝向 (SAPIEN 坐标系), shape (3,3)
+
+        Returns:
+            root_pos: base_link 世界位置, shape (3,)
+            root_quat: base_link 世界四元数, shape (4,)
+            joint1, joint2: 手指关节值 (对称)
+        """
+        # 1. 对 MANO 输入点做 EMA 平滑 (保证几何对齐)
+        sm_wrist, sm_f1, sm_f2 = self._apply_smooth(
+            mano_wrist, mano_finger1, mano_finger2)
+
+        # 2. 解析法初始解 (指尖对齐 + 手腕朝向, X⊥Y 100%)
+        init_root_pos, init_R, joint, finger_center = _compute_analytical_gripper_pose(
+            sm_wrist, sm_f1, sm_f2, prefix=self.prefix)
+        self._last_init_R = init_R.copy()
+
+        # 3. 直接使用解析解: 指尖误差 ~0.1mm, 朝向由手指几何决定
+        #    不做 LM 优化, 因为 R_target (MANO 手腕朝向) 和解析 R 可能差 15°+
+        #    优化器会为了追朝向而牺牲指尖对齐
+        opt_root_pos = init_root_pos
+        opt_R = init_R
+        opt_joint = joint
+
+        opt_root_quat = pr.quaternion_from_matrix(opt_R)
+        return opt_root_pos, opt_root_quat, opt_joint, opt_joint
+
+    def reset(self):
+        self.smooth_wrist = None
+        self.smooth_finger1 = None
+        self.smooth_finger2 = None
+
+
+class RetargetingSmoother:
+    """per-DOF-group EMA 平滑 + 帧间限幅
+
+    参考 do-as-i-do 的 cost hierarchy:
+      finger_pos_cost=10.0 > wrist_ori_cost=3.0 > wrist_pos_cost=0.3 > posture_cost=0.01
+    对应: finger alpha 高(快响应) > root_pos alpha 中 > root_rot alpha 低(强阻尼)
+
+    7 DOF 布局 (add_dummy_free_joint=True):
+      [0:3] = dummy_x/y/z_translation  (根平移)
+      [3:6] = dummy_x/y/z_rotation     (根旋转)
+      [6]   = finger_joint1             (手指关节)
+    """
+    MAX_ROOT_POS_DELTA = 0.01   # 根平移单轴帧间限幅 (1cm)
+    MAX_ROOT_ROT_DELTA = 0.05   # 根旋转单轴帧间限幅 (~3°)
+
+    def __init__(self, alpha_finger=0.5, alpha_root_pos=0.4, alpha_root_rot=0.25):
+        self.alpha_finger = alpha_finger
+        self.alpha_root_pos = alpha_root_pos
+        self.alpha_root_rot = alpha_root_rot
+        self.state = None
+
+    def smooth(self, qpos):
+        if self.state is None:
+            self.state = qpos.copy()
+            return qpos.copy()
+        result = qpos.copy()
+        # 根平移 [0:3]: EMA + 限幅
+        delta_pos = np.clip(qpos[0:3] - self.state[0:3],
+                            -self.MAX_ROOT_POS_DELTA, self.MAX_ROOT_POS_DELTA)
+        result[0:3] = self.state[0:3] + self.alpha_root_pos * delta_pos
+        # 根旋转 [3:6]: EMA + 限幅
+        delta_rot = np.clip(qpos[3:6] - self.state[3:6],
+                            -self.MAX_ROOT_ROT_DELTA, self.MAX_ROOT_ROT_DELTA)
+        result[3:6] = self.state[3:6] + self.alpha_root_rot * delta_rot
+        # 手指关节 [6:]: 仅 EMA, 不限幅
+        if len(qpos) > 6:
+            result[6:] = self.state[6:] + self.alpha_finger * (qpos[6:] - self.state[6:])
+        self.state = result.copy()
+        return result
+
+    def reset(self):
+        self.state = None
 
 # 夹爪 URDF 模板 (只有 gripper 部分, 无机械臂, 与 hand_track/render_gripper_only.py 一致)
 _GRIPPER_ONLY_URDF_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
@@ -307,55 +559,82 @@ def _generate_gripper_only_urdf(prefix="right"):
 
 
 def _compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, prefix="right"):
-    """从 MANO 3 个特征点计算夹爪 gripper_link 位姿和手指关节值
+    """从 MANO 3 个特征点计算夹爪位姿和手指关节值 (解析初始解)
 
-    与 hand_track/render_gripper_only.py 的 _compute_analytical_gripper_pose 一致:
-    方法: 加权 SVD (Procrustes) + 匹配指尖中点
-      1. 从 MANO 指尖距离计算手指关节值
-      2. 用加权 SVD 找最近正交旋转矩阵, Y 轴 (开合方向) 权重更高,
-         优先保证开合方向精确 (因为开合方向直接影响指尖位置)
-      3. 匹配两个指尖的中点确定 gripper_link 位置
+    核心原则 (URDF 约束保持):
+    - 夹爪中心 = (MANO4 + MANO8) / 2  (指尖中点, 夹爪跟随指尖位置)
+    - Y 轴 (开合方向) = 精确对齐 MANO4→MANO8
+    - X 轴 (指向方向) = MANO wrist→finger_center, Gram-Schmidt 正交化 (手腕跟随位姿)
+    - Z 轴 = cross(X, Y), 右手系
+    - 手腕 (base_link) = 夹爪中心后方 0.03689m, 在中心线上 (URDF 刚性)
 
-    关键: MANO 的指向方向 (wrist→finger_mid) 和开合方向 (finger1→finger2)
-    通常不正交。当它们非正交时, 标准 SVD 会均等折中, 导致两个方向都不精确。
-    给 Y 轴更高权重可以优先保证开合方向精确, 从而最小化指尖位置误差。
+    URDF 结构 (与 GalaxeaManipSim 一致):
+      gripper_base_link (=root) --0.03689m (沿 X 轴)--> finger_center
     """
-    W_Y = 5.0  # Y 轴 (开合方向) 权重, 越大越优先保证开合方向精确
-
-    # 1. 计算手指关节值
+    # 1. 计算手指关节值 (解析法, 对称, 不参与优化)
     v_finger = mano_finger2 - mano_finger1
     finger_dist = np.linalg.norm(v_finger)
-    required_open_sum = finger_dist - _FINGER_BASE_DIST
-    joint1 = max(0.0, min(0.05, required_open_sum / 2))
-    joint2 = max(0.0, min(0.05, required_open_sum / 2))
+    required_open = finger_dist - _FINGER_BASE_DIST
+    joint = max(0.0, min(0.05, required_open / 2))
 
-    # 2. 加权 SVD 最近正交旋转
-    finger_mid = (mano_finger1 + mano_finger2) / 2
-    pointing = finger_mid - mano_wrist
-    pointing = pointing / max(np.linalg.norm(pointing), 1e-6)
+    # 2. 夹爪中心 = MANO 指尖中点 (夹爪跟随指尖位置)
+    finger_center = (mano_finger1 + mano_finger2) / 2
 
-    y_sign = 1.0 if prefix == "right" else -1.0
-    opening = y_sign * v_finger / max(finger_dist, 1e-6)
+    # 3. Y 轴: 精确等于 MANO 开合方向 (finger1→finger2)
+    if finger_dist < 1e-8:
+        y_axis = np.array([0.0, 1.0, 0.0])
+    else:
+        y_axis = v_finger / finger_dist
 
-    gripper_x = np.array([1.0, 0.0, 0.0])
-    gripper_y = np.array([0.0, 1.0, 0.0])
+    # 4. X 轴: MANO wrist→finger_center 方向 (手腕跟随位姿)
+    v_point = finger_center - mano_wrist
+    v_point_norm = np.linalg.norm(v_point)
+    if v_point_norm < 1e-8:
+        x_raw = np.array([1.0, 0.0, 0.0])
+    else:
+        x_raw = v_point / v_point_norm
 
-    # 加权 Procrustes: 找 R 使得 R @ [gripper_x, w_y*gripper_y] ≈ [pointing, w_y*opening]
-    W = np.diag([1.0, W_Y])
-    A = np.column_stack([gripper_x, gripper_y]) @ W  # (3, 2)
-    B = np.column_stack([pointing, opening]) @ W      # (3, 2)
-    H = A @ B.T  # (3, 3)
-    U, S, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    root_R = Vt.T @ np.diag([1.0, 1.0, np.sign(d)]) @ U.T
+    # Gram-Schmidt: X ⊥ Y (100% 数学保证)
+    x_axis = x_raw - np.dot(x_raw, y_axis) * y_axis
+    x_norm = np.linalg.norm(x_axis)
+    if x_norm < 1e-8:
+        # X_raw 平行于 Y: 用世界参考构造正交基
+        world_ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(y_axis, world_ref)) > 0.99:
+            world_ref = np.array([0.0, 1.0, 0.0])
+        x_axis = np.cross(y_axis, world_ref)
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-8:
+            x_axis = np.array([1.0, 0.0, 0.0])
+            x_norm = 1.0
+    x_axis /= x_norm
 
-    # 3. 匹配指尖中点确定 gripper_link 位置
-    finger1_in_gripper = _FINGER1_ORIGIN + _FINGER1_AXIS * joint1
-    finger2_in_gripper = _FINGER2_ORIGIN + _FINGER2_AXIS * joint2
-    finger_mid_in_gripper = (finger1_in_gripper + finger2_in_gripper) / 2
-    root_pos = finger_mid - root_R @ finger_mid_in_gripper
+    # 5. Z 轴: 右手系, Z ⊥ X 且 Z ⊥ Y (100% 保证)
+    z_axis = np.cross(x_axis, y_axis)
+    z_axis /= np.linalg.norm(z_axis)
 
-    return root_pos, root_R, joint1, joint2
+    # 6. 旋转矩阵
+    R = np.column_stack([x_axis, y_axis, z_axis])
+
+    # 7. 手腕位置: base_link = 指尖中心 - R @ 深度偏移 (0.03689m, URDF 几何)
+    root_pos = finger_center - R @ np.array([_GRIPPER_DEPTH_OFFSET, 0.0, 0.0])
+
+    return root_pos, R, joint, finger_center
+
+
+def _get_gripper_pose_from_retargeting(retargeting, retarget_qpos, prefix):
+    """从 retargeting 优化器的正运动学获取夹爪位姿
+
+    与 hand_track/common.py 的实现一致: 使用 retargeting 内部机器人的 FK
+    """
+    internal_robot = retargeting.optimizer.robot
+    internal_robot.compute_forward_kinematics(retarget_qpos)
+    target_name = f"{prefix}_gripper_link"
+    for i, name in enumerate(internal_robot.link_names):
+        if name == target_name:
+            pose = internal_robot.get_link_pose(i)
+            return pose[:3, 3].copy(), pose[:3, :3].copy()
+    raise RuntimeError(f"内部机器人中找不到 {target_name}")
 
 
 def make_look_at_camera(eye, target, up=np.array([0, 0, 1.0])):
@@ -917,14 +1196,14 @@ def setup_physics_scene(ground_height=GROUND_HEIGHT):
     return scene
 
 
-def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, fast_collision=False):
+def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, fast_collision=False, collision_vis=False, material_json_path=None):
     """加载 GLB 场景并创建带碰撞体的物理物体
 
     与 load_glb_transformed() (02_render_scene.py) 的区别:
     - 物体为 dynamic (可被推动/抓取)
     - 添加碰撞体: CoACD 凸分解 (精确) 或凸包 (快速)
-    - 设置物理材质: friction=0.5, restitution=0.3
-    - 设置密度: OBJECT_DENSITY=1000 kg/m³
+    - 设置物理材质: 从 material.json 读取 (每物体独立), 无则使用默认值
+    - 设置密度: 从 material.json 读取 (每物体独立), 无则 OBJECT_DENSITY=1000
     - 支持碰撞体缓存 (避免重复计算 CoACD)
 
     Args:
@@ -933,6 +1212,7 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         scene: SAPIEN 场景实例
         logger: 日志记录器
         fast_collision: 是否使用快速凸包碰撞体 (调试用)
+        material_json_path: material.json 路径 (可选)
 
     Returns:
         list: SAPIEN actor 列表 (带碰撞体的动态物体)
@@ -952,8 +1232,10 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         size_mb = Path(glb_path).stat().st_size / 1024 / 1024
         logger.info(f"  GLB 文件: {glb_path} ({size_mb:.1f} MB)")
 
-    glb_cache_dir = Path(glb_path).parent / "physics_cache"
-    glb_cache_dir.mkdir(exist_ok=True)
+    # 缓存目录: 用 GLB 文件名哈希, 存储在项目 writable 目录下
+    script_dir = Path(__file__).parent
+    glb_cache_dir = script_dir / "physics_pipeline" / "output" / "physics_cache"
+    glb_cache_dir.mkdir(parents=True, exist_ok=True)
     glb_hash = f"{Path(glb_path).stem}_{Path(transform_params_path).stem}"
     if fast_collision:
         glb_hash += "_fast"
@@ -978,10 +1260,44 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
     if logger:
         logger.info(f"  GLB 坐标系: {glb_up_axis}{' (将转换到 Y-UP)' if need_zup_to_yup else ''}")
 
+    # 建立 geom_key → node_name 映射
+    geom_to_node = {}
+    for node_name in trimesh_scene.graph.nodes:
+        _, geom_key = trimesh_scene.graph[node_name]
+        geom_to_node[geom_key] = node_name
+
+    # 加载 material.json (每物体独立物理材质)
+    mat_config = {}
+    if material_json_path and Path(material_json_path).exists():
+        try:
+            with open(material_json_path) as f:
+                mat_config = json.load(f)
+            if logger:
+                logger.info(f"  加载 material.json: {len(mat_config)} 个物体材质")
+        except Exception as e:
+            if logger:
+                logger.warning(f"  material.json 加载失败: {e}, 使用默认材质")
+
+    def _get_material_params(real_name):
+        """从 material.json 查找物体的材质参数, 返回 (sf, df, rest, density)"""
+        parts = real_name.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            candidate = f"{parts[0]}_inst{parts[1]}"
+            if candidate in mat_config:
+                m = mat_config[candidate]
+                return (float(m.get("static_friction", 0.8)),
+                        float(m.get("dynamic_friction", 0.8)),
+                        float(m.get("restitution", 0.0)),
+                        float(m.get("density", OBJECT_DENSITY)))
+        return (0.8, 0.8, 0.0, OBJECT_DENSITY)
+
     obj_actors = []
     temp_files = []
 
     for geom_idx, (geom_name, geom) in enumerate(trimesh_scene.geometry.items()):
+        real_name = geom_to_node.get(geom_name, geom_name)
+        if not hasattr(geom, 'faces'):
+            continue
         vertices = geom.vertices.copy()
         faces = geom.faces.copy()
         if len(vertices) == 0 or len(faces) == 0:
@@ -1008,7 +1324,7 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         vertices_centered = vertices_sapien - centroid
 
         # 保存居中后的PLY (视觉+碰撞体都基于居中顶点)
-        temp_ply = f'/tmp/glb_physics_{os.getpid()}_{geom_name.replace(" ", "_")}.ply'
+        temp_ply = f'/tmp/glb_physics_{os.getpid()}_{real_name.replace(" ", "_")}.ply'
         geom_centered = trimesh.Trimesh(
             vertices=vertices_centered,
             faces=faces,
@@ -1020,10 +1336,12 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         builder = scene.create_actor_builder()
         builder.set_physx_body_type("kinematic")
 
+        # 从 material.json 获取该物体的物理材质参数
+        sf, df, rest, obj_density = _get_material_params(real_name)
         phys_material = scene.create_physical_material(
-            static_friction=0.8,
-            dynamic_friction=0.8,
-            restitution=0.0,
+            static_friction=sf,
+            dynamic_friction=df,
+            restitution=rest,
         )
 
         if avg_color is not None:
@@ -1037,83 +1355,250 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         else:
             builder.add_visual_from_file(filename=temp_ply)
         if logger:
-            logger.info(f"    ✓ {geom_name}: 视觉体已添加")
+                logger.info(f"    ✓ {real_name}: 视觉体已添加")
 
-        cache_file = glb_cache_dir / f"{glb_hash}_{geom_name.replace(' ', '_')}.npz"
+        cache_file = glb_cache_dir / f"{glb_hash}_{real_name.replace(' ', '_')}.pickle"
 
         collision_ok = False
+        collision_vis_plys = []  # 碰撞体可视化PLY路径集合
+
         if fast_collision:
             try:
                 builder.add_convex_collision_from_file(filename=temp_ply, material=phys_material)
                 collision_ok = True
+                collision_vis_plys.append(temp_ply)
                 if logger:
-                    logger.info(f"    ✓ {geom_name}: 凸包碰撞体 (fast mode)")
+                    logger.info(f"    ✓ {real_name}: 凸包碰撞体 (fast mode)")
             except Exception as e:
                 if logger:
-                    logger.warning(f"    ✗ {geom_name}: 凸包碰撞失败 ({e}), 尝试非凸")
+                    logger.warning(f"    ✗ {real_name}: 凸包碰撞失败 ({e}), 尝试非凸")
                 try:
                     builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
                     collision_ok = True
+                    collision_vis_plys.append(temp_ply)
                 except Exception as e2:
                     if logger:
-                        logger.warning(f"    ✗ {geom_name}: 碰撞体生成失败 ({e2})")
+                        logger.warning(f"    ✗ {real_name}: 碰撞体生成失败 ({e2})")
         elif cache_file.exists():
             try:
-                cache_data = np.load(str(cache_file), allow_pickle=True)
-                convex_parts = cache_data['convex_parts'].item()
-                for part_verts, part_faces in convex_parts:
+                with open(cache_file, 'rb') as f:
+                    convex_parts = pickle.load(f)
+                for part_i, (part_verts, part_faces) in enumerate(convex_parts):
                     # 居中碰撞体顶点(与视觉体一致)
                     part_verts_centered = part_verts - centroid
-                    part_ply = f'/tmp/glb_physics_part_{os.getpid()}_{geom_idx}.ply'
+                    part_ply = f'/tmp/glb_physics_part_{os.getpid()}_{geom_idx}_p{part_i}.ply'
                     part_mesh = trimesh.Trimesh(vertices=part_verts_centered, faces=part_faces)
                     part_mesh.export(part_ply)
                     temp_files.append(part_ply)
                     builder.add_convex_collision_from_file(filename=part_ply, material=phys_material)
+                    # 碰撞体可视化PLY (每个凸部件对应不同的PLY)
+                    if collision_vis:
+                        vis_ply = f'/tmp/glb_physics_vis_{os.getpid()}_{geom_idx}_p{part_i}.ply'
+                        part_mesh.export(vis_ply)
+                        temp_files.append(vis_ply)
+                        collision_vis_plys.append(vis_ply)
                 collision_ok = True
                 if logger:
-                    logger.info(f"    ✓ {geom_name}: 缓存碰撞体 ({len(convex_parts)} 凸部件)")
+                    logger.info(f"    ✓ {real_name}: 缓存碰撞体 ({len(convex_parts)} 凸部件)")
             except Exception as e:
                 if logger:
-                    logger.warning(f"    ✗ {geom_name}: 缓存加载失败 ({e}), 重新计算 CoACD")
+                    logger.warning(f"    ✗ {real_name}: 缓存加载失败 ({e}), 重新计算 CoACD")
+                # 缓存加载失败, 重新运行 CoACD 并保存到缓存
+                coacd_imported = False
                 try:
-                    builder.add_multiple_convex_collisions_from_file(
-                        filename=temp_ply, decomposition="coacd", material=phys_material,
-                    )
+                    from coacd import Mesh as CoacdMesh, run_coacd as run_coacd_fn
+                    coacd_imported = True
+                except ImportError:
+                    pass
+                if coacd_imported:
+                    try:
+                        coacd_mesh = CoacdMesh(vertices_sapien.astype(np.float64, copy=False),
+                                               faces.astype(np.int32, copy=False))
+                        coacd_result = run_coacd_fn(coacd_mesh,
+                                                    max_convex_hull=5,
+                                                    resolution=500,
+                                                    mcts_iterations=30)
+                        convex_parts = [(np.array(v, dtype=np.float64),
+                                         np.array(f, dtype=np.int32))
+                                        for v, f in coacd_result]
+                        for part_i, (part_verts, part_faces) in enumerate(convex_parts):
+                            part_verts_centered = part_verts - centroid
+                            part_ply = f'/tmp/glb_physics_part_{os.getpid()}_{geom_idx}_p{part_i}.ply'
+                            part_mesh = trimesh.Trimesh(vertices=part_verts_centered, faces=part_faces)
+                            part_mesh.export(part_ply)
+                            temp_files.append(part_ply)
+                            builder.add_convex_collision_from_file(filename=part_ply, material=phys_material)
+                            if collision_vis:
+                                vis_ply = f'/tmp/glb_physics_vis_{os.getpid()}_{geom_idx}_p{part_i}.ply'
+                                part_mesh.export(vis_ply)
+                                temp_files.append(vis_ply)
+                                collision_vis_plys.append(vis_ply)
+                        # 保存到缓存 (用 pickle 支持变长凸部件)
+                        with open(cache_file, 'wb') as f:
+                            pickle.dump(convex_parts, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        collision_ok = True
+                        if logger:
+                            logger.info(f"    ✓ {real_name}: CoACD 缓存已更新 ({len(convex_parts)} 凸部件)")
+                    except Exception as e2:
+                        if logger:
+                            logger.warning(f"    ✗ {real_name}: coacd 包失败 ({e2}), 回退 SAPIEN CoACD")
+                        try:
+                            builder.add_multiple_convex_collisions_from_file(
+                                filename=temp_ply, decomposition="coacd", material=phys_material,
+                                decomposition_params=dict(max_convex_hull=5, resolution=500, mcts_iterations=30),
+                            )
+                            collision_ok = True
+                            collision_vis_plys.append(temp_ply)
+                        except Exception as e3:
+                            if logger:
+                                logger.warning(f"    ✗ {real_name}: SAPIEN CoACD 也失败 ({e3}), 尝试非凸碰撞")
+                            try:
+                                builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
+                                collision_ok = True
+                                collision_vis_plys.append(temp_ply)
+                            except Exception as e4:
+                                if logger:
+                                    logger.warning(f"    ✗ {real_name}: 碰撞体生成失败 ({e4})")
+                else:
+                    try:
+                        builder.add_multiple_convex_collisions_from_file(
+                            filename=temp_ply, decomposition="coacd", material=phys_material,
+                            decomposition_params=dict(max_convex_hull=5, resolution=500, mcts_iterations=30),
+                        )
+                        collision_ok = True
+                        collision_vis_plys.append(temp_ply)
+                        if logger:
+                            logger.info(f"    ✓ {real_name}: CoACD 碰撞体已生成 (未缓存, 缺少coacd库)")
+                    except Exception as e2:
+                        if logger:
+                            logger.warning(f"    ✗ {real_name}: CoACD 失败 ({e2}), 尝试非凸碰撞")
+                        try:
+                            builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
+                            collision_ok = True
+                            collision_vis_plys.append(temp_ply)
+                        except Exception as e3:
+                            if logger:
+                                logger.warning(f"    ✗ {real_name}: 碰撞体生成失败 ({e3})")
+        else:
+            # CACHE MISS: 使用 coacd 包运行凸分解, 保存到缓存, 逐个添加到 builder
+            coacd_imported = False
+            try:
+                from coacd import Mesh as CoacdMesh, run_coacd as run_coacd_fn
+                coacd_imported = True
+            except ImportError:
+                pass
+            if coacd_imported:
+                try:
+                    coacd_mesh = CoacdMesh(vertices_sapien.astype(np.float64, copy=False),
+                                           faces.astype(np.int32, copy=False))
+                    coacd_result = run_coacd_fn(coacd_mesh,
+                                                max_convex_hull=5,
+                                                resolution=500,
+                                                mcts_iterations=30)
+                    convex_parts = [(np.array(v, dtype=np.float64),
+                                     np.array(f, dtype=np.int32))
+                                    for v, f in coacd_result]
+                    # 先逐个添加凸部件到 builder (即使后续缓存保存失败, 碰撞体已生效)
+                    for part_i, (part_verts, part_faces) in enumerate(convex_parts):
+                        part_verts_centered = part_verts - centroid
+                        part_ply = f'/tmp/glb_physics_part_{os.getpid()}_{geom_idx}_p{part_i}.ply'
+                        part_mesh = trimesh.Trimesh(vertices=part_verts_centered, faces=part_faces)
+                        part_mesh.export(part_ply)
+                        temp_files.append(part_ply)
+                        builder.add_convex_collision_from_file(filename=part_ply, material=phys_material)
+                        if collision_vis:
+                            vis_ply = f'/tmp/glb_physics_vis_{os.getpid()}_{geom_idx}_p{part_i}.ply'
+                            part_mesh.export(vis_ply)
+                            temp_files.append(vis_ply)
+                            collision_vis_plys.append(vis_ply)
+                    # 全部添加成功后保存到缓存 (用 pickle 支持变长凸部件)
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(convex_parts, f, protocol=pickle.HIGHEST_PROTOCOL)
                     collision_ok = True
                     if logger:
-                        logger.info(f"    ✓ {geom_name}: CoACD 碰撞体已生成")
-                except Exception as e2:
+                        logger.info(f"    ✓ {real_name}: CoACD 缓存已保存 ({len(convex_parts)} 凸部件)")
+                except Exception as e:
                     if logger:
-                        logger.warning(f"    ✗ {geom_name}: CoACD 失败 ({e2}), 尝试非凸碰撞")
+                        logger.warning(f"    ✗ {real_name}: coacd 包失败 ({e}), 回退 SAPIEN CoACD")
+                    try:
+                        builder.add_multiple_convex_collisions_from_file(
+                            filename=temp_ply, decomposition="coacd", material=phys_material,
+                            decomposition_params=dict(max_convex_hull=5, resolution=500, mcts_iterations=30),
+                        )
+                        collision_ok = True
+                        collision_vis_plys.append(temp_ply)
+                    except Exception as e2:
+                        if logger:
+                            logger.warning(f"    ✗ {real_name}: SAPIEN CoACD 也失败 ({e2}), 尝试非凸碰撞")
+                        try:
+                            builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
+                            collision_ok = True
+                            collision_vis_plys.append(temp_ply)
+                        except Exception as e3:
+                            if logger:
+                                logger.warning(f"    ✗ {real_name}: 碰撞体生成失败 ({e3})")
+            else:
+                # coacd 包未安装, 使用 SAPIEN 内部 CoACD (不缓存)
+                try:
+                    builder.add_multiple_convex_collisions_from_file(
+                        filename=temp_ply,
+                        decomposition="coacd",
+                        material=phys_material,
+                        decomposition_params=dict(max_convex_hull=5, resolution=500, mcts_iterations=30),
+                    )
+                    collision_ok = True
+                    collision_vis_plys.append(temp_ply)
+                    if logger:
+                        logger.info(f"    ✓ {real_name}: CoACD 碰撞体已生成 (未缓存, 缺少coacd库)")
+                except Exception as e:
+                    if logger:
+                        logger.warning(f"    ✗ {real_name}: CoACD 失败 ({e}), 尝试非凸碰撞")
                     try:
                         builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
                         collision_ok = True
-                    except Exception as e3:
+                        collision_vis_plys.append(temp_ply)
+                    except Exception as e2:
                         if logger:
-                            logger.warning(f"    ✗ {geom_name}: 碰撞体生成失败 ({e3})")
-        else:
-            try:
-                builder.add_multiple_convex_collisions_from_file(
-                    filename=temp_ply,
-                    decomposition="coacd",
-                    material=phys_material,
-                )
-                collision_ok = True
-                if logger:
-                    logger.info(f"    ✓ {geom_name}: CoACD 碰撞体已生成")
-            except Exception as e:
-                if logger:
-                    logger.warning(f"    ✗ {geom_name}: CoACD 失败 ({e}), 尝试非凸碰撞")
-                try:
-                    builder.add_nonconvex_collision_from_file(filename=temp_ply, material=phys_material)
-                    collision_ok = True
-                except Exception as e2:
-                    if logger:
-                        logger.warning(f"    ✗ {geom_name}: 碰撞体生成失败 ({e2})")
+                            logger.warning(f"    ✗ {real_name}: 碰撞体生成失败 ({e2})")
 
         if not collision_ok:
             if logger:
-                logger.warning(f"    ⚠ {geom_name}: 无碰撞体, 仅添加视觉体")
+                logger.warning(f"    ⚠ {real_name}: 无碰撞体, 仅添加视觉体")
+
+        # 碰撞体可视化: 叠加到主builder上(同actor, 跟随物体运动)
+        # PLY无顶点颜色时用material的base_color显示半透明红色
+        if collision_vis and collision_vis_plys:
+            vis_mat = sapien.render.RenderMaterial(
+                base_color=[1.0, 0.0, 0.0, 0.3], metallic=0.0, roughness=0.5,
+            )
+            n_added = 0
+            for ply_path in collision_vis_plys:
+                if not os.path.exists(ply_path):
+                    if logger:
+                        logger.warning(f"    ⚠ {real_name}: 碰撞体可视化文件不存在: {ply_path}")
+                    continue
+                try:
+                    # 检查PLY是否有顶点颜色, 有则重新导出无颜色版本(让material生效)
+                    ply_mesh = trimesh.load(ply_path)
+                    has_vc = (hasattr(ply_mesh.visual, 'vertex_colors') and
+                              ply_mesh.visual.vertex_colors is not None)
+                    if has_vc:
+                        clean_ply = f'/tmp/glb_physics_vis_clean_{os.getpid()}_{real_name}.ply'
+                        trimesh.Trimesh(vertices=ply_mesh.vertices, faces=ply_mesh.faces).export(clean_ply)
+                        temp_files.append(clean_ply)
+                        builder.add_visual_from_file(filename=clean_ply, material=vis_mat)
+                    else:
+                        # 注意: SAPIEN 的 add_visual_from_file 要求文件存在且为有效三角网格
+                        builder.add_visual_from_file(filename=ply_path, material=vis_mat)
+                    n_added += 1
+                except Exception as vis_err:
+                    if logger:
+                        logger.warning(f"    ⚠ {real_name}: 碰撞体可视化添加失败 ({vis_err}), 路径={ply_path}")
+            if logger:
+                if n_added == len(collision_vis_plys):
+                    logger.info(f"    ✓ {real_name}: 碰撞体可视化添加成功 ({n_added}个, 共{len(collision_vis_plys)}个PLY)")
+                else:
+                    logger.warning(f"    ⚠ {real_name}: 碰撞体可视化部分添加 ({n_added}/{len(collision_vis_plys)})")
 
         # 判断几何体类型: 大型扁平几何体(桌面/地板)设为kinematic, 小物体设为dynamic
         # 启发式: 体积>0.01m³ 或 最长边>0.5m 且 扁平度(Z范围/XY范围<0.3) → 场景固定结构
@@ -1129,14 +1614,14 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
         if is_scene_structure:
             # 场景固定结构(桌面/地板/墙壁): kinematic, 不受重力影响
             builder.set_physx_body_type("kinematic")
-            actor = builder.build(name=f"glb_{geom_name}")
+            actor = builder.build(name=f"glb_{real_name}")
             actor.set_pose(sapien.Pose(p=centroid.tolist(), q=[1, 0, 0, 0]))
             if logger:
-                logger.info(f"    → {geom_name}: kinematic (场景结构, vol={volume:.4f}m³, flat={flatness:.2f})")
+                logger.info(f"    → {real_name}: kinematic (场景结构, vol={volume:.4f}m³, flat={flatness:.2f})")
         else:
             # 可交互物体(杯子/书本等): dynamic, 可被推动/抓取
             builder.set_physx_body_type("dynamic")
-            actor = builder.build(name=f"glb_{geom_name}")
+            actor = builder.build(name=f"glb_{real_name}")
             actor.set_pose(sapien.Pose(p=centroid.tolist(), q=[1, 0, 0, 0]))
             # 应用质量 (参考 GalaxeaManipSim: 质量下限 0.1kg, 防轻物被碰飞)
             obj_mass = max(volume * OBJECT_DENSITY, 0.1)
@@ -1145,7 +1630,7 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, logger=None, f
                     comp.mass = obj_mass
                     break
             if logger:
-                logger.info(f"    → {geom_name}: dynamic (可交互, vol={volume:.4f}m³, flat={flatness:.2f}, mass={obj_mass:.3f}kg)")
+                logger.info(f"    → {real_name}: dynamic (可交互, vol={volume:.4f}m³, flat={flatness:.2f}, mass={obj_mass:.3f}kg)")
 
         obj_actors.append(actor)
 
@@ -1430,6 +1915,7 @@ class PhysicsSimulator:
     def __init__(self, hawor_dir, ras_dir, transform_params_path,
                  output="physics_sim.mp4", fps=30, hand_idx=0,
                  logger=None, viewer=False, crf=18, fast_collision=False,
+                 collision_vis=False,
                  hide_hand=False, speed=1.0,
                  cam_width=CAM_WIDTH, cam_height=CAM_HEIGHT, smooth=1,
                  two_pass=False, support_table=True,
@@ -1468,6 +1954,7 @@ class PhysicsSimulator:
         self.viewer = viewer
         self.crf = crf
         self.fast_collision = fast_collision
+        self.collision_vis = collision_vis
         self.hide_hand = hide_hand
         self.speed = speed
         self.cam_width = cam_width
@@ -1536,6 +2023,16 @@ class PhysicsSimulator:
             pose = actor.get_pose()
             p = np.array(pose.p)
             self.logger.info(f"    {actor.get_name()}: pos=({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f})")
+
+    def _log_gripper_pose(self, robot, label="夹爪位姿"):
+        if not self.logger or not robot:
+            return
+        pose = robot.get_root_pose()
+        p = np.array(pose.p)
+        q = np.array(pose.q)
+        self.logger.info(f"  ── {label} ──")
+        self.logger.info(f"    root_pos=({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f})")
+        self.logger.info(f"    root_quat=({q[0]:+.4f}, {q[1]:+.4f}, {q[2]:+.4f}, {q[3]:+.4f})")
 
     def _log_coordinate_diagnosis(self, hawor_data, mano_layer, obj_actors, start_frame=0):
         if not self.logger:
@@ -1864,14 +2361,15 @@ class PhysicsSimulator:
                             )
 
         # 禁用手指之间的自碰撞 + realsense_link 碰撞 (修复夹爪不对称打开)
-        # 原因: finger1-finger2 自碰撞会把 joint1 卡在 0, joint2 过冲; realsense_link 与手指碰撞
+        # 原因: finger1-finger2 自碰撞会把 joint1 卡在 0, joint2 过冲; gripper_link 碰撞同理
         # SRDF (robot.srdf) 已声明手指互不碰撞, 但 loader.load() 未传 SRDF, 声明未生效
         # 用 set_collision_groups API:
         #   - ignore group (g2) + 相同 id (g3): 两 shape 互相忽略碰撞
         #   - [0,0,0,0]: 完全不参与任何碰撞
         finger_ignore_bit = 1 << 0  # bit 0
         finger_ignore_id = 1
-        finger_link_names = {"right_gripper_finger_link1", "right_gripper_finger_link2"}
+        finger_link_names = {"right_gripper_finger_link1", "right_gripper_finger_link2",
+                             "right_gripper_link"}
         for link in robot.get_links():
             if link.get_name() in finger_link_names:
                 for component in link.entity.components:
@@ -2239,13 +2737,13 @@ class PhysicsSimulator:
         return positions
 
     def run_single_gripper_tracking(self, start_frame=0, num_frames=-1):
-        """单夹爪模式: 只加载夹爪URDF (无机械臂), 直接用MANO手腕位姿驱动夹爪
+        """单夹爪模式: 只加载夹爪URDF (无机械臂), 通过 Dex Retargeting 优化器驱动夹爪
 
         与 run_physics_tracking 的区别:
-        - 无机械臂, 无 IK, 无 Dex Retargeting
-        - 夹爪 root 位姿直接从 MANO 手腕/指尖解析计算 (_compute_analytical_gripper_pose)
-        - 夹爪手指关节从 MANO 指尖距离计算
-        - 物理仿真: 夹爪可碰撞/推动 GLB 物体, 但夹爪本身用 set_root_pose + set_qpos 控制
+        - 无机械臂, 无 IK
+        - 夹爪 root 位姿从 Dex Retargeting 优化器 FK 获取
+        - 夹爪手指 PD 驱动 (set_drive_target), 不调用 set_qpos
+        - 物理仿真: 夹爪可碰撞/推动 GLB 物体, 夹爪 root 用 set_root_pose 跟踪优化器输出
 
         参考: hand_track/render_gripper_only.py 的 --mode gripper
 
@@ -2286,12 +2784,14 @@ class PhysicsSimulator:
                     self.logger.info(f"  桌面/地面高度: {ground_height:.4f}m")
             except Exception as e:
                 self.logger.info(f"  ⚠ 支撑面计算失败: {e}")
-        self.scene = setup_physics_scene(ground_height=ground_height)
+        self.scene = setup_physics_scene(ground_height=GROUND_HEIGHT)  # 单夹爪用 -0.5m 兜底地面, 避免桌面碰撞干扰
         internal_scene = self.scene.render_system._internal_scene
         context = sapien.render.SapienRenderer()._internal_context
 
-        # 桌面支撑 (可选)
-        if self.support_table:
+        # 桌面支撑 (已注释: 位置不对, GLB 自带桌面, 用不可见地面支撑即可)
+        # 不可见物理地面 (setup_physics_scene 中 add_ground) 提供碰撞支撑
+        # 如果要恢复, 改 `if False` 为 `if self.support_table`
+        if False:
             table_builder = self.scene.create_actor_builder()
             table_mat = sapien.render.RenderMaterial()
             table_color = np.array([0.55, 0.45, 0.35, 1.0])
@@ -2302,8 +2802,10 @@ class PhysicsSimulator:
             if support_plane is not None:
                 extent = support_plane['extent_xy']
                 center = support_plane['center_xy']
-                table_half_x = max(0.15, extent[0] / 2 + 0.15)
-                table_half_y = max(0.15, extent[1] / 2 + 0.15)
+                # 桌子大小 = GLB物体范围 + 0.15m 边缘, 限制最大半尺寸 0.35m (0.7m总宽)
+                # 避免场景中大结构(墙壁/地面)让桌子变得巨大挡住相机
+                table_half_x = min(0.35, extent[0] / 2 + 0.15)
+                table_half_y = min(0.35, extent[1] / 2 + 0.15)
                 table_center_xy = center
             else:
                 table_half_x = 0.5
@@ -2322,7 +2824,8 @@ class PhysicsSimulator:
         glb_actors = []
         if glb_path is not None and glb_path.exists() and self.transform_params_path.exists() and trimesh is not None:
             glb_actors = load_glb_with_physics(glb_path, self.transform_params_path, self.scene,
-                                                logger=self.logger, fast_collision=self.fast_collision)
+                                                logger=self.logger, fast_collision=self.fast_collision,
+                                                collision_vis=self.collision_vis)
             self.logger.info(f"  加载 {len(glb_actors)} 个 GLB 物体")
             if glb_actors:
                 self._log_object_positions(glb_actors, "GLB物体初始位置")
@@ -2347,7 +2850,7 @@ class PhysicsSimulator:
             axes_origin = np.array([support_plane['center_xy'][0], support_plane['center_xy'][1], ground_height + 0.01])
         else:
             axes_origin = np.array([0.0, 0.0, ground_height + 0.01])
-        self._axes_nodes = self._create_axes_actors(context, internal_scene, axes_origin)
+        # self._axes_nodes = self._create_axes_actors(context, internal_scene, axes_origin)
         self.logger.info(f"  坐标轴可视化: origin={axes_origin}")
 
         # [3/6] 加载夹爪 URDF (只有夹爪, 无机械臂)
@@ -2365,9 +2868,14 @@ class PhysicsSimulator:
         gripper_idx2 = joint_names.index(f"{prefix}_gripper_finger_joint2")
         self.logger.info(f"  夹爪关节: {joint_names}")
 
-        # 设置 PD 驱动属性 (高刚度跟踪目标)
+        # 设置 PD 驱动属性: 臂关节使用 JOINT_STIFFNESS/DAMPING (大质量, 需高阻尼)
+        # 夹爪关节使用 GRIPPER_STIFFNESS/DAMPING (轻质量, 接近临界阻尼)
         for joint in active_joints:
-            joint.set_drive_property(stiffness=GRIPPER_STIFFNESS, damping=GRIPPER_DAMPING)
+            is_gripper = "finger" in joint.name
+            if is_gripper:
+                joint.set_drive_property(stiffness=GRIPPER_STIFFNESS, damping=GRIPPER_DAMPING)
+            else:
+                joint.set_drive_property(stiffness=JOINT_STIFFNESS, damping=JOINT_DAMPING)
 
         # 初始夹爪开合
         init_qpos = robot.get_qpos().copy()
@@ -2386,10 +2894,16 @@ class PhysicsSimulator:
                         component.physx_material = self.scene.create_physical_material(
                             static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
 
-        # 禁用手指之间的自碰撞 (修复夹爪不对称打开, 与全臂模式一致)
+        # 禁用夹爪内部碰撞: 手指与手指、手指与夹爪本体通过 collision group 过滤
+        # 原因: STL 碰撞体几何复杂, 手指闭合时与 gripper_link 碰撞导致求解器
+        # 产生不对称响应 (j1→0.0, j2→0.05), 使 PD 控制器无法收敛
         finger_ignore_bit = 1 << 0
         finger_ignore_id = 1
-        finger_link_names_single = {f"{prefix}_gripper_finger_link1", f"{prefix}_gripper_finger_link2"}
+        finger_link_names_single = {
+            f"{prefix}_gripper_finger_link1",
+            f"{prefix}_gripper_finger_link2",
+            f"{prefix}_gripper_link",
+        }
         for link in robot.get_links():
             if link.get_name() in finger_link_names_single:
                 for component in link.entity.components:
@@ -2403,6 +2917,19 @@ class PhysicsSimulator:
         # 物理稳定化: 让物体落稳
         for _ in range(200):
             self.scene.step()
+
+        self._log_gripper_pose(robot, "夹爪初始位姿 (warm-up后)")
+
+        # [3.5/6] 初始化单夹爪迭代 IK 优化器 (替代 Dex Retargeting)
+        self.logger.info("\n[3.5/6] 初始化单夹爪 IK 优化器 ...")
+        prefix = "right"
+        self.gripper_ik = GripperIKOptimizer(robot, prefix=prefix)
+        self.logger.info(f"  ✓ GripperIKOptimizer 初始化完成")
+        self.logger.info(f"  EMA 平滑: pos_alpha={_GRIPPER_SMOOTH_ALPHA_POS}, "
+                         f"rot_alpha={_GRIPPER_SMOOTH_ALPHA_ROT}, joint_alpha={_GRIPPER_SMOOTH_ALPHA_JOINT}")
+        self.logger.info(f"  方法: 解析法+LM优化 (Y轴=MANO开合方向, X轴=MANO wrist→指尖方向+Gram-Schmidt, 深度{_GRIPPER_DEPTH_OFFSET:.5f}m)")
+        self.logger.info(f"  LM优化: 5次迭代, cost=10*指尖+3*朝向, 3DOF(仅旋转), joint固定为解析解, 手腕在夹爪中心(几何约束)")
+        self.logger.info(f"  URDF 刚性: 手腕(base_link)在夹爪中心线上, 夹爪只开合, root速度每帧清零")
 
         # [4/6] 预计算手腕位置 (用于相机中心)
         self.logger.info("\n[4/6] 预计算手腕位置 ...")
@@ -2443,11 +2970,38 @@ class PhysicsSimulator:
         render_fps = self.fps
         frame_repeat = max(1, round(1.0 / self.speed))
 
+        # ── Warm start: 用第一帧解析位姿验证数据 ──
+        self.logger.info("\n  Warm start (用解析法验证第一帧) ...")
+        prefix = "right"  # 单夹爪 URDF 始终使用 right 前缀
+        for probe_idx in range(num_frames):
+            g_idx = start_frame + probe_idx
+            if not hawor_data["pred_valid"][g_idx]:
+                continue
+            rot = hawor_data["pred_rot"][g_idx]
+            trans = hawor_data["pred_trans"][g_idx]
+            hand_pose = hawor_data["pred_hand_pose"][g_idx]
+            if np.any(np.isnan(rot)) or np.any(np.isnan(trans)) or np.any(np.isnan(hand_pose)):
+                continue
+            _, j = compute_mano_joints(mano_layer, rot, hand_pose, trans)
+            joints_wrist = self._render_to_sapien(j)
+            mano_wrist = joints_wrist[0, :3]
+            mano_finger1 = joints_wrist[4, :3]
+            mano_finger2 = joints_wrist[8, :3]
+            # MANO 手腕朝向 (SAPIEN 坐标系, pred_rot 是轴角→转旋转矩阵)
+            R_mano = GripperIKOptimizer._rotvec_to_R(rot)
+            R_mano_target = RXWORLD_TO_SAPIEN @ R_mano
+            root_pos, root_quat, j1, j2 = self.gripper_ik.solve(
+                mano_wrist, mano_finger1, mano_finger2, R_mano_target)
+
+            robot.set_root_pose(sapien.Pose(root_pos.tolist(), root_quat.tolist()))
+            self.logger.info(f"  ✓ Warm start 完成 (帧 {g_idx}), root_pos={np.round(root_pos, 4)}, j1={j1:.4f}")
+            break
+
         if self.viewer:
             from sapien.utils import Viewer
             viewer = Viewer()
             viewer.set_scene(self.scene)
-            viewer.control_window.show_origin_frame = True
+            viewer.control_window.show_origin_frame = False
             viewer.control_window.show_grid = False
             viewer_cam_pos = scene_center + np.array([-0.3, -0.3, 0.3])
             viewer.set_camera_xyz(x=viewer_cam_pos[0], y=viewer_cam_pos[1], z=viewer_cam_pos[2])
@@ -2457,16 +3011,40 @@ class PhysicsSimulator:
                                      (camera.get_width(), camera.get_height()))
             self.logger.info(f"  视频帧率: {render_fps}fps (speed={self.speed}x, 每帧重复{frame_repeat}次)")
 
-        # MANO 关节索引: 拇指尖=4, 食指尖=8, 手腕=0
-        ref_indices = [4, 8]
+        # 渲染参考点 (MANO 骨架)
+        kp_nodes = []
+        skel_nodes = []
+
+        # 保存 GLB 稳定后的初始位姿 (用于 viewer 循环重放时重置)
+        glb_init_poses = [actor.get_pose() for actor in glb_actors] if glb_actors else []
 
         animation_loop = True
         while animation_loop:
             if not self.viewer:
                 animation_loop = False
 
+            # 每次循环前重置 GLB 物体到稳定后的初始位姿 (尤其是 viewer 逐帧重放时)
+            if glb_actors and glb_init_poses:
+                for actor, init_pose in zip(glb_actors, glb_init_poses):
+                    actor.set_pose(init_pose)
+                # 物理解算几步让接触稳定
+                for _ in range(10):
+                    self.scene.step()
+
+            # 重置夹爪到张开初始位置
+            robot.set_root_pose(sapien.Pose([0, 0, 0], [1, 0, 0, 0]))
+            qpos = robot.get_qpos().copy()
+            qpos[gripper_idx1] = GRIPPER_INIT_OPEN
+            qpos[gripper_idx2] = GRIPPER_INIT_OPEN
+            robot.set_qpos(qpos)
+            for i, j_idx in enumerate([gripper_idx1, gripper_idx2]):
+                robot.get_active_joints()[j_idx].set_drive_target(qpos[j_idx])
+            for _ in range(30):
+                self.scene.step()
+
             for local_idx in trange(num_frames, desc="单夹爪渲染", disable=False):
                 global_idx = start_frame + local_idx
+                prefix = "right"  # 单夹爪 URDF 始终使用 right 前缀, 用于 retargeting FK
 
                 # 相机更新 (仅 fpv 模式)
                 if self.view == "fpv" and R_c2w_all is not None and t_c2w_all is not None:
@@ -2479,34 +3057,88 @@ class PhysicsSimulator:
                                                hawor_data["pred_hand_pose"][global_idx], hawor_data["pred_trans"][global_idx])
                     joints_sapien = self._render_to_sapien(j)
 
+                    # 渲染 MANO 参考点 (紫色小球) 和骨架线 (受 --hide-hand 控制)
+                    if not self.hide_hand:
+                        kp_nodes = self._render_keypoints(joints_sapien[:, :3], context, internal_scene, kp_nodes,
+                                                          ref_indices=[0, 4, 8])
+                        skel_nodes = self._render_hand_skeleton(joints_sapien[:, :3], context, internal_scene, skel_nodes)
+
+                    # ── 优化器: MANO 参考点 → 7 DOF (root_pose 6 + finger 1) ──
+                    # URDF 约束保持: 手腕和夹爪通过 URDF 刚体连接, 优化器在约束内求解
                     mano_wrist = joints_sapien[0, :3]
-                    mano_finger1 = joints_sapien[ref_indices[0], :3]
-                    mano_finger2 = joints_sapien[ref_indices[1], :3]
+                    mano_finger1 = joints_sapien[4, :3]
+                    mano_finger2 = joints_sapien[8, :3]
+                    # MANO 手腕朝向 (SAPIEN 坐标系, pred_rot 是轴角→转旋转矩阵)
+                    R_mano = GripperIKOptimizer._rotvec_to_R(hawor_data["pred_rot"][global_idx])
+                    R_mano_target = RXWORLD_TO_SAPIEN @ R_mano
+                    root_pos, root_quat, gripper_j1, gripper_j2 = self.gripper_ik.solve(
+                        mano_wrist, mano_finger1, mano_finger2, R_mano_target)
 
-                    # 解析计算夹爪位姿和手指关节
-                    root_pos, root_R, joint1, joint2 = _compute_analytical_gripper_pose(
-                        mano_wrist, mano_finger1, mano_finger2, prefix=mano_side)
-                    root_quat = pr.quaternion_from_matrix(root_R)
+                    finger_dist = np.linalg.norm(mano_finger1 - mano_finger2)
+                    R_root_ik = pr.matrix_from_quaternion(root_quat)
+                    ik_f1 = root_pos + R_root_ik @ (_FINGER1_ORIGIN + gripper_j1 * _FINGER1_AXIS)
+                    ik_f2 = root_pos + R_root_ik @ (_FINGER2_ORIGIN + gripper_j2 * _FINGER2_AXIS)
+                    ik_err1 = np.linalg.norm(ik_f1 - mano_finger1) * 1000
+                    ik_err2 = np.linalg.norm(ik_f2 - mano_finger2) * 1000
+                    ik_err_avg = (ik_err1 + ik_err2) / 2
+                    # 检查旋向误差
+                    R_analytical = self.gripper_ik._last_init_R if hasattr(self.gripper_ik, '_last_init_R') else None
+                    if R_analytical is not None:
+                        ori_err = GripperIKOptimizer._orientation_error(R_root_ik, R_mano_target)
+                        ori_err_deg = ori_err * 180 / np.pi
+                    else:
+                        ori_err_deg = 0.0
+                    self.logger.info(f"  帧 {global_idx}: root_pos={np.round(root_pos, 4)}, "
+                                     f"j1={gripper_j1:.4f}, j2={gripper_j2:.4f}, "
+                                     f"MANO_dist={finger_dist:.4f}, "
+                                     f"IK_f1={np.round(ik_f1, 4)}, MANO_f1={np.round(mano_finger1, 4)}, "
+                                     f"IK_f2={np.round(ik_f2, 4)}, MANO_f2={np.round(mano_finger2, 4)}, "
+                                     f"IK_err={ik_err_avg:.1f}mm, ori_err={ori_err_deg:.1f}°")
 
-                    # 设置夹爪 root 位姿 (直接设置, 无需 IK)
+                    # 设置夹爪 root 位姿 + 清零速度 (防止物理步进中漂移, 保证 URDF 刚性)
                     robot.set_root_pose(sapien.Pose(root_pos.tolist(), root_quat.tolist()))
+                    robot.set_root_linear_velocity(np.zeros(3))
+                    robot.set_root_angular_velocity(np.zeros(3))
 
-                    # 设置夹爪手指关节
-                    qpos = robot.get_qpos().copy()
-                    qpos[gripper_idx1] = float(joint1)
-                    qpos[gripper_idx2] = float(joint2)
-                    robot.set_qpos(qpos)
-
-                    # 更新 PD drive target
+                    # 设置夹爪手指位置: 纯PD控制 (与 GalaxeaManipSim 一致)
+                    # 使用 set_drive_target 设置PD目标, compute_passive_force 补偿重力
+                    # 从不调用 set_qpos 避免与PD控制器冲突
                     active_joints = robot.get_active_joints()
-                    active_joints[gripper_idx1].set_drive_target(float(joint1))
-                    active_joints[gripper_idx2].set_drive_target(float(joint2))
+                    active_joints[gripper_idx1].set_drive_target(gripper_j1)
+                    active_joints[gripper_idx2].set_drive_target(gripper_j2)
+                    for _ in range(DECIMATION):
+                        qf = robot.compute_passive_force(gravity=True, coriolis_and_centrifugal=True)
+                        robot.set_qf(qf)
+                        self.scene.step()
 
-                # 物理仿真步进 (decimation 次, 让物体与夹爪交互)
-                for _ in range(DECIMATION):
-                    qf = robot.compute_passive_force(gravity=True, coriolis_and_centrifugal=True)
-                    robot.set_qf(qf)
-                    self.scene.step()
+                # ── PD 跟踪验证: 读取仿真实际状态 vs 优化器目标 ──
+                actual_pose = robot.get_pose()
+                actual_qpos = robot.get_qpos()
+                actual_pos = np.array(actual_pose.p)
+                actual_quat = np.array(actual_pose.q)
+                actual_R = pr.matrix_from_quaternion(actual_quat)
+
+                # 位置误差 (mm)
+                pos_error = np.linalg.norm(actual_pos - root_pos) * 1000.0
+                # 旋转误差 (°)
+                quat_dot = np.clip(np.dot(actual_quat / np.linalg.norm(actual_quat),
+                                          root_quat / np.linalg.norm(root_quat)), -1.0, 1.0)
+                rot_error = 2.0 * np.arccos(quat_dot) * 180.0 / np.pi
+                # 关节误差 (mm) — 读取仿真实际 qpos
+                raw_qpos = np.array(robot.get_qpos())
+                a_j1 = float(raw_qpos[gripper_idx1]) if gripper_idx1 < len(raw_qpos) else 0.0
+                a_j2 = float(raw_qpos[gripper_idx2]) if gripper_idx2 < len(raw_qpos) else 0.0
+                joint_error1 = abs(a_j1 - gripper_j1) * 1000.0
+                joint_error2 = abs(a_j2 - gripper_j2) * 1000.0
+                # 从仿真实际状态计算指尖位置, 对比 MANO 参考点
+                af1 = actual_pos + actual_R @ (_FINGER1_ORIGIN + a_j1 * np.array([0.0, -1.0, 0.0]))
+                af2 = actual_pos + actual_R @ (_FINGER2_ORIGIN + a_j2 * np.array([0.0, 1.0, 0.0]))
+                f_err = (np.linalg.norm(af1 - mano_finger1) + np.linalg.norm(af2 - mano_finger2)) / 2.0 * 1000.0
+
+                self.logger.info(f"  [PD跟踪] raw_qpos={np.round(raw_qpos, 4)}, target_j1={gripper_j1:.4f}, "
+                                 f"target_j2={gripper_j2:.4f}, pos_err={pos_error:.1f}mm, "
+                                 f"rot_err={rot_error:.2f}°, j_err1={joint_error1:.1f}mm, "
+                                 f"j_err2={joint_error2:.1f}mm, f_err={f_err:.1f}mm")
 
                 # 渲染
                 if self.viewer:
@@ -2598,9 +3230,8 @@ class PhysicsSimulator:
 
         # 添加可见桌面支撑 (可选): 自适应位置和大小, 用于支撑GLB物体
         # 桌面位置 = GLB物体XY质心, 桌面大小 = GLB物体XY范围 + 边距
-        TABLE_HALF_THICKNESS = 0.025  # 桌面半厚度=2.5cm (总厚度5cm), 防止物体被推出桌面
-        TABLE_XY_MARGIN = 0.15  # 桌面XY边距=15cm, 防止物体从边缘掉落
-        if self.support_table:
+        # 桌面支撑 (已注释: GLB 自带桌面, 位置不对, 用不可见地面支撑)
+        if False:
             table_builder = self.scene.create_actor_builder()
             table_mat = sapien.render.RenderMaterial()
             table_color = np.array([0.55, 0.45, 0.35, 1.0])  # 默认木色
@@ -2649,7 +3280,7 @@ class PhysicsSimulator:
         obj_actors = []
         settled_obj_poses = []  # 稳定后的物体位置，供第二趟重放
         if glb_path is not None and glb_path.exists() and self.transform_params_path.exists():
-            obj_actors = load_glb_with_physics(glb_path, self.transform_params_path, self.scene, logger=self.logger, fast_collision=self.fast_collision)
+            obj_actors = load_glb_with_physics(glb_path, self.transform_params_path, self.scene, logger=self.logger, fast_collision=self.fast_collision, collision_vis=self.collision_vis)
             if obj_actors:
                 self.logger.info(f"  ✓ GLB 物理物体: {len(obj_actors)} 个")
                 self._log_object_positions(obj_actors, "GLB物体初始位置")
@@ -2732,8 +3363,9 @@ class PhysicsSimulator:
         config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, HandType.right)
         override = dict(
             add_dummy_free_joint=True,
-            normal_delta=1e-5,
-            huber_delta=0.01,
+            normal_delta=5e-3,
+            huber_delta=0.05,
+            low_pass_alpha=0.3,
             target_link_names=[
                 "right_gripper_finger_link1",
                 "right_gripper_finger_link2",
@@ -3479,6 +4111,8 @@ def main():
     parser.add_argument("--viewer", action="store_true", help="交互式Viewer渲染（不保存视频）")
     parser.add_argument("--fast-collision", action="store_true",
                         help="使用快速凸包碰撞体代替 CoACD (速度快但精度低, 推荐调试时使用)")
+    parser.add_argument("--collision-vis", action="store_true",
+                        help="可视化碰撞体外壳: 在物体上叠加半透明红色碰撞体形状, 便于调试碰撞对齐")
     parser.add_argument("--hide-hand", action="store_true",
                         help="隐藏手部mesh和骨架，只显示3个跟随点")
     parser.add_argument("--speed", type=float, default=1.0,
@@ -3595,15 +4229,28 @@ def main():
     logger = logging.getLogger("PhysicsSim")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    logger.addHandler(handler)
+    # stdout handler with immediate flush for viewer mode
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    stream_handler.flush = lambda: sys.stdout.flush()
+    logger.addHandler(stream_handler)
+    # file handler for persistent logs
+    log_dir = Path(__file__).parent / "physics_pipeline" / "output"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"physics_sim_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
+    file_handler = logging.FileHandler(str(log_path), encoding='utf-8', mode='w')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(file_handler)
+    logger.info(f"日志文件: {log_path}")
+    logger.info(f"Viewer模式: {args.viewer}, single_gripper: {args.single_gripper}")
+    logger.info(f"collision_vis: {args.collision_vis}, hide_hand: {args.hide_hand}")
 
     sim = PhysicsSimulator(hawor_dir=args.hawor_dir, ras_dir=args.ras_dir,
                            transform_params_path=args.transform_params,
                            output=args.output, fps=args.fps, hand_idx=args.hand_idx,
                            logger=logger, viewer=args.viewer, crf=args.crf,
                            fast_collision=args.fast_collision,
+                           collision_vis=args.collision_vis,
                            hide_hand=args.hide_hand, speed=args.speed,
                            cam_width=args.width, cam_height=args.height,
                            smooth=args.smooth,

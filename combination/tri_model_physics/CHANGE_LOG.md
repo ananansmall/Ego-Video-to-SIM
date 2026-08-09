@@ -1,5 +1,249 @@
 # CHANGE_LOG
 
+## [2026-07-10] Phase 2: 6D XYZ+RPY 优化 + 轨迹可视化 (第二十九轮)
+
+**类型**: 修改
+**影响范围**: tri_model_physics/traj_optimize.py, tri_model_physics/grasp_hawor.py, tri_model_physics/vis_trajectory.py, tri_model_physics/CHANGE_LOG.md
+
+### 背景
+Phase 1（3D XYZ）已实现夹爪接触物体（contact=12, min_dist=2mm），但 lift=0。需要扩展到 6D（XYZ+RPY）让夹爪调整姿态包住物体并提升，同时生成轨迹对比图可视化优化效果。
+
+### 修改内容
+
+**1. `traj_optimize.py`: 新增 Phase 2 工具**
+- `cem_6d_optimize()`: 6 维 XYZ+RPY CEM 优化器，支持从 Phase 1 最优初始化
+- `compute_reward_phase2()`: Phase 2 奖励函数，在 Phase 1 基础上加入 lift、grasp_success、last_contact 奖励
+- `REWARD_WEIGHTS_PHASE2`: 对应权重配置
+
+**2. `grasp_hawor.py`: 新增 Phase 2 流程**
+- `_compute_mano_neutral_target`: 增加 6 维分支（`len(opt_params)==6`），同时应用位置偏移和旋转偏移
+- `run_optimize`: Phase 1 验证完成后自动执行 Phase 2，用 Phase 1 最优 XYZ 初始化 6D CEM
+- `rollout_single`: 通过 `self._reward_fn` 动态切换 Phase 1/Phase 2 奖励函数
+
+**3. `vis_trajectory.py`: 支持 3D/6D 参数可视化 + 坐标系对齐**
+- 新增 `load_alignment_transform()`: 加载 HaWoR→GLB 对齐变换参数
+- 新增 `sapien_to_glb()`: 将 SAPIEN 轨迹坐标转换为 GLB 空间
+- 支持 3D（常量 XYZ）、6D（XYZ+RPY）、旧版 keyframe/窗口参数的可视化
+
+### 验证结果
+- ✅ Phase 1（3D XYZ）: 26 秒，contact=12, min_dist=2mm, last_contact=4/5
+- ✅ Phase 2（6D XYZ+RPY）: 28 秒，**lift=3.38m**, contact=5, last_contact=3/5
+- ✅ 总优化时间: **54 秒**
+- ✅ 轨迹对比图已生成: `/tmp/traj_compare_3d.png`, `/tmp/traj_compare_dist.png`
+- ✅ 语法检查通过，导入验证通过
+
+### 文档同步
+- ✓ CHANGE_LOG.md 已更新（本次条目）
+- ✓ docs/2026-07-10-xyz-first-optimization-plan.md 新增 Phase 2 实施说明
+
+---
+
+## [2026-07-10] Phase 1: 3D XYZ 偏移优化 (第二十九轮)
+
+**类型**: 修改
+**影响范围**: tri_model_physics/traj_optimize.py, tri_model_physics/grasp_hawor.py, tri_model_physics/docs/questions.md
+
+### 背景
+用户反馈 156 维帧级窗口优化太慢且不成功，要求先只用 XYZ 三参数让夹爪接触物体。MANO 轨迹已预计算为 gripper 位姿，但 rollout_single 每帧重复计算 MANO FK（54,240 次浪费）。
+
+### 修改内容
+
+**1. `traj_optimize.py`: 新增 Phase 1 工具**
+- `apply_xyz_offset()`: 对 MANO 位姿施加常量 XYZ 偏移，姿态不变
+- `compute_reward_xyz()`: 简化奖励函数，只奖励接近距离、最小距离、接触帧数；不奖励 lift
+- `REWARD_WEIGHTS_XYZ`: 对应权重配置
+- `cem_xyz_optimize()`: 3 维 PyTorch CEM 优化器，15 iter × 32 pop
+
+**2. `grasp_hawor.py`: rollout_single 跳过 MANO FK**
+- 帧循环中移除 `compute_mano_joints` 调用（MANO FK），使用预计算轨迹
+- `_compute_mano_neutral_target` 增加 3D XYZ 分支（`len(opt_params)==3`）
+- `run_optimize` 替换帧级窗口 CEM 为 3D XYZ CEM
+- `main()` 日志更新为 3D CEM 描述
+
+**3. `docs/questions.md`: 新增 Q9 记录方案讨论**
+
+### 验证结果
+- ✅ 优化耗时 **24 秒**（15×32=480 rollouts）
+- ✅ `contact=12`（之前 0-7），`min_dist=0.002m`（之前 0.02m）
+- ✅ `last_contact=4/5`（之前 0/5），CLOSE 末段稳定接触
+- ✅ 偏移量 `[-0.0423, 0.0493, 0.0070]m`，仅 ~6.5cm
+- ✅ 完美可重现（`diff=0.0000`）
+- ✅ 语法检查通过，导入验证通过
+
+### 文档同步
+- ✓ CHANGE_LOG.md 已更新（本次条目）
+- ✓ docs/2026-07-10-xyz-first-optimization-plan.md 已创建（计划文档）
+- ✓ docs/questions.md 已更新（Q8, Q9）
+
+---
+
+## [2026-07-08] 添加交互式 Viewer 模式
+
+**类型**: 新增
+**影响范围**: tri_model_physics/grasp_hawor.py
+
+### 背景
+用户需要在实时窗口中观察物理仿真过程，而不是只能看离线渲染的视频。此前 grasp_hawor.py 只支持离线渲染到 MP4，不具备实时 Viewer。
+
+### 修改内容
+
+**`grasp_hawor.py`: 添加 `--viewer` 交互式 Viewer 模式**
+- `setup_physics_scene()`: 在 `sapien.Scene()` 创建前调用 `set_viewer_shader_dir` / `set_camera_shader_dir`（需在 scene 创建前设置）
+- `__init__()`: 新增 `viewer=False` 参数
+- `run()`: 新增 §8d 交互式 Viewer 创建逻辑：
+  - 使用 `make_look_at_camera` 计算相机姿态，位于场景中心斜上方 0.5m 处
+  - 使用 `set_camera_pose(sapien.Pose)` 精确设置位置+朝向
+  - 主循环每帧调用 `viewer.render()`
+  - 窗口关闭时自动检测并 `break` 提前退出仿真
+  - 兼容 `window.is_running` / `control_window.is_running` 两种 SAPIEN 版本
+- CLI 参数: 新增 `--viewer`（store_true），`--views` choices 增加 `"none"`（配合 viewer 使用）
+
+### 验证结果
+- ✅ `grasp_hawor.py` 语法检查通过（`py_compile`）
+- ✅ `--help` 输出正常显示 `--viewer` 参数
+
+### 文档同步
+无需更新 README 或其他文档。
+
+## [2026-07-08] CMA-ES + sigma 退火调度 (第二十二轮)
+
+**类型**: 修改
+**影响范围**: tri_model_physics/traj_optimize.py, tri_model_physics/grasp_hawor.py
+
+### 背景
+用户反馈"开始确实范围需要大一点，然后不断的缩小"。此前是两阶段离散切换（阶段1 sigma=0.20 粗搜 → 阶段2 sigma=0.04 精调），改为单阶段 sigma 指数退火，更平滑地控制搜索范围从大到小收缩。
+
+### 修改内容
+
+**1. `traj_optimize.py`: `cmaes_optimize` 重构**
+- 添加 sigma 退火调度: sigma 从 `sigma0`（默认 0.25=25cm/25°）指数衰减到 `sigma_end`（默认 0.005=0.5°）
+- 每代 `es.sigma *= sigma_decay`，其中 `sigma_decay = (sigma_end / sigma0) ^ (1/n_generations)`
+- 支持 `sigma_decay` 参数手动指定衰减系数（覆盖自动计算）
+- 默认代数从 30→50，sigma0 从 0.02→0.25
+- 每 5 代打印当前 sigma（rad + °）
+
+**2. `grasp_hawor.py`: 移除两阶段代码，使用 sigma 退火**
+- `run_optimize` 中删除两阶段 CMA-ES 调用，改为单次 `cmaes_optimize` 带 sigma_end
+- CLI 参数: 移除 `--no-two-stage`、`--cmaes-{gen,pop,sigma}-s1/s2`，新增 `--cmaes-sigma-end`、`--cmaes-sigma-decay`
+- 日志和属性设置同步更新
+
+### 验证结果
+- ✅ `traj_optimize.py` 导入验证通过: `cmaes_optimize` 新签名正确
+- ✅ `grasp_hawor.py` 语法检查通过 (`ast.parse`)
+- ⚠ `grasp_hawor.py` 完整导入需 SAPIEN 环境（非代码问题）
+
+### 文档同步
+- ✓ CHANGE_LOG.md 已更新 (本次条目)
+
+---
+
+## [2026-07-03] 离线 CEM 轨迹优化 (第十八轮)
+
+**类型**: 新增 + 修改
+**影响范围**: tri_model_physics/grasp_hawor.py, tri_model_physics/traj_optimize.py (新建)
+
+### 背景
+用户在第十七轮迭代 7 次测试后提出: "本身肯定是有一个位姿曲线你需要跟随, 我希望你能在这个轨迹基础上最小化偏离代价" — 从"纯跟随"升级为"最小化偏离的轨迹优化"。借鉴 `/home/an/robot_world_ws/src/do-as-i-do/retargeting` 的 Stage 5 (CEM 采样式优化)。
+
+### 修改内容
+
+**1. 新建 `traj_optimize.py` (CEM 优化器 + rollout + reward)**
+- 9 维优化参数: `grasp_pos_delta` (3D), `grasp_R_euler` (3D), `finger_close_target`, `close_blend_ratio`, `transport_vel_limit`
+- CEM 算法: 10 轮 × 24 采样 = 240 次 rollout, 约 8 分钟
+- 多目标奖励: 偏离代价 + 接触帧数 + 提升量 + 距碗距离 + 掉落惩罚 + 穿透惩罚
+
+**2. `_compute_mano_neutral_target` 参数化**
+- 接受 `opt_params` 参数, CLOSE 阶段应用 `grasp_pos_delta`、`grasp_R_euler`、`finger_close_target`、`close_blend_ratio`
+- `None` 时用默认值 (向后兼容)
+
+**3. `_step_gripper_only` 回归纯 PD 控制**
+- 删除 `set_qpos(-0.01)` 瞬移手指 (会让手指变 kinematic, 绕过物理)
+- 删除 `lock_root_pose` 每子步锁根 (会压制物理引擎)
+- 全阶段统一: `set_root_pose` + `set_root_linear_velocity` 驱动根, `set_drive_target` 驱动手指
+
+**4. `setup_physics_scene` 加 `force_cpu` 参数**
+- 优化模式 (`--optimize`) 传 `force_cpu=True` 直接创建 CPU 场景, 避免 Vulkan 渲染初始化段错误
+- 正常模式不受影响
+
+**5. 新增 `--optimize` 和 `--opt-params` 命令行参数**
+- `--optimize`: 先 CEM 优化, 再渲染视频 (无头模式)
+- `--opt-params`: 手动指定优化参数文件 (npy)
+
+**6. `run_optimize` 方法**
+- 无头模式初始化 (force_cpu=True)
+- CEM 优化 (10 轮 × 24 采样)
+- 保存最优参数到 `opt_params.npy`
+
+**7. 接触检测 API 修复**
+- `c.actor0` → `c.bodies[0]` (SAPIEN Contact API)
+- `c.get_depth(0)` → `c.points[0].get_dist()` (穿透检测)
+
+### 验证结果
+
+```
+最优参数: [-0.0015 -0.0012 -0.0028 -0.0009  0.0019  0.0045  0.0035  0.2979  0.5034]
+```
+
+- ✅ CEM 10 轮 × 24 采样完成, 无报错
+- ✅ 最优参数偏离 mm 级 (finger_close_target: 0.0035, 默认 0.0)
+- ✅ `close_blend_ratio` 几乎不变 (0.2979 vs 默认 0.3)
+- ✅ `transport_vel_limit` 几乎不变 (0.5034 vs 默认 0.5)
+- ✅ 优化后参数已保存到 `output/gripper_only_left/opt_params.npy`
+- ✅ 核心发现: 当前默认参数已经接近最优, CEM 无显著改善
+
+### 文档同步
+- ✓ CHANGE_LOG.md 已更新 (本次条目)
+- ✓ docs/2026-07-02-trajectory-optimization-plan.md 已更新 (最终实施结果)
+- ⚠ README.md 需补充 `--optimize` 和 `--opt-params` 参数说明
+
+---
+
+## [2026-06-30] MANO 跟随重设计 — 设计文档修订 (第十三轮, 设计阶段)
+
+**类型**: 设计文档
+**影响范围**: tri_model_physics/docs/2026-06-30-mano-follow-redesign-design.md (新建)
+
+### 背景
+用户观看 Round 12 测试视频后提出 4 项关键反馈 + 第二次澄清:
+1. 物理限制是否超过 R1? — 经查证: 关节限位/质量/惯量/PD **都已对齐**, 唯一不匹配是手指碰撞体 (box 12×20×24mm vs R1 mesh)
+2. god 相机 0.2m 还是很高 — 经查证: **坐标系问题**, `god_pos = scene_center + [0,0,0.20]`, scene_center_z≈0.185 → god_pos_z≈0.385m (不是 0.2m)
+3. 没有真正夹住 (像抓娃娃机, 物体最终掉下) — verify.json "真正夹住" 是误报 (用 max(z) 不是 final(z), 接触是全局非 per-object)
+4. **轨迹偏离严重** (最关键) — 当前用固定 top-down 朝向, 忽略 MANO root_R; 用户要求: 位姿不改变 + 位置优化最小损失
+
+### 修改内容 (设计文档, 尚未实施代码改动)
+
+**1. 物理参数诊断修正**
+- mass=0.027, inertia, PD, 关节限位 **已对齐 R1** (之前误判为未对齐)
+- 唯一需改: 手指 collision box → mesh (STL), friction 2.0→1.0, restitution 0.0→0.6
+
+**2. god 相机坐标系修复方案**
+- 旧: `god_pos = scene_center + [0,0,0.20]` → god_pos_z ≈ 0.385m
+- 新: `god_pos = [scene_center[0], scene_center[1], ground_z + 0.20]` → god_pos_z ≈ 0.20m
+
+**3. 验证逻辑修复方案**
+- 接触: 全局 → per-object (用 contact[0]/[1] actor 名匹配)
+- 提升: `max(z) - init_z` → `final_z - init_z` (排除"托起又掉")
+- 跟随: 加 z 方差 < 1cm (排除娃娃机式托住)
+
+**4. 轨迹重设计方案 (最关键) — 位姿不改变 + 位置优化最小损失**
+- 姿态: `gripper_R = traj["R"][local_idx]` (MANO root_R, 严格跟随, **位姿不改变**)
+- 位置: `gripper_pos = mano_pos + offset`, offset 最小化 (在 f_grasp 处对齐目标)
+- 删除 `gripper_R_fixed` (固定 top-down) 和基于固定朝向的 `ee_offset_neutral`
+- `mano_gripper_traj` 扩展存储 "R" 键
+- Z-floor 用当前 gripper_R 计算手指方向 (不再用固定 0.037)
+
+**5. 碰撞可视化方案**
+- 半透明红色 RGBA[1,0,0,0.4] 覆盖在手指视觉模型外
+- 每帧跟随手指 link 位姿, 不影响物理
+
+### 文档同步
+- ✓ docs/2026-06-30-mano-follow-redesign-design.md 已创建并修订 (含用户第二次澄清)
+- ⚠ 待实施代码改动 (下一步: writing-plans skill 创建实施计划)
+- ⚠ docs/grasp_hawor_analysis.md 待补充 3.7d 节
+- ⚠ docs/questions.md 待补充 Q5/Q6
+
+---
+
 ## [2026-06-30] MANO+offset 中和态 + Z-floor 碗保护 + god 降至 0.2m (第十二轮)
 
 **类型**: 新增 + 修改

@@ -86,9 +86,10 @@ def _compute_gripper_pose_by_strategy(strategy, mano_wrist, mano_finger1, mano_f
 
 from common import (
     detect_hands, load_hawor_data, load_hawor_c2w, setup_scene,
-    load_glb_transformed, compute_mano_joints, _render_to_sapien,
+    load_glb_to_sapien, compute_mano_joints, _render_to_sapien,
     _render_keypoints, hawor_cam_to_sapien_pose, make_look_at_camera,
     _compute_wrist_positions_sapien, _get_gripper_pose_from_retargeting,
+    set_render_transform_params,
 )
 
 
@@ -267,13 +268,27 @@ def render_gripper_only_video(hawor_dir, ras_dir, transform_params_path, output,
             strategy, mano_wrist, mano_finger1, mano_finger2,
             prefix, finger_origin_x, finger1_origin_x, finger2_origin_x, open_scale)
 
+    # ── 设置变换参数 (与 render_quick.py 一致) ──
+    if transform_params_path is not None and Path(transform_params_path).exists():
+        tp = dict(np.load(transform_params_path, allow_pickle=True))
+        s = float(tp['scale_ratio'])
+        R_h2g = tp['R_hand_to_glb']
+        t_h2g = tp['t_hand_to_glb']
+        Rx_hand = tp.get('Rx_hand', np.diag([1, -1, -1]))
+        set_render_transform_params(R_h2g, t_h2g, Rx_hand, s)
+        logger.info(f"  变换参数: scale={s:.4f}")
+    else:
+        logger.warning("  未找到 transform_params, 将使用旧变换 (可能导致对齐错误)")
+
     # ── 创建场景 ──
     scene = setup_scene()
 
     glb_path = Path(ras_dir) / "final_scene.glb"
     has_transform = transform_params_path is not None and Path(transform_params_path).exists()
     if glb_path.exists() and has_transform:
-        obj_actors = load_glb_transformed(glb_path, transform_params_path, scene, logger)
+        tp = dict(np.load(transform_params_path, allow_pickle=True))
+        obj_actors = load_glb_to_sapien(
+            glb_path, float(tp['scale_ratio']), tp['R_hand_to_glb'], tp['t_hand_to_glb'], scene, logger)
         if obj_actors:
             logger.info(f"  ✓ GLB 加载成功: {len(obj_actors)} 个物体")
 
@@ -792,6 +807,18 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
         gs["fixed_qpos"] = fixed_qpos
         logger.info(f"  {prefix} 优化器: gripper-only URDF, finger1={f1x*1000:.1f}mm, finger2={f2x*1000:.1f}mm")
 
+    # ── 设置变换参数 (与 render_quick.py 一致) ──
+    if transform_params_path is not None and Path(transform_params_path).exists():
+        tp = dict(np.load(transform_params_path, allow_pickle=True))
+        s = float(tp['scale_ratio'])
+        R_h2g = tp['R_hand_to_glb']
+        t_h2g = tp['t_hand_to_glb']
+        Rx_hand = tp.get('Rx_hand', np.diag([1, -1, -1]))
+        set_render_transform_params(R_h2g, t_h2g, Rx_hand, s)
+        logger.info(f"  变换参数: scale={s:.4f}")
+    else:
+        logger.warning("  未找到 transform_params, 将使用旧变换 (可能导致对齐错误)")
+
     focal = gripper_states[0]["hawor_data"].get("img_focal")
     if focal is None or focal <= 0:
         focal = HAWOR_FOCAL_DEFAULT
@@ -804,7 +831,9 @@ def render_dual_gripper_video(hawor_dir, ras_dir, transform_params_path, output,
     glb_path = Path(ras_dir) / "final_scene.glb"
     has_transform = transform_params_path is not None and Path(transform_params_path).exists()
     if glb_path.exists() and has_transform:
-        obj_actors = load_glb_transformed(glb_path, transform_params_path, scene, logger)
+        tp = dict(np.load(transform_params_path, allow_pickle=True))
+        obj_actors = load_glb_to_sapien(
+            glb_path, float(tp['scale_ratio']), tp['R_hand_to_glb'], tp['t_hand_to_glb'], scene, logger)
         if obj_actors:
             logger.info(f"  ✓ GLB 加载成功: {len(obj_actors)} 个物体")
 

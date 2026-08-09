@@ -154,3 +154,173 @@ f_grasp = argmin_f |mano_root_pos[f] - target_pos|   (MANO 最接近目标的帧
 
 ---
 
+## Q5: 夹爪是否超过物理限制? 是否和 GalaxeaManipSim 一样约束? 为什么没真正夹住?
+
+**日期**: 2026-06-30
+**分类**: 物理
+
+### 问题
+用户反馈: "夹爪是不是有点超过了物理限制呢? 是和 `/home/an/robot_world_ws/src/GalaxeaManipSim` 一样的约束吗?...目前我根本没看到夹爪有真正的夹取物体, 感觉是你和抓娃娃机一样硬放上去的, 而且夹爪根本没有夹住, 是因为碰撞物的问题吗?"
+
+### 解答
+
+**物理限制对比** (查证 GalaxeaManipSim R1 URDF + 我的 prepare_gripper_only_urdf):
+
+| 参数 | Galaxea R1 | 我的实现 | 是否对齐 |
+|------|-----------|---------|---------|
+| 关节限位 | lower=0, upper=0.05, effort=100, velocity=0.25 | 同 | ✓ |
+| 手指质量 | 0.027 kg | 0.027 kg | ✓ |
+| 手指惯量 | ixx=2.4057e-6 等 | 同 | ✓ |
+| PD 阻尼 | stiffness=1000, damping=200 | 同 | ✓ |
+| **手指碰撞体** | **MESH (STL, 完整手指)** | **box 12×20×24mm** | **❌ 唯一不匹配** |
+| 摩擦 | 1.0/1.0 | 2.0/2.0 | ⚠ |
+| 弹性 | 0.6 | 0.0 | ⚠ |
+
+**结论**: 夹爪**没有**超过 R1 物理限制 (关节限位/质量/惯量/PD 都一致). **没真正夹住的根因是碰撞体太小** (box 12×20×24mm 体积约 R1 mesh 的 1/5), 手指接触面不够, 物体容易滑出.
+
+**修复方案** (设计文档 4.1 节):
+1. 手指 collision box → mesh (`{prefix}_gripper_finger_link1.STL`)
+2. friction 2.0 → 1.0 (对齐 R1)
+3. restitution 0.0 → 0.6 (对齐 R1)
+4. mass/inertia/PD 不改 (已对齐)
+
+**碰撞可视化** (用户要求): 在手指视觉模型外覆盖半透明红色 RGBA[1,0,0,0.4] 碰撞体, 每帧跟随手指 link 位姿, 视频中清晰看到碰撞体 vs 物体接触.
+
+---
+
+## Q8: 为什么轨迹优化要两小时？参数不是只有 7 维吗？
+
+**日期**: 2026-07-10
+**分类**: 性能 / 架构
+
+### 问题
+用户反馈: "怎么可能用两小时呢，有 gpu 还那么慢吗，只是优化一个轨迹而已，没有那么复杂！已经映射过来就是一个7维参量，有那么复杂吗，抓个物体，阶段都给出来了，目标是很明确的啊"
+
+### 解答
+
+**1. GPU 对当前瓶颈基本无效**
+
+当前优化不是卡在 PyTorch/CMA-ES 采样，而是每次 rollout 都要跑 113 帧 SAPIEN 物理仿真。SAPIEN 的物理引擎运行在 CPU 上，rollout 之间又必须串行（共享同一个 scene），所以 GPU 加不了速。
+
+从后台日志看，最近 10×20=200 个 rollout 的运行时间大约 12-15 分钟，并不是两小时；但因为反复调参、多轮运行累计起来就显得很慢。
+
+**2. 为什么 156 维还不成功**
+
+当前实现把靠近物体的 26 帧窗口每帧都优化 6DOF 偏移，维度 26×6=156。优化器确实能找到"靠近一下"的解（contact=7, min_dist≈2cm），但 CLOSE 最后 5 帧又远离了（avg_dist_last5≈27cm），所以 lift=0。
+
+根因是：MANO 轨迹在 LIFT 阶段会抬手离开物体，而 156 维窗口只在 F86-F111 做偏移，没有在 LIFT/HOLD 阶段维持住"包住物体一起抬升"的位姿。
+
+**3. 按"7 维参量"的推荐方案**
+
+把参数降回 7 维：
+- `[dx, dy, dz, droll, dpitch, dyaw]`：一个**全局 6DOF 偏移**，在 CLOSE/HOLD/LIFT 阶段整体加到 gripper 位姿上。
+- `gripper_close_bias`：手指闭合余量/闭合时机。
+
+这样维度从 156 → 7，CEM 用 32×20=640 rollouts，单进程约 5-10 分钟；同时因为偏移贯穿 LIFT，夹爪会带着物体一起抬升。
+
+---
+
+## Q6: 为什么轨迹偏离严重? 如何实现"位姿不改变 + 位置优化最小损失"?
+
+**日期**: 2026-06-30
+**分类**: 架构
+
+### 问题
+用户反馈: "你的夹爪现在完全不跟随参考点吗, 这完全不对, 你的模块关键在于在尽可能跟随参考点的情况下完成抓取的任务, 而不是只完成抓取任务, 你现在的轨迹都偏离非常多, 这个完全错误, 参考的mano是一定要跟随的, 你可以稍微调整它的位置, 但姿态要跟上, 可以进行一个优化的操作, 让其能够在轨迹范围内完成抓取的任务...你的任务是尽可能跟随原来轨迹, 微调原来轨迹的位置 (可以优化, 达到了取最小, 但不要调整姿态), 实现抓取任务后结束"
+
+用户第二次澄清: "不是0偏移, 是位姿不改变, 轨迹可以有偏移, 你要在抓取物体的轨迹和现在的轨迹进行优化, 把损失降到最小"
+
+### 解答
+
+**根因** (查证代码):
+- `compute_analytical_gripper_pose` (L1062-1116) **返回了 root_R** (MANO 真实手腕朝向, 加权 SVD Procrustes)
+- 但 `_compute_mano_neutral_target` (L2260-2262) **忽略 root_R**, 用固定 `gripper_R_fixed = [[0,1,0],[0,0,-1],[-1,0,0]]` (top-down)
+- 当前 offset = `target_grasp_pos - mano_pos[f_grasp]` 用固定朝向计算, 可能 5cm+
+
+**重设计方案** (设计文档 4.5 节) — 位姿不改变 + 位置优化最小损失:
+
+```
+姿态: gripper_R[local_idx] = traj["R"][local_idx]   (MANO root_R, 严格跟随, 位姿不改变)
+位置: gripper_pos[local_idx] = mano_pos[local_idx] + offset
+offset = target_pos - mano_pos[f_grasp] - finger_offset_along_R[f_grasp]   (最小必要平移)
+```
+
+**为什么这是"最小损失"**:
+- offset 是在 f_grasp 处让 EE+finger 对齐 target 的最小必要平移
+- 其他帧 gripper_pos = mano_pos + offset (常量平移), 保持 MANO 轨迹形状
+- 姿态 gripper_R = traj["R"][local_idx] 完全跟随 MANO (零姿态偏差)
+- 唯一"损失"是位置上的常量平移 ||offset||, 这是抓取成功的最小必要平移
+
+**关键代码改动**:
+1. `mano_gripper_traj` 扩展存储 "R" 键 (当前丢弃了 root_R)
+2. `_compute_mano_neutral_target` 用 `traj["R"][local_idx]` 替代 `gripper_R_fixed`
+3. offset 计算用 f_grasp 处的 MANO root_R 计算手指前向偏移 (不是固定朝向)
+4. 删除 `gripper_R_fixed` 和基于固定朝向的 `ee_offset_neutral`
+5. Z-floor 用当前 gripper_R 计算手指方向 (不再用固定 0.037)
+
+详见 [2026-06-30-mano-follow-redesign-design.md](./2026-06-30-mano-follow-redesign-design.md).
+
+---
+
+## Q7: god 相机为什么 0.2m 还是很高? 是坐标系问题吗?
+
+**日期**: 2026-06-30
+**分类**: 配置
+
+### 问题
+用户反馈: "god的相机视角我运行[默认命令]没有感觉有下降" + "固定 0.2m还是很高, 不知道为什么, 是坐标系的问题吗?"
+
+### 解答
+
+**根因** (查证代码 L3269, L3242):
+```python
+scene_center = (arm_base_pos + obj_centroid) / 2.0   # z ≈ (0.35 + 0.02)/2 = 0.185m
+god_pos = scene_center + np.array([0.0, 0.0, god_height])   # z = 0.185 + 0.20 = 0.385m
+```
+
+**问题**: `god_height = 0.20` 是相对 `scene_center` 的偏移, 不是相对地面的绝对高度. scene_center_z ≈ 0.185 (臂基座 0.35 + 物体 0.02 的平均), 所以实际相机在 0.385m, 比用户期望的 0.2m 高出近一倍.
+
+**用户感知"0.2m 还是很高"是正确的** — 实际就是 0.385m.
+
+**修复** (设计文档 4.2 节): 改为绝对地面坐标:
+```python
+ground_z = min(obj_centers[:, 2])   # 物体最低 z ≈ 0
+god_pos = np.array([scene_center[0], scene_center[1], ground_z + god_height])   # z = 0.20m
+```
+
+---
+
+## Q9: 用户要求先只用 XYZ 三维优化接触，方案是什么？
+
+**日期**: 2026-07-10
+**分类**: 架构 / 优化
+
+### 问题
+用户澄清: "不是，哪里来的156个维度呢，我觉得先这样，原始的mano轨迹，你先优化，xyz三个量，能够先接触物体是最主要的，然后调整后，你再去说调整其他几个变量，能够去抓取物体，这个很关键，把优化方案给我出一版"
+
+### 解答
+
+**方案**: 两阶段递进优化。
+
+**Phase 1: 3 维 XYZ 偏移**
+- 参数: `[dx, dy, dz]`
+- 作用: 对原始 MANO 轨迹做常量 XYZ 平移，姿态完全跟随 MANO
+- 目标: 让夹爪在 CLOSE 阶段接触到物体
+- 奖励: 只保留接近距离、最小距离、接触帧数；不奖励 lift
+- 优化器: PyTorch CEM，15 iter × 32 pop = 480 rollouts，预计 5-10 分钟
+- 成功标准: `contact_frames_in_close >= 1`, `min_dist_in_close < 0.02m`
+
+**Phase 2: 扩展到 6/7 维**
+- 在 Phase 1 最优 XYZ 基础上冻结为初始均值
+- 增加 `[droll, dpitch, dyaw]` → 6D
+- 增加 `gripper_close_bias` → 7D
+- 奖励加入 lift、grasp_success、last_contact
+- 目标: 稳定抓取并提升物体
+
+**风险与回退**:
+- 如果 3D 偏移不足以接触（姿态不匹配），直接跳到 6D XYZ+RPY。
+
+**详细计划文档**: [2026-07-10-xyz-first-optimization-plan.md](./2026-07-10-xyz-first-optimization-plan.md)
+
+---
+

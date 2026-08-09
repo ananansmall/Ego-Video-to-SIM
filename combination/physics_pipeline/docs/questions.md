@@ -95,3 +95,61 @@
 **重力**: `[0, 0, -9.81]` (Z-down)，SAPIEN 和 PyBullet 都用 Z-up 坐标系，重力方向正确。桌面在物体最低点下方 2mm (`ground_z = min_z - 0.002`)，物体自然落稳。
 
 ---
+
+## Q: GLB 物体在仿真中显得很小 + 实时渲染环境重载 + 基座固定 + 仿真测试要求
+
+**日期**: 2026-06-22
+**分类**: 调试 / 架构
+
+### 问题
+1. 实时的渲染需要重新加载仿真环境，而不是在同一个仿真环境里面不断渲染
+2. 为什么感觉在仿真环境里面 GLB 的加载会那么小呢，物体大小有发生变化吗？
+3. 之后的仿真需要测试渲染50%以上的视频才能结束，刚开始有点问题
+4. 在 SAPIEN 仿真里面基座最好固定一下
+
+### 解答
+
+#### 1. 实时渲染环境重载
+**修复**: PyBullet 管线新增 `reset_simulation()` 和 `_init_simulation()` 方法:
+- `__init__` 只存储参数，调用 `_init_simulation()` 完成初始化
+- `reset_simulation()` 断开当前连接，重新创建全新仿真环境 (物理客户端、地面、机器人)
+- `render_video()` 和 `render_single_gripper_video()` 开头调用 `reset_simulation()`，确保每次渲染从干净环境开始
+- GLB 物体在重置后重新加载
+
+#### 2. GLB 物体大小问题
+**分析**: PyBullet 管线中 GLB 物体**没有额外缩放**:
+- `meshScale=[1, 1, 1]` (1:1 原始尺寸)
+- 顶点变换链与 02_render_scene.py 完全一致: `vertices_hawor = s_inv * (R_inv @ vertices.T).T + t_inv` → `vertices_sapien = (RXWORLD_TO_SAPIEN @ vertices_hawor.T).T`
+- 物体大小完全取决于 `transform_params.npz` 中的 `s_inv` (逆缩放因子)
+
+**可能原因**:
+- `s_inv` 值偏小: 01_align_scene.py 的 Umeyama 对齐计算的缩放因子可能使物体变小
+- 相机视角: 第一人称视角 (fpv) 的相机位置可能离物体较远，导致物体看起来小
+- 视觉参照: 没有明确的参照物 (如桌面纹理、网格线)，难以判断物体实际大小
+
+**验证方法**:
+```python
+# 检查 s_inv 值
+params = np.load('transform_params.npz')
+print(f"s_inv = {params['s_inv']}")  # 应接近 1.0
+
+# 检查物体实际尺寸
+vertices_sapien = ...  # 变换后的顶点
+bbox = vertices_sapien.max(axis=0) - vertices_sapien.min(axis=0)
+print(f"物体尺寸: {bbox} 米")  # 应该是合理的物体大小 (几cm到几十cm)
+```
+
+#### 3. 仿真测试渲染50%以上视频
+**修复**: `render_video()` 和 `render_single_gripper_video()` 添加渲染进度验证:
+- 渲染完成后检查实际写入帧数是否 >= 目标帧数的 50%
+- 如果不足 50%，打印警告并返回 False
+- 确保仿真测试真正渲染了大部分视频内容
+
+#### 4. SAPIEN 04 基座固定
+**修复**: 新增 `--fixed-base` 参数:
+- 默认: 浮动基座模式 (基座在 XY 方向 ±4cm 范围跟踪手腕)
+- `--fixed-base`: 基座固定在初始位置，不跟随手腕移动
+- 优先级: `fixed_base` > `base_cluster` > 浮动基座
+- SAPIEN 已使用 `fix_root_link=True` (物理固定)，`--fixed-base` 是在此基础上不再调用 `set_root_pose` 移动基座
+
+---

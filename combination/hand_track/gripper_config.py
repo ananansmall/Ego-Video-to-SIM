@@ -727,4 +727,75 @@ def compute_gripper_offset_in_root(robot, prefix):
             offset_pos = np.array(pose.p)
             offset_R = pr.matrix_from_quaternion(np.array(pose.q))
             return offset_pos, offset_R
-    return np.zeros(3), np.eye(3)
+
+
+def compute_mano_based_gripper_pose(j, prefix="right", scale=1.0):
+    """从 MANO 5 个关节点解算夹爪位姿 (SVD 手掌平面 + Gram-Schmidt).
+
+    输入: MANO 21 关节的 SAPIEN 坐标 j[21, 3]
+
+    算法:
+      1. 锚点 anchor = (j3 拇指PIP + j5 食指MCP) / 2  → gripper base
+      2. 5 点 (j3,j5,j6,j7,j8) SVD 拟合手掌平面 → Z 轴 (法向)
+      3. X 候选 = 归一化(j6 - j5) 即 MCP→PIP (食指延伸方向)
+      4. Gram-Schmidt: X = X - (X·Z)Z → 归一化
+      5. Y = Z × X, Z = X × Y → 三轴严格正交
+      6. gripper base = anchor
+      7. 手指开合: joint = (‖j8 - j4‖ - FINGER_BASE_DIST * scale) / 2
+
+    MANO 关节索引 (右手法):
+      j3=拇指PIP, j4=拇指tip, j5=食指MCP, j6=食指PIP, j7=食指DIP, j8=食指尖
+
+    Returns:
+        gripper_pos: (3,) gripper_link 位置
+        gripper_R: (3,3) 旋转矩阵
+        joint1, joint2: 手指关节值 (scaled space, 即与输入 j 同尺度)
+    """
+    thumb_pip = j[3]
+    index_mcp = j[5]
+    index_pip = j[6]
+    index_dip = j[7]
+    index_tip = j[8]
+    thumb_tip = j[4]
+
+    # ── Step 1: 锚点 = (拇指PIP + 食指MCP) / 2 ──
+    anchor = (thumb_pip + index_mcp) / 2
+
+    # ── Step 2: SVD 拟合手掌平面 → Z ──
+    palm_pts = np.array([thumb_pip, index_mcp, index_pip, index_dip, index_tip])
+    palm_center = palm_pts.mean(axis=0)
+    centered = palm_pts - palm_center
+    U, S, Vt = np.linalg.svd(centered, full_matrices=True)
+    z_axis = Vt[2] / np.linalg.norm(Vt[2])
+
+    # ── Step 3: X 候选 (MCP→PIP) ──
+    x_raw = index_pip - index_mcp
+    if np.linalg.norm(x_raw) < 1e-8:
+        x_raw = index_tip - index_mcp
+    x_raw = x_raw / np.linalg.norm(x_raw)
+
+    # ── Step 4-5: Gram-Schmidt 正交化 ──
+    x_orth = x_raw - np.dot(x_raw, z_axis) * z_axis
+    x_norm = np.linalg.norm(x_orth)
+    if x_norm < 1e-8:
+        x_axis = np.cross(z_axis, np.array([0, 0, 1.0]))
+        x_axis = x_axis / np.linalg.norm(x_axis)
+    else:
+        x_axis = x_orth / x_norm
+
+    y_axis = np.cross(z_axis, x_axis)
+    z_axis = np.cross(x_axis, y_axis)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+    if np.linalg.det(R) < 0:
+        z_axis = -z_axis
+        R = np.column_stack([x_axis, y_axis, z_axis])
+
+    # ── Step 6: gripper base = anchor ──
+    base = anchor
+
+    # ── Step 7: 手指开合 (FINGER_BASE_DIST 需 × scale 匹配输入空间) ──
+    finger_dist = np.linalg.norm(index_tip - thumb_tip)
+    required_open_sum = finger_dist - FINGER_BASE_DIST * scale
+    joint = max(0.0, min(0.05, required_open_sum / 2))
+
+    return base, R, joint, joint

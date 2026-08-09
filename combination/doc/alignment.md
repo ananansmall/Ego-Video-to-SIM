@@ -7,8 +7,8 @@
 │                                                                     │
 │  RAS (ReplicateAnyScene)                                            │
 │  ─────────────────────────                                          │
-│  VGGT World (任意) ──R,t──→ Room World (Z-UP) ──z2y──→ GLB (Y-UP) │
-│                              地板z=0           导出时做了z→y转换     │
+│  VGGT World (任意) ──R,t──→ Room World (Z-UP) ──z2y──→ GLB (Y-UP 或 Z-UP) │
+│                              地板z=0     导出时可能做z→y转换,也可能未做  │
 │                                                                     │
 │  HaWoR                                                              │
 │  ─────                                                              │
@@ -166,9 +166,16 @@ cam_fov = 2 * np.arctan(CAM_HEIGHT / 2.0 / focal_for_render)
 ### 3.1 完整变换链
 
 ```
-RAS GLB (Y-UP, VGGT单位)
+RAS GLB (Y-UP 或 Z-UP, VGGT单位)
+    │
+    │  Step 0: 检测 GLB 坐标系 (_detect_glb_up_axis)
+    │  Y-UP: 导出时做了 z→y 转换 (相机坐标系)
+    │  Z-UP: 未转换, 地面坐标系 (地板在 z=0)
     │
     │  Step 1: 01_align_scene.py 计算 RAS Y-UP → HaWoR Render World 变换
+    │  R_c2w Y-UP 转换取决于 GLB 坐标系:
+    │    Y-UP GLB: R_c2w_yup = ZUP_TO_YUP @ R_c2w_zup @ ZUP_TO_YUP.T (相似变换)
+    │    Z-UP GLB: R_c2w_yup = ZUP_TO_YUP @ R_c2w_zup (直接乘)
     │  p_hawor = s_inv * R_inv @ p_glb + t_inv
     │  参数保存在 transform_params.npz
     ↓
@@ -185,6 +192,16 @@ SAPIEN World (Z-UP, 米制)
 ### 3.2 01_align_scene.py 的对齐原理
 
 **核心思想**：同一个视频的第一帧相机，在 RAS 和 HaWoR 中描述同一个物理相机。
+
+**R_c2w Y-UP 转换** (取决于 GLB 坐标系):
+- Y-UP GLB (导出时已做 z→y): 相机约定随世界 up 轴变化 → 相似变换
+  `R_c2w_yup = ZUP_TO_YUP @ R_c2w_zup @ ZUP_TO_YUP.T`
+- Z-UP GLB (地面坐标系, 未转换): 只改变世界坐标系, 相机约定不变 → 直接乘
+  `R_c2w_yup = ZUP_TO_YUP @ R_c2w_zup`
+
+**尺度校正**:
+- 优先使用 Umeyama (相机轨迹标准差比)
+- 若 Umeyama 尺度导致手→GLB距离 > 10cm, 自动网格搜索更优 s_inv
 
 ```
 RAS 第一帧相机:  R_c2w_ras (Y-UP, OpenCV约定)
@@ -457,5 +474,5 @@ scene.export('scene_in_hawor_world.glb')
 | `01_align_scene.py` | 计算 RAS→HaWoR 变换参数，保存到 `transform_params.npz` |
 | `02_render_scene.py` | 加载变换后的 GLB + HaWoR 手部 + R1 机器人，SAPIEN 渲染 |
 | `03_track_robot.py` | 独立机器人跟踪（不需要 GLB 场景），快速验证映射 |
-| `transform_params.npz` | 包含 `s_inv`, `R_inv`, `t_inv` (GLB→HaWoR 变换参数) |
+| `transform_params.npz` | 包含 `s_inv`, `R_inv`, `t_inv`, `glb_up_axis` (GLB→HaWoR 变换参数) |
 | `question.md` | 问题与回答 |
