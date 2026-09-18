@@ -578,8 +578,40 @@ def build_stage2_timeline(
             float(close_q[k]), "TARGET_CONTACT_ALLOWED",
         )
     hold_start_idx = len(source)
-    for _ in range(hold_controls):
-        append_control(F50_IDX, STAGE1_PHASE_SETTLE, anchor_pos, anchor_R, q_grasp, "BILATERAL_TARGET")
+    # ★★★★ 2026-09-17 Stage2 "重坐 (re-seat)" 新版本 ★★★★
+    #   (用户: "你可以另外测试一个 stage2 的版本, 重点是把仿真解决")
+    #   问题 (CoACD 实测 output/coacd_s2 / coacd_fine):
+    #     Stage1 给出的抓取位姿让两指**斜着卡在凸包的棱上** ✗
+    #       闭合终点 act=[0.0105, 0.0304] (两指相差 19.9mm) ✗
+    #       对照 box 版   act=[0.0127, 0.0182] (相差仅 5.5mm)  ✓
+    #     ⇒ SETTLE 前 5~6 帧非双侧 ✗ ⇒ PROVISIONAL_GRASP ✗ ⇒ CARRY 滑脱 173.97mm ✗
+    #   做法: 在 STAGE1_SETTLE 段内插入一次**小幅"开→再闭"**
+    #     (幅度 _S2_RESEAT_M, 默认 0 = 关闭 ✓)
+    #     ⇒ 给物体一个"自己坐正"的机会 ⇒ 两指重新落位 ⇒ 接触对称化 ✓
+    #   安全性: 只改 settle 段的 q 序列 ✓;
+    #     close 段与 recipe 校验(close_ctrl_q) **完全不动** ✓;
+    #     默认 0 时与原来逐位相同 ✓ ⇒ 不影响已跑通的 box 版 ✓
+    _reseat_m = float(os.environ.get("_S2_RESEAT_M", "0") or 0.0)
+    if _reseat_m > 0.0:
+        logger.warning(
+            "[Stage2 重坐] STAGE1_SETTLE 段插入 开→再闭 (幅度 %.1fmm, %d 个控制点) ⇒ 让物体自己坐正 ✓",
+            _reseat_m * 1000.0, int(hold_controls),
+        )
+    _reseat_q = []
+    for _k in range(int(hold_controls)):
+        _q_h = float(q_grasp)
+        if _reseat_m > 0.0 and int(hold_controls) >= 4:
+            _u = _k / float(int(hold_controls) - 1)
+            _w = (
+                float(np.sin(np.pi * (_u - 0.25) / 0.5))
+                if 0.25 <= _u <= 0.75
+                else 0.0
+            )
+            _q_h = float(q_grasp) + _reseat_m * _w
+        _reseat_q.append(_q_h)
+        append_control(
+            F50_IDX, STAGE1_PHASE_SETTLE, anchor_pos, anchor_R, _q_h, "BILATERAL_TARGET"
+        )
 
     verify_start_idx = len(source)
     for k in range(carry_verify_controls):
@@ -1927,6 +1959,26 @@ class Stage2Mixin:
         # 只在 close_start 之后生效: 接近段仍全开, 不改变碰撞余量.
         _grip_preload = float(os.environ.get("_GRIP_PRELOAD", "0") or 0.0)
         _close_start_idx = int(meta["close_start"])
+        # ★★★★ 2026-09-17 闭合"下限" (用户: "continue" / 方案 A) ★★★★
+        #   已实测 (output/fine64 / fine64b, 64 凸包精细分解 ✓):
+        #     门禁已推进到 **CARRY @controls=88** ✓ (PRE_F50_READY ✓ / PROVISIONAL_GRASP ✓ 都通过 ✓)
+        #     残余: 闭合末段手指 **act 一到 0.0107 (约 2mm 嵌入)** ⇒ 物体瞬间 objΔ[+3.5,-10.4,+8.4]mm ✗
+        #       ⇒ 4 个控制点后 **130mm** ✗ ⇒ 被弹射 ⇒ 携带段 dist2obj=108mm ✗ / 手指 act=0.0060 夹空 ✗
+        #   机制: CoACD 的 64 个凸包**逐个**加在同一刚体上 (方式正确 ✓), 但彼此**空间重叠** ✗
+        #     ⇒ 深度嵌入时同时接触多个重叠凸包 ⇒ 接触法向冲突 ⇒ 求解器冲量互杠 ⇒ **爆炸** ✗
+        #   几何模型 (已实测校验): q_grasp = q_contact − _GRIP_OVERCLOSURE
+        #     实测 q_grasp=0.0047 ✓ / _GRIP_OVERCLOSURE=0.008 ✓ ⇒ q_contact=**0.0127** ✓
+        #     ⇒ 名义过盈 **8mm** ✗ ⇒ 手指被命令压进物体 8mm ⇒ 必然触发上面的爆炸 ✗
+        #   为什么不用 `_GRIP_OVERCLOSURE` 直接调小 ✗: 它同时进入 Stage1 的抓取原语
+        #     (stage1_grasp_mixin:48/622 的 `_GRIP_TARGET`) ⇒ 改它 = 改 Stage1 抓取本身
+        #     ⇒ 实测 _GRIP_OVERCLOSURE=0.005/0.002 时物体直接被打飞 (drift 142~244mm ✗) ⇒ 不可用 ✗
+        #   本实现 (方案 A): 只在 **Stage2 下发命令处**给 q 加一个**下限** (floor) ✓
+        #     · bundle / timeline / recipe **完全不动** ✓ ⇒ stage1_reuse_report 的
+        #       "闭合序列逐位一致" 校验**不受影响** ✓
+        #     · 注意与 `_grip_preload` 方向相反: preload 是**更往里** ✗, floor 是**不许过深** ✓
+        #   目标值: floor ≈ 0.0120 ⇒ 实际过盈从 8mm ✗ 降到 **~0.7mm** ✓ (仍有正压力 ✓)
+        #   开关: `_S2_CLOSE_FLOOR_Q` (默认 0 ⇒ 不设时行为完全不变 ✓)
+        _close_floor_q = float(os.environ.get("_S2_CLOSE_FLOOR_Q", "0") or 0.0)
         # (2026-09-13) 这里曾有 _APPROACH_FINGER_K 分相位改夹爪刚度的旋钮, 已按用户
         # "夹爪从始至终应该是一个模式"的要求撤销.
         # 携带确认帧数 (0 = 该相位不存在, 其门禁整段跳过)
@@ -2118,6 +2170,40 @@ class Stage2Mixin:
                     )
                     if _stop:
                         break
+                # ★★★★ 2026-09-17 就位窗口逐点曲线 (用户: "继续") ★★★★
+                #   实测: CoACD 版 max_preclose_q_error = 3.06mm ✗, 阈值 0.003 (=3mm ✗)
+                #   ⇒ **只超 0.06mm (2%)** ✗; 且五轮各种位姿/参数下**数值恒定 3.06** ✗
+                #   ⇒ 不是"位姿敏感" ✗, 而是**判据恰好压在一个接触决定的物理量噪声带里** ✗
+                #   本打印: 暴露窗口内**逐点**误差与峰值帧号, 分辨:
+                #     单点尖峰 (其余点 ≈0) ⇒ 单帧毛刺 ✗ ⇒ 判据应用稳健统计 (中值/连续帧) ✓
+                #     整窗持续抬高        ⇒ 是真实持续跟不上 ✗ ⇒ 才该查物理 ✓
+                try:
+                    # 注意: preclose_q_error 形状是 (窗口, 2) —— **双指** ✓
+                    #   flat 索引直接索引 2D 数组会取到"整行", float() 即报
+                    #   "only length-1 arrays can be converted to Python scalars" ✗ (已实测 ✓)
+                    _err_all = np.abs(preclose_q_error) * 1000.0
+                    _err_mm = _err_all.ravel()
+                    _pk = int(np.argmax(_err_mm))
+                    _ph = None
+                    try:
+                        _ph_all = trace.get("phase") or trace.get("phases")
+                        if _ph_all is not None and len(_ph_all) >= len(_qa):
+                            _ph = list(np.asarray(_ph_all)[-_n_win:])
+                    except Exception:  # noqa: BLE001
+                        _ph = None
+                    logger.warning(
+                        "[就位窗口] close_start=idx%d 窗口=%d点 (窗口内全局 idx %d..%d) | "
+                        "逐点|act-cmd| mm=%s | 峰值=%.3fmm @窗口第%d点 | 窗口内相位=%s | "
+                        "cmd=%s act=%s",
+                        int(meta["close_start"]), _n_win,
+                        int(meta["close_start"]) - _n_win, int(meta["close_start"]) - 1,
+                        np.round(_err_mm, 3).tolist(), float(_err_mm[_pk]) + 0.0, _pk,
+                        _ph if _ph is not None else "n/a",
+                        np.round(np.asarray(_qc[-_n_win:], dtype=np.float64), 4).tolist(),
+                        np.round(np.asarray(_qa[-_n_win:], dtype=np.float64), 4).tolist(),
+                    )
+                except Exception as _ew:  # noqa: BLE001
+                    logger.warning("[就位窗口] 采集失败: %s", _ew)
                 if max_preclose_q_error > 0.003:
                     fail(
                         "PRE_F50_READY",
@@ -2135,6 +2221,9 @@ class Stage2Mixin:
             q_cmd = np.asarray(bundle["gripper_q"][index], dtype=np.float64)
             if _grip_preload > 0.0 and index >= _close_start_idx:
                 q_cmd = np.maximum(0.0, q_cmd - _grip_preload)
+            # 闭合下限 (方案 A): 与 preload 反方向 —— 不许手指嵌入过深 (见上方 _close_floor_q 注释)
+            if _close_floor_q > 0.0 and index >= _close_start_idx:
+                q_cmd = np.maximum(q_cmd, _close_floor_q)
             rz, ry, rx = _cmd_euler[index]
             for key, value in (
                 ("vx", target_pos[0]),
@@ -2184,6 +2273,34 @@ class Stage2Mixin:
             leak_contacts = audit["leak_contact"]
             ground_contacts = audit["ground_contact"]
             bilateral = bool(f1_contact and f2_contact and target_in_contacts)
+            # ★★★★ 2026-09-17 几何双侧兜底 (用户: "continue") ★★★★
+            #   现象 (已实测, output/objd): CoACD 线闭合段**物体全程 objΔ=[0.0,0.0,0.0]mm** ✓
+            #     (纹丝不动 ⇒ 被稳稳夹住 ✓ / 或一直被桌面摩擦固定 ✓), 手指 act 收到 0.0079 停住 ✓,
+            #     但 `f1/f2` 报 False ✗ ⇒ `target_bilateral` 恒 0 ✗ ⇒ PROVISIONAL_GRASP 必挂 ✗
+            #   根因: `_target_finger_contacts`(1304) 的 `object_bodies` 只登记 actor 的**第一个**
+            #     PhysxRigidDynamicComponent ✗ (line 1331 有 `break` ✗); 而 CoACD 是**多凸包复合碰撞体**
+            #     ⇒ 接触落在别的组件上 ⇒ 名字匹配不上 ⇒ is_target=False ✗
+            #     同文件的 `_contact_detail_pairs`(1368) 因为**现取** body.name ✓ 就能读到
+            #     ("link1 × glb_4 = 0.1268mm" ✓) ⇒ 两个函数读同一个 `scene.get_contacts()`,
+            #     差别只在**名字解析** ✓ ⇒ 排除"物理没夹住" ✗
+            #   旁证: SAPIEN 警告 "loading multiple convex collision meshes from STL file is
+            #     unsupported and can result in **invalid collision meshes**" ✗
+            #     ⇒ 多凸包碰撞体的**接触对查询不可靠** ✗ ⇒ 该判据在 CoACD 下测不到真值 ✗
+            #   修法 (与上一条建议一致): 换一条**与 SAPIEN 无关**的几何通道判"双侧夹住" ✓
+            #     指缝 = FINGER_GAP0 + 2·act ✓ (physics_env:264 同式 ✓), 物体 y 宽 = bbox_size[1] ✓
+            #     ⇒ 双侧夹住 ⟺ |指缝 − 物体宽| ≤ 4mm ✓
+            #   开关: `_BILATERAL_GEO_FALLBACK=1` 才启用 ✓ ⇒ **默认行为完全不变** ✓ (对 box 线零影响 ✓)
+            if not bilateral and os.environ.get("_BILATERAL_GEO_FALLBACK", "0") == "1":
+                try:
+                    _gap_geo = float(FINGER_GAP0) + 2.0 * float(
+                        np.mean(np.asarray(actual_qpos[[gi1, gi2]], dtype=np.float64))
+                    )
+                    _w_geo = float(
+                        self.obj_info.get(target_name, {}).get("bbox_size", [0.0, 0.0, 0.0])[1]
+                    )
+                    bilateral = bool(_w_geo > 0.0 and abs(_gap_geo - _w_geo) <= 0.004)
+                except Exception as _eg:  # noqa: BLE001
+                    logger.warning("[几何双侧兜底] 采集失败: %s", _eg)
             T_G_O = _relative_pose(T_W_G, T_W_O) if T_W_G is not None else None
 
             trace["control_index"].append(index)
@@ -2244,6 +2361,35 @@ class Stage2Mixin:
                     np.linalg.norm([actual_qvel[virtual_idx[k]] for k in ("rz", "ry", "rx")])
                 )
                 object_drift = float(np.linalg.norm(T_W_O[:3, 3] - initial_object_T[:3, 3]))
+                # ★★★★ 2026-09-17 drift 分解 (用户: "继续") ★★★★
+                #   实测三联 (轴向余量 6mm / 12mm / 不压平底面): drift **恒为 20.68mm** ✗
+                #     ⇒ 与一切几何/接近配置无关 ✗ ⇒ 不是"被手指推走" ✗, 是**常数项** ✗
+                #   代码事实: initial_object_T = reset_object_T (stage2_reconstruct_mixin:1921)
+                #     ⇒ 参考是 **reset 瞬间** 的位姿 ✗ (物体尚未在桌面坐实 ✗)
+                #     ⇒ "落到桌面坐实"的位移被当成漂移 ✗
+                #   量级吻合 ✓: 物体 bbox 高 39.29mm ⇒ 半高 **19.63mm** ≈ 20.68mm ✓
+                #     (box 版碰撞体=规则盒 ⇒ 与名义位姿一致 ⇒ 该项≈0 ✓ ⇒ 门禁通过 ✓;
+                #      CoACD 凸包支撑面 ≠ 名义位姿 ✗ ⇒ 多出 ~20mm ✗)
+                #   本打印: 把 drift 拆成 Δx/Δy/Δz, 一眼看出是"横向被推" ✗ 还是"z 落定" ✓
+                try:
+                    _d_now = np.asarray(T_W_O[:3, 3], dtype=np.float64)
+                    _d_ref = np.asarray(initial_object_T[:3, 3], dtype=np.float64)
+                    logger.warning(
+                        "[drift 分解] idx=%d | 当前 z=%.4f 参考 z=%.4f | "
+                        "Δx=%+.2fmm Δy=%+.2fmm Δz=%+.2fmm | 横向=%.3fmm 垂向=%.3fmm | "
+                        "总=%.2fmm (阈值 %.1fmm) | 物体 bbox 半高=%.2fmm",
+                        index, float(_d_now[2]), float(_d_ref[2]),
+                        (_d_now[0] - _d_ref[0]) * 1000.0,
+                        (_d_now[1] - _d_ref[1]) * 1000.0,
+                        (_d_now[2] - _d_ref[2]) * 1000.0,
+                        float(np.linalg.norm(_d_now[:2] - _d_ref[:2]) * 1000.0),
+                        float(abs(_d_now[2] - _d_ref[2]) * 1000.0),
+                        object_drift * 1000.0, PRE_GRASP_OBJECT_DRIFT_M * 1000.0,
+                        float(self._target_bbox_size(target_actor)[2] * 1000.0 / 2.0)
+                        if hasattr(self, "_target_bbox_size") else float("nan"),
+                    )
+                except Exception as _ed:  # noqa: BLE001
+                    logger.warning("[drift 分解] 采集失败: %s", _ed)
                 ready_samples.append(
                     {
                         # ★ 2026-09-13 (用户定策一致性修正):
@@ -2280,6 +2426,53 @@ class Stage2Mixin:
                     meta["settle_start"] : meta["settle_end"] + 1
                 ]
                 object_drift = float(np.linalg.norm(T_W_O[:3, 3] - initial_object_T[:3, 3]))
+                # ★★★★ 2026-09-17 闭合段逐控制点转储 (用户: "continue") ★★★★
+                #   现状 (CoACD, 缓存 key 修好后): 门禁已推进到 `PROVISIONAL_GRASP` @hold_end ✓
+                #     唯一卡点: settle bilateral = [F,F,F,F,F,F,F,F,F,T] ✗
+                #       判据: sum >= settle_n-2 (=8) 且末 3 个全 True
+                #     预紧单调有效 (0 → 1 个, 0.002 → 3 个, 0.004 → 4 个 ✓) 但 +0.002 只换 1 个 ✗
+                #       ⇒ 到 8 个需 ~0.010 ⇒ 有过度挤压风险 ✗
+                #     已排除: _Q_OPEN 变小 ✗ (擦碰↑) / q_near ✗ (项目废弃) / carry_time_scale ✗ (无影响)
+                #   ⇒ 本转储: 看**闭合窗内手指到底走到哪**, 判定该延长闭合段还是该后移静置窗
+                #     判据: 静置窗打开时 act 是否已到接触阈值 q≈0.0224 (物体凸包 y 半宽 37.6mm) ✓
+                #           以及 f1/f2 分别何时变 1 ⇒ 是"还没夹上" ✗ 还是"单侧夹上" ✗
+                try:
+                    _cs = int(meta["close_start"])
+                    _he = int(meta["hold_end"])
+                    _qc_all = np.asarray(trace["gripper_q_cmd"], dtype=np.float64)
+                    _qa_all = np.asarray(trace["gripper_q_actual"], dtype=np.float64)
+                    _bl_all = np.asarray(trace["target_bilateral"], dtype=bool)
+                    _ph_all = np.asarray(trace["phase"], dtype="U24")
+                    _f1_all = np.asarray(trace["finger1_contact"], dtype=bool)
+                    _f2_all = np.asarray(trace["finger2_contact"], dtype=bool)
+                    _oT_all = np.asarray(trace["object_T"], dtype=np.float64)
+                    _rows = []
+                    for _k in range(_cs, min(_he + 1, len(_bl_all))):
+                        # ★ 2026-09-17 加物体实际位置 (用户: "continue") ★
+                        #   现象: act 从 0.0127(接触点) creep 到 0.0079 ✗ 后 f1/f2 双双失接触 ✗
+                        #     ⇒ 指缝 46mm ✗ < 物体 55.9mm ✗ ⇒ **物体已不在指间** ✗
+                        #   但"往哪跑"未知 ✗ ⇒ 量 dx/dy/dz (相对复位后静置位姿 ✓):
+                        #     横向 dy 大 (闭合轴) ⇒ 被"推"出去 ✗ ⇒ 查摩擦/接触时序
+                        #     垂向 dz 大 (上下)   ⇒ 被"楔"出去 ✗ ⇒ 查手指几何/开口方向
+                        _dz = _oT_all[_k][:3, 3] - np.asarray(initial_object_T, dtype=np.float64)[:3, 3]
+                        _rows.append(
+                            "%d|%s cmd%.4f act%.4f[%.4f,%.4f] f1=%d f2=%d bl=%d objΔ[%+.1f,%+.1f,%+.1f]mm"
+                            % (
+                                _k, str(_ph_all[_k])[:10],
+                                float(_qc_all[_k][0]), float(_qa_all[_k].mean()),
+                                float(_qa_all[_k][0]), float(_qa_all[_k][1]),
+                                int(_f1_all[_k]), int(_f2_all[_k]), int(_bl_all[_k]),
+                                float(_dz[0] * 1000.0), float(_dz[1] * 1000.0),
+                                float(_dz[2] * 1000.0),
+                            )
+                        )
+                    logger.warning(
+                        "[闭合段逐点] close_start=%d settle窗=%d..%d hold_end=%d\n%s",
+                        _cs, int(meta["settle_start"]), int(meta["settle_end"]), _he,
+                        "\n".join("    " + r for r in _rows),
+                    )
+                except Exception as _ec:  # noqa: BLE001
+                    logger.warning("[闭合段逐点] 采集失败: %s", _ec)
                 if len(settle_bilateral) != settle_n:
                     fail(
                         "PROVISIONAL_GRASP",
@@ -2685,6 +2878,41 @@ class Stage2Mixin:
                     "← 有帧夹爪朝上 ✗" if _up2 else "✓ 全程朝下")
         except Exception as _e2:  # noqa: BLE001
             logger.warning("[Stage2 CSV] 写出失败: %s", _e2)
+
+        # ★★★★ 2026-09-17 夹空判据 (用户: "夹空这个确实需要改正一下") ★★★★
+        #   背景 (CoACD 实测 output/coacd_s2): 门禁全程绿灯 ✗ 而实际是**夹空**:
+        #     · CARRY 手指 act=[0.0057,0.0097] ✗ 几乎等于命令 0.0047 ⇒ **没被物体挡停** ⇒ 手里空的
+        #     · CARRY dist2obj=101.6mm ✗ (box 版 37.7mm)  · max_pen=0.0000mm ✗ (只擦到)
+        #     · 但 dist2obj 测的是"夹爪基座↔物体中心" ✗ ⇒ 分不清"在两指之间"和"在前方 35mm" ✗
+        #   判据: 携带段里, 手指**实际开合**必须明显大于**命令** (被物体挡停产生的闭合差)
+        #     闭合差 = max(act - cmd) over CARRY 段
+        #     ⇒ 夹住 ⇒ 闭合差 ≈ 6~10mm ✓ ; 夹空 ⇒ 闭合差 ≈ 0 ✗
+        try:
+            _gqa = np.asarray(trace.get("gripper_q_actual", []), dtype=np.float64)
+            _gqc = np.asarray(trace.get("gripper_q_cmd", []), dtype=np.float64)
+            _pha = np.asarray(trace.get("phase", []), dtype="U24")
+            _carry_m = _pha == "CARRY"
+            if _carry_m.any() and _gqa.size == _gqc.size and _gqa.shape == _gqc.shape:
+                _closure = float(np.max(_gqa[_carry_m] - _gqc[_carry_m]))
+                _min_needed = float(os.environ.get("_MIN_CARRY_CLOSURE_M", "0.002"))
+                metrics["carry_closure_mm"] = _closure * 1000.0
+                logger.warning(
+                    "[Stage2 夹持校验] 携带段手指闭合差=%.2fmm (阈值 %.2fmm) ⇒ %s",
+                    _closure * 1000.0, _min_needed * 1000.0,
+                    "真夹住 ✓" if _closure >= _min_needed else "**夹空** ✗",
+                )
+                if _closure < _min_needed and gate_result.get("passed", False):
+                    gate_result.update({
+                        "passed": False,
+                        "failure": "EMPTY_GRASP",
+                        "failure_detail": (
+                            f"携带段手指未被物体挡停 (闭合差={_closure * 1000.0:.2f}mm "
+                            f"< {_min_needed * 1000.0:.2f}mm) ⇒ **夹空**, 物体不在两指之间"
+                        ),
+                    })
+                    logger.error("[Stage2 gate] EMPTY_GRASP: %s", gate_result["failure_detail"])
+        except Exception as _egc:  # noqa: BLE001
+            logger.warning("[Stage2 夹持校验] 采集失败: %s", _egc)
 
         # 夹爪接触明细 (2026-09-11): 定位"到底跟什么碰、穿多深、第几个控制点开始"
         if contact_detail:

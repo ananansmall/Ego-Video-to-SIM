@@ -225,7 +225,20 @@ _GRIP_CLOSE = 0.0       # PD 闭合目标 qpos; 设为关节下限, 让 PD 在�
 # v4.28b: 0.0045 -> 0.008. 实测手指停稳位 0.0430 仍只产生 ~3.2N (估算误差实际
 # 0.0043, 0.0045 仅剩 0.0002 挤压). 0.008 -> 目标 0.0393, 相对实际接触点 ~0.0037
 # 关节单位 -> ~59N/指, 对称挤压不产生横向推力, 摩擦容量 2*mu*N 远大于 7.7N 物重.
-_GRIP_OVERCLOSURE = 0.008  # 目标 qpos 比几何接触点再收紧量 (关节单位), 保证持续正压力
+_GRIP_OVERCLOSURE = float(
+    os.environ.get("_GRIP_OVERCLOSURE", "0.008")
+)  # 目标 qpos 比几何接触点再收紧量 (关节单位), 保证持续正压力
+# ★★★★ 2026-09-17 补上 env 读取 (用户: "continue" / 目标: CoACD 线 Stage2 通过) ★★★★
+#   BUG: 本常量原先写死为 0.008 ✗, 但它已被列在"可调/可导出"名单里 (见本文件 physics 配置
+#     导出处 "_DESCEND_OPEN", "_GRIP_CLOSE", "_GRIP_OVERCLOSURE") ⇒ 说明**本就该可调** ✗
+#   实测证据: 设 `_GRIP_OVERCLOSURE=0.002` 后, 与不设时 **bundle hash 完全相同**
+#     (f974fbf9c44b ✓), cmd 仍是 0.0047 ✗ ⇒ 环境变量**完全没被读取** ✗
+#   几何模型 (已实测校验 ✓): q_grasp = q_contact − _GRIP_OVERCLOSURE
+#     实测 q_grasp=0.0047 ✓, _GRIP_OVERCLOSURE=0.008 ✓ ⇒ q_contact=0.0127 ✓
+#     独立按物体 y 宽 55.9mm 算: (0.0559−0.0304)/2 = 0.0128 ✓ ⇒ **吻合** ✓
+#   0.008 的过盈对 **55.9mm 宽的轻物体 (~72g)** 偏大 ✗: 约 8N ⇒ 手指一路压到 act=0.0080
+#     (指缝 46.4mm ✗ < 物体 55.9mm ✗) ⇒ **物体被挤出指间** ✗ ⇒ f1/f2 双双失接触 ✗
+#   故需要可调旋钮 (默认仍 0.008 ⇒ 不设时行为完全不变 ✓)
 
 # Stage 1 夹持力策略 (与 plan v4.4 对齐, 减少硬编码解析)
 # v4.7: force_limit 上限由 GRIPPER_FORCE=100N 决定, 单策略简化
@@ -854,8 +867,24 @@ def setup_robot(scene, mode, side, base_pos, base_quat):
         logger.info(f"  gripper_only: 已禁用所有 robot link 重力 (虚拟关节 PD 驱动, 无重力干扰)")
 
     # 夹爪摩擦对齐 GalaxeaManipSim R1 (static=1.0, dynamic=1.0, restitution=0.6)
+    # ★★★★ 2026-09-17 restitution 改为 env 可调 (用户: "continue"; 默认 0.6 不变 ⇒ 对 box 线零影响) ★★★★
+    #   背景 (实测 output/fine64): CoACD 线的**求解爆炸**已精确定位到
+    #     手指 act 一到 0.0107 (约 2mm 嵌入 ✗) ⇒ 物体瞬间 objΔ[+3.5,-10.4,+8.4]mm ✗
+    #     ⇒ 4 个控制点后 130mm ✗ ⇒ 被"弹射"出去 ✓
+    #   机制: CoACD 的 64 个凸包**逐个**加在同一刚体上 (data_loader:483-490, 方式正确 ✓),
+    #     但这些凸包在空间上**互相重叠** ✗ (CoACD 的正常输出 ✓)
+    #     ⇒ 手指嵌入时同时接触**多个**重叠凸包 ⇒ 接触法向互相冲突 ✗
+    #     ⇒ 求解器冲量互杠 ⇒ 深度嵌入时**爆炸** ✗
+    #   而这里的 restitution=0.6 ✗ (60% 弹性 ✗) 会把冲量冲突进一步放大 ✓
+    #   依据: 注释称"对齐 R1 的 static=1.0/dynamic=1.0/restitution=0.6" ✓,
+    #     但代码里摩擦早已改用 `GRIPPER_FRICTION` (抓取需要, 我们设 4.0 ✗)
+    #     ⇒ **"对齐 R1"的前提已不成立** ✗ ⇒ restitution 同样可按"夹持稳定性"重定 ✓
+    #   物理上也更合理: 夹爪应**吸收**冲击而非反弹 (restitution→0) ✓
+    #   开关: `_GRIP_RESTITUTION` (默认 0.6 ✓ ⇒ 不设时行为完全不变 ✓)
+    _grip_restitution = float(os.environ.get("_GRIP_RESTITUTION", "0.6"))
     gripper_material = scene.create_physical_material(
-        static_friction=GRIPPER_FRICTION, dynamic_friction=GRIPPER_FRICTION, restitution=0.6
+        static_friction=GRIPPER_FRICTION, dynamic_friction=GRIPPER_FRICTION,
+        restitution=_grip_restitution,
     )
     touch_link_names = []
     for s in sides:
