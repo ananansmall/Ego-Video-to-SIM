@@ -4,6 +4,46 @@
 
 ---
 
+## [2026-09-24 14:50] 打包发布 Snapshot v0.1-2026-09-24 到 GitHub
+
+### 目的
+把工作区当前状态打成一个可追溯的版本快照，方便日后回退到"这一版能跑的样子"。
+
+### Git 操作（无代码逻辑改动）
+- 分支 `main` 推送：`e1ee749` + 新 `ddecf1a` → `origin/main`
+  - `origin` = `git@github.com:ananansmall/Ego-centric-Video-to-Simulation.git`
+- 新 annotated tag: `v0.1-2026-09-24` → 指向 `ddecf1a41b497facbd692478e774e57a6a5fe2e9`
+  - `git push origin v0.1-2026-09-24` 已同步远程
+
+### 提交 ddecf1a 内容概览
+- **新增主线入口**: `mainv3.py`（完整 Ego-centric video → simulation 管线入口）
+- **新增 stage61 sapien 仿真栈**: `tools/sapien_loader.py`、`stage61_sim_sapien.py`、`stage61_render_scene.py`、`stage61_render_pyrender.py`、`stage61_fixed_camera.py`、`stage61_visualize_sapien.py`、`test_minimal_sapien.py`
+- **新增 src 模块**: `pick_place_detector.py`、`stage61_urdf_generator.py`、`vlm_logger.py`、`__init__.py`
+- **新增工具**: `material_annotator.py`、`materials_db.json`、`diagnose_penetration.py`、`diagnose_scenes.py`、`rescale_meshes_by_pointcloud.py`、`render_glb_preview.py`、`qwen_client.py`、`visualize_local.py`、`wrist_trajectory_3d.py`、`test_pointcloud_vs_mesh_size.py`
+- **文档重组**: `docs/*.md` 重命名到 `docs/{design,pipeline,research}/` 三类目录，新增 `docs/README.md`、`SAM3D_SCALE_DRIFT_REPORT.md`、`design/stage61_urdf_plan.md`、`design/stage6_design.md`、`pipeline/stage5_refinement_analysis.md`、`research/MAIN_MODEL_CALLING_FLOWS.md`
+- **测试重构**: 根目录 5 个 `test_*.py` 删除，新增 `test/` 目录下 8 个结构化子测试
+- **代码增强**: `mainv2.py`、`src/geometry_utils.py`、`src/object_segmentation.py`、`src/sg_deduplication.py`、`tools/generate_scene_json_stage1.py`、`tools/infer_relations_scene_graph.py`、`tools/refine_inter_object_placement.py`、`tools/refine_other_objects_relations.py`、`stage4/run_alignment.py`、`tools/asset_verifier.py`
+- **新增计划文档**: `dynamic_object_detection_plan.md`、`dynamic_pointcloud_output_plan.md`、`analyze_7a_scene.py`、`quick_verify_7a.py`、`test_verify_7a_stage3.py`
+- **删除**: `docs/stage5_physics_engine_proposal.md`、`tools/debug_chair_scale*.py`、`tools/test_sam3d_scale.py`
+- **`.gitignore`**: 新增 `.trae/`（IDE 目录不进仓库）
+
+### 后续回退方式
+```bash
+# 回到本快照
+git checkout v0.1-2026-09-24
+# 回到上一次远程状态（无 tag）
+git checkout 85c5949
+# 看所有历史
+git log --oneline --all
+```
+
+### ⚠️ Docs to Review
+- `GIT_GUIDE.md`: 目前未提及 tag 用法。后续如果要建立"版本打 tag"的流程规范，可以补一节。
+- `TECHNICAL_DOCUMENTATION.md`: 内容停留在 stage5 阶段，未涵盖 stage61 sapien 仿真栈。功能完善后需同步。
+- `README.md`: 未提及 `mainv3.py` 这个新入口，也未链接 `docs/README.md` 分类导航。
+
+---
+
 ## [2026-07-24 21:30] 修复CLIP去重阈值过低导致所有物体被链式合并为1个
 
 ### Changed
