@@ -1,0 +1,111 @@
+Sun Aug  9 10:32:21 PM CST 2026 开始轮询 GPU 空闲...
+Sun Aug  9 10:33:22 PM CST 2026 GPU 1 空闲, 启动验证 (CUDA_VISIBLE_DEVICES=1)
+/mnt/data/lza/conda_envs/ReplicateAnyScene/lib/python3.11/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+======================================================================
+Stage 1 原始关系: {"bag": "supported by other objects", "bib": "supported by other objects", "bottle": "supported by other objects", "cabinet": "supported by floor", "chair": "supported by floor", "clothes": "supported by other objects", "clothes_rack": "supported by floor", "cup": "supported by other objects", "curtains": "attached to wall", "mask": "supported by other objects", "package": "supported by other objects", "refrigerator": "supported by floor", "router": "supported by other objects", "table": "supported by floor", "television": "supported by other objects", "toy": "supported by other objects"}
+======================================================================
+   📷 准备数据...
+   📋 实例列表: ['bag_0', 'bib', 'bottle_0', 'cabinet_0', 'cabinet_1', 'cabinet_2', 'chair_0', 'chair_1', 'clothes_0', 'clothes_1', 'clothes_2', 'clothes_3', 'clothes_rack_0', 'cup', 'curtains_0', 'curtains_1', 'curtains_2', 'curtains_3', 'curtains_4', 'curtains_5', 'curtains_6', 'mask', 'package', 'refrigerator', 'router_0', 'table_0', 'television_0', 'toy']
+   🔄 动态物体 bottle_0: 首次出现在帧 #0
+   📷 Step 1: 全场景预览...
+   🤖 加载VLM: /mnt/data/lza/models/Qwen3.5-9B
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/760 [00:00<?, ?it/s]Loading weights:   0%|          | 1/760 [00:00<03:52,  3.27it/s]Loading weights:   0%|          | 2/760 [00:00<04:20,  2.91it/s]Loading weights:   2%|▏         | 15/760 [00:00<00:27, 27.41it/s]Loading weights:   4%|▍         | 29/760 [00:00<00:14, 49.55it/s]Loading weights:   6%|▌         | 43/760 [00:01<00:10, 66.96it/s]Loading weights:   7%|▋         | 54/760 [00:01<00:09, 74.54it/s]Loading weights:   9%|▉         | 68/760 [00:01<00:08, 85.90it/s]Loading weights:  11%|█         | 82/760 [00:01<00:07, 94.51it/s]Loading weights:  12%|█▎        | 95/760 [00:01<00:06, 99.56it/s]Loading weights:  14%|█▍        | 107/760 [00:01<00:06, 101.70it/s]Loading weights:  16%|█▌        | 120/760 [00:01<00:06, 102.75it/s]Loading weights:  18%|█▊        | 135/760 [00:01<00:05, 109.22it/s]Loading weights:  20%|█▉        | 149/760 [00:01<00:05, 110.81it/s]Loading weights:  21%|██        | 161/760 [00:02<00:05, 109.64it/s]Loading weights:  23%|██▎       | 173/760 [00:02<00:05, 110.65it/s]Loading weights:  25%|██▍       | 187/760 [00:02<00:05, 112.33it/s]Loading weights:  26%|██▋       | 201/760 [00:02<00:04, 113.52it/s]Loading weights:  28%|██▊       | 213/760 [00:02<00:05, 104.37it/s]Loading weights:  30%|██▉       | 227/760 [00:02<00:04, 107.34it/s]Loading weights:  32%|███▏      | 241/760 [00:02<00:04, 109.75it/s]Loading weights:  34%|███▎      | 255/760 [00:02<00:04, 110.13it/s]Loading weights:  35%|███▌      | 267/760 [00:03<00:04, 107.99it/s]Loading weights:  37%|███▋      | 280/760 [00:03<00:04, 107.44it/s]Loading weights:  39%|███▊      | 293/760 [00:03<00:04, 107.21it/s]Loading weights:  41%|████      | 308/760 [00:03<00:04, 111.79it/s]Loading weights:  42%|████▏     | 320/760 [00:03<00:04, 109.53it/s]Loading weights:  44%|████▍     | 333/760 [00:03<00:03, 109.16it/s]Loading weights:  46%|████▌     | 347/760 [00:03<00:03, 111.20it/s]Loading weights:  48%|████▊     | 361/760 [00:03<00:03, 111.96it/s]Loading weights:  49%|████▉     | 373/760 [00:04<00:03, 110.01it/s]Loading weights:  51%|█████     | 386/760 [00:04<00:03, 109.25it/s]Loading weights:  53%|█████▎    | 400/760 [00:04<00:03, 109.65it/s]Loading weights:  54%|█████▍    | 414/760 [00:04<00:03, 111.01it/s]Loading weights:  56%|█████▌    | 426/760 [00:04<00:03, 109.21it/s]Loading weights:  72%|███████▎  | 551/760 [00:04<00:00, 408.03it/s]Loading weights:  87%|████████▋ | 663/760 [00:04<00:00, 599.39it/s]Loading weights:  99%|█████████▉| 755/760 [00:04<00:00, 676.79it/s]Loading weights: 100%|██████████| 760/760 [00:04<00:00, 157.57it/s]
+   📷 Step 1: 全场景预览投票 (frame 78)...
+   📊 preview: bag_0 → supported by table_0
+   📊 preview: bib → supported by table_0
+   📊 preview: bottle_0 → supported by table_0
+   📊 preview: cabinet_0 → supported by floor
+   📊 preview: cabinet_1 → supported by floor
+   📊 preview: cabinet_2 → supported by floor
+   📊 preview: chair_0 → supported by floor
+   📊 preview: chair_1 → supported by floor
+   📊 preview: clothes_0 → supported by clothes_rack_0
+   📊 preview: clothes_1 → supported by clothes_rack_0
+   📊 preview: clothes_2 → supported by clothes_rack_0
+   📊 preview: clothes_3 → supported by clothes_rack_0
+   📊 preview: clothes_rack_0 → supported by floor
+   📊 preview: cup → supported by table_0
+   📊 preview: curtains_0 → attached to wall
+   📊 preview: curtains_1 → attached to wall
+   📊 preview: curtains_2 → attached to wall
+   📊 preview: curtains_3 → attached to wall
+   📊 preview: curtains_4 → attached to wall
+   📊 preview: curtains_5 → attached to wall
+   📊 preview: curtains_6 → attached to wall
+   📊 preview: mask → supported by table_0
+   📊 preview: package → supported by table_0
+   📊 preview: refrigerator → supported by floor
+   📊 preview: router_0 → supported by table_0
+   📊 preview: table_0 → supported by floor
+   📊 preview: television_0 → supported by floor
+   📊 preview: toy → supported by table_0
+   📊 全场景预览共解析 28 个物体
+   📷 Step 2: 逐实例多帧投票...
+   ✅ bag_0: supported by cabinet_0 (4 票: {'supported by table_0': 2, 'supported by cabinet_0': 3})
+   ✅ bib: supported by table_0 (2 票: {'supported by table_0': 1, 'supported by floor': 1})
+   ✅ bottle_0: supported by table_0 (4 票: {'supported by table_0': 12, 'supported by chair_0': 2})
+   ✅ cabinet_0: supported by floor (4 票: {'supported by floor': 5})
+   ✅ cabinet_1: supported by floor (4 票: {'supported by floor': 5})
+   ✅ cabinet_2: supported by floor (4 票: {'supported by floor': 5})
+   ✅ chair_0: supported by floor (4 票: {'supported by floor': 5})
+   ✅ chair_1: supported by floor (4 票: {'supported by floor': 5})
+   ⚠️ clothes_0: 原关系为 other objects，VLM未明确具体支撑物(supported by floor)，保留原始关系不降级
+   ✅ clothes_0: supported by other objects (4 票: {'supported by clothes_rack_0': 2, 'supported by floor': 3})
+   ✅ clothes_1: supported by clothes_rack_0 (4 票: {'supported by clothes_rack_0': 2, 'supported by other objects': 2, 'supported by floor': 1})
+   ✅ clothes_2: supported by clothes_rack_0 (4 票: {'supported by clothes_rack_0': 4, 'supported by floor': 1})
+   ✅ clothes_3: supported by clothes_rack_0 (4 票: {'supported by clothes_rack_0': 4, 'supported by floor': 1})
+   ✅ clothes_rack_0: supported by floor (4 票: {'supported by floor': 5})
+   ✅ cup: supported by table_0 (2 票: {'supported by table_0': 2})
+   ✅ curtains_0: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_1: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_2: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_3: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_4: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_5: attached to wall (4 票: {'attached to wall': 5})
+   ✅ curtains_6: attached to wall (4 票: {'attached to wall': 5})
+   ✅ mask: supported by table_0 (2 票: {'supported by table_0': 2})
+   ✅ package: supported by table_0 (3 票: {'supported by table_0': 2, 'supported by floor': 1})
+   ✅ refrigerator: supported by floor (2 票: {'supported by floor': 2})
+   ✅ router_0: supported by table_0 (4 票: {'supported by table_0': 2, 'supported by cabinet_1': 2, 'supported by floor': 1})
+   ✅ table_0: supported by floor (4 票: {'supported by floor': 5})
+   ⚠️ television_0: 原关系为 other objects，VLM未明确具体支撑物(supported by floor)，保留原始关系不降级
+   ✅ television_0: supported by other objects (3 票: {'supported by floor': 2, 'supported by cabinet_1': 2})
+   ✅ toy: supported by table_0 (2 票: {'supported by table_0': 2})
+   🔧 Step 3: 物理常识后处理...
+   💾 场景图关系已保存: /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/output_v2/3chair-bottle_vggt_omega/relations_scene_graph.json
+
+======================================================================
+修复后 5.1 关系:
+  bag_0: supported by cabinet_0  ⚠️ 改动
+  bib: supported by table_0  ⚠️ 改动
+  bottle_0: supported by table_0  ⚠️ 改动
+  cabinet_0: supported by floor
+  cabinet_1: supported by floor
+  cabinet_2: supported by floor
+  chair_0: supported by floor
+  chair_1: supported by floor
+  clothes_0: supported by other objects
+  clothes_1: supported by clothes_rack_0  ⚠️ 改动
+  clothes_2: supported by clothes_rack_0  ⚠️ 改动
+  clothes_3: supported by clothes_rack_0  ⚠️ 改动
+  clothes_rack_0: supported by floor
+  cup: supported by table_0  ⚠️ 改动
+  curtains_0: attached to wall
+  curtains_1: attached to wall
+  curtains_2: attached to wall
+  curtains_3: attached to wall
+  curtains_4: attached to wall
+  curtains_5: attached to wall
+  curtains_6: attached to wall
+  mask: supported by table_0  ⚠️ 改动
+  package: supported by table_0  ⚠️ 改动
+  refrigerator: supported by floor
+  router_0: supported by table_0  ⚠️ 改动
+  table_0: supported by floor
+  television_0: supported by other objects
+  toy: supported by table_0  ⚠️ 改动
+======================================================================
+Sun Aug  9 11:31:49 PM CST 2026 验证完成, exit=0

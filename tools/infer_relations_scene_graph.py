@@ -47,6 +47,8 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 from PIL import Image
 
+from src.vlm_logger import vlm_inference, set_vlm_log_dir
+
 
 FILTER_CATEGORIES = {
     'floor', 'wall', 'ground', 'ceiling', 'floor_area', 'wall_section',
@@ -76,290 +78,277 @@ MUST_BE_WALL_ATTACHED = {
 }
 
 
-def create_id_labeled_image(
+def build_instance_names(categories_and_relations: Dict[str, str]) -> List[str]:
+    """从 categories_and_relations 构建实例名列表
+
+    规则:
+      - 如果 key 带 _数字 后缀 (如 toy_0, duck_1) → 保留原样
+      - 如果 key 不带 _数字 后缀 (如 toy, duck) → 推断实例数量后展开
+        从 scene_dir/optimal_frames/instance_visibility.json 读取实例数
+
+    返回:
+      实例名列表，如 ["duck_0", "duck_1", "plate_0", "toy_0", ...]
+    """
+    instance_names = []
+    for key in categories_and_relations:
+        if key.lower() in FILTER_CATEGORIES:
+            continue
+        if '_' in key and key.rsplit('_', 1)[-1].isdigit():
+            # 已经是实例级 key
+            instance_names.append(key)
+        else:
+            # 需要展开为实例级
+            instance_names.append(key)  # 暂时用类别名，调用者负责展开
+
+    return instance_names
+
+
+def create_labeled_frame_image(
     frame_image: np.ndarray,
+    visible_instances: List[str],
     instance_masks: Dict[str, List[Dict]],
-    categories_and_relations: Dict[str, str],
-    display_id_offset: int = 3,
-    best_frame_id: int = None,
+    frame_id: int,
 ) -> np.ndarray:
     """
-    在帧图像上为每个可见实例绘制ID标注 (绿色边框 + 红色编号)
+    在帧图像上为每个可见实例绘制彩色 bounding box + 实例名
 
     参数:
         frame_image: RGB图像 (H, W, 3)
-        instance_masks: {category: [{frame_id, mask}, ...]} 每个实例的mask数据
-        categories_and_relations: {category: relation} 物体关系
-        display_id_offset: 显示ID偏移 (与SimRecon一致, floor=1, wall=2, 物体从3开始)
-        best_frame_id: 当前标注的帧ID, 用于从每个实例的mask列表中选取对应帧的mask
+        visible_instances: 该帧中可见的实例名列表 (如 ["duck_0", "plate_0", "toy_0"])
+        instance_masks: mask 数据 {category: [{frame_id, mask}, ...], ...}
+        frame_id: 当前帧的 ID
     返回:
-        标注后的RGB图像
+        标注后的RGB图像 (带彩色框和实例名)
     """
     annotated = frame_image.copy()
-    display_id = display_id_offset
+    h, w = annotated.shape[:2]
 
-    category_to_display_ids = {}
+    # 为每个实例生成固定颜色 (基于实例名哈希, 保证同实例同色)
+    instance_colors = {}
+    for inst_name in visible_instances:
+        hash_val = hash(inst_name) % (256 * 256 * 256)
+        r = (hash_val >> 16) & 0xFF
+        g = (hash_val >> 8) & 0xFF
+        b = hash_val & 0xFF
+        instance_colors[inst_name] = (r, g, b)
 
-    for category in categories_and_relations:
-        if category.lower() in FILTER_CATEGORIES:
-            continue
+    # 为每个可见实例查找 mask 并绘制 bounding box
+    for inst_name in visible_instances:
+        color = instance_colors[inst_name]
+        # 解析实例名: "duck_0" → category="duck", idx=0
+        parts = inst_name.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            category, inst_idx = parts[0], int(parts[1])
+        else:
+            # 非 "category_idx" 格式的实例名 (如纯类别名 "car" 或 "car_car"),
+            # 整名当作类别, 索引取 0; 若在 instance_masks 中找不到整名对应的类别,
+            # 会安全跳过 (见下方 cat_masks 判空), 避免 int() 抛 ValueError 崩溃
+            category, inst_idx = inst_name, 0
 
-        cat_masks = instance_masks.get(category, [])
+        # 从 instance_masks 中查找该实例的 mask
+        cat_masks = instance_masks.get(category)
         if not cat_masks:
             continue
+        if inst_idx >= len(cat_masks):
+            continue
+        instance_mask_list = cat_masks[inst_idx]
 
-        category_to_display_ids[category] = []
+        # 找到 frame_id 对应的 mask
+        bbox = None
+        for mask_entry in instance_mask_list:
+            if mask_entry.get('frame_id') == frame_id:
+                mask = mask_entry.get('mask')
+                if mask is not None and mask.ndim >= 2:
+                    coords = np.where(mask > 0)
+                    if len(coords[0]) > 0:
+                        y_min, y_max = coords[0].min(), coords[0].max()
+                        x_min, x_max = coords[1].min(), coords[1].max()
+                        bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                break
 
-        for inst_idx, inst_mask_list in enumerate(cat_masks):
-            # 优先选 best_frame_id 对应的 mask; 找不到则回退到第一个
-            mask_for_frame = None
-            if best_frame_id is not None:
-                for im in inst_mask_list:
-                    if im.get('frame_id') == best_frame_id:
-                        mask_for_frame = im['mask']
-                        break
-            if mask_for_frame is None and inst_mask_list:
-                mask_for_frame = inst_mask_list[0]['mask']
+        if bbox is None:
+            # 没有 mask，跳过
+            continue
 
-            if mask_for_frame is None:
-                category_to_display_ids[category].append(display_id)
-                display_id += 1
-                continue
+        x, y, bw, bh = bbox
+        # 边界保护
+        x = max(0, min(x, w - 1))
+        y = max(0, min(y, h - 1))
+        bw = max(1, min(bw, w - x))
+        bh = max(1, min(bh, h - y))
 
-            if mask_for_frame.shape[:2] != annotated.shape[:2]:
-                category_to_display_ids[category].append(display_id)
-                display_id += 1
-                continue
+        # 绘制矩形框
+        cv2.rectangle(annotated, (x, y), (x + bw, y + bh), color, 2)
 
-            ys, xs = np.where(mask_for_frame > 0)
-            if len(ys) == 0:
-                category_to_display_ids[category].append(display_id)
-                display_id += 1
-                continue
+        # 绘制实例名标签 (在框上方)
+        label = inst_name
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 2
+        text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+        label_y = max(y - text_size[1] - 5, 5)
 
-            x_min, x_max = int(xs.min()), int(xs.max())
-            y_min, y_max = int(ys.min()), int(ys.max())
+        # 标签背景
+        cv2.rectangle(annotated,
+                      (x, label_y - text_size[1] - 3),
+                      (x + text_size[0], label_y + 3),
+                      color, -1)
+        # 标签文字
+        cv2.putText(annotated, label, (x + 2, label_y),
+                    font, font_scale, (255, 255, 255), thickness)
 
-            cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (0, 255, 0), 3)
-
-            label = str(display_id)
-            font_scale = max(0.8, min(2.0, (x_max - x_min) / 50.0))
-            thickness = max(2, int(font_scale))
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-            label_x = x_min
-            label_y = max(y_min - 5, th + 5)
-            cv2.rectangle(annotated, (label_x, label_y - th - 5), (label_x + tw + 5, label_y + 5), (0, 0, 255), -1)
-            cv2.putText(annotated, label, (label_x + 2, label_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-
-            category_to_display_ids[category].append(display_id)
-            display_id += 1
-
-    return annotated, category_to_display_ids
-
-
-def select_best_frame_for_labeling(
-    instance_masks: Dict[str, List[Dict]],
-    colors: List[np.ndarray],
-) -> int:
-    """
-    选择显示最多物体的帧用于ID标注
-
-    参数:
-        instance_masks: {category: [{frame_id, mask}, ...]}
-        colors: 帧图像列表
-    返回:
-        最佳帧ID
-    """
-    frame_object_count = defaultdict(int)
-
-    for category, cat_masks in instance_masks.items():
-        for inst_masks in cat_masks:
-            visible_frames = set()
-            for im in inst_masks:
-                visible_frames.add(im['frame_id'])
-            for fid in visible_frames:
-                frame_object_count[fid] += 1
-
-    if not frame_object_count:
-        return 0
-
-    best_frame = max(frame_object_count, key=frame_object_count.get)
-    return best_frame
+    return annotated
 
 
-def infer_relations_from_scene_graph(
+def infer_relations_from_labeled_image(
     model,
     processor,
     image_path: str,
-    object_ids: List[int],
-    category_names: List[str],
-) -> Dict[str, Any]:
+    instance_names: List[str],
+) -> str:
     """
     使用 SimRecon 风格的 VLM prompt 推断物体间关系
+    (复用现有 prompt 模板, 只替换 object name hints)
 
     参数:
         model: VLM模型
         processor: VLM处理器
-        image_path: ID标注图路径
-        object_ids: 显示ID列表 (从 display_id_offset 开始)
-        category_names: 对应的类别名列表
+        image_path: 标注图路径
+        instance_names: 实例名列表 (如 ["duck_0", "plate_0", "toy_0"])
     返回:
-        场景图推断结果
+        VLM 原始输出文本
     """
-    display_ids_str = ", ".join(map(str, object_ids))
-    num_objects = len(object_ids)
+    # 构建 prompt
+    num_objects = len(instance_names)
+    instance_names_str = ", ".join(instance_names)
+    id_name_hints = "\n".join([f"- {name}" for name in instance_names])
 
-    id_to_name = {}
-    for did, name in zip(object_ids, category_names):
-        id_to_name[did] = name
-    id_name_hints = "\n".join([f"- ID {did} = {name}" for did, name in zip(object_ids, category_names)])
+    prompt = f'''You are analyzing a room scene image with labeled objects.
 
-    prompt = f'''You are analyzing a room scene image with numbered labels (green boxes with red numbers).
-
-**Visible object IDs**: {display_ids_str} (Total: {num_objects} objects)
+**Visible objects**: {instance_names_str} (Total: {num_objects} objects)
 
 **Hidden root nodes** (not shown in image):
-- ID 1 = "floor" (ground surface)
-- ID 2 = "wall" (vertical wall surface)
+- "floor" (ground surface)
+- "wall" (vertical wall surface)
 
-**Object name hints** (use these as category names):
+**Object name hints** (use these as the primary reference):
 {id_name_hints}
 
-## STEP-BY-STEP ANALYSIS (Follow this order strictly):
-
-### Step 1: Identify ALL objects
-For EACH of the {num_objects} IDs ({display_ids_str}), confirm what the object is.
-- Use the provided name hints as the primary reference
-- Two objects with the SAME category at different positions are DIFFERENT objects
-
-### Step 2: Build FLOOR tree (support relations)
-Think about what objects are SUPPORTED BY FLOOR (standing on ground):
-- Furniture: desk, table, chair, sofa, bed, cabinet, wardrobe, shelf, bookcase, dresser, nightstand
-- Appliances: refrigerator, washing machine, TV stand
-- Other: carpet, rug, plant pot, trash can, box, luggage
-
-Then think: what objects are ON TOP of these floor-supported objects?
-- Example chain: floor → desk → lamp → cup
-
-### Step 3: Build WALL tree (attached relations)
-Think about what objects are ATTACHED TO WALL (hanging/fixed on vertical surface):
-- ONLY these types: picture, painting, photo frame, mirror, clock, poster, whiteboard, TV (wall-mounted), window, door, curtain rod, light switch, outlet
-- Curtains are attached to wall (via curtain rod)
-
-### Step 4: Handle objects not on any surface
-For objects that appear to be held by a person or floating in mid-air:
-- Think about where the object would NATURALLY REST if not held
-- If it's a small object that belongs on a table/desk → parent = that furniture's ID, relation = "support"
-- If it's a large object that belongs on the floor → parent = 1, relation = "support"
-- Do NOT use relation="held" — always assign a physical support relation based on where the object belongs
-
-## PHYSICAL COMMON SENSE RULES:
-1. **Cabinets, wardrobes, bookshelves** → ALWAYS supported by floor (parent=1), NOT attached to wall!
-2. **Tables, desks, chairs, beds** → ALWAYS supported by floor (parent=1)
-3. **Wall-attached** is RARE, only for: pictures, mirrors, clocks, posters, wall-mounted TVs, curtains, windows, doors
-4. **Objects on furniture** → parent is that furniture's ID, relation is "support"
-5. **Small items on desk** (lamp, monitor, keyboard, cup) → supported by desk
-6. **Objects held by hand or floating** → assign their NATURAL support relation (where they belong when not held), NOT relation="held"
-7. **If unsure**, default to: relation="support", parent=1 (floor)
+## PHYSICAL COMMON SENSE RULES (use internally, do NOT repeat in output):
+1. Cabinets, wardrobes, bookshelves, tables, desks, chairs, beds → supported by floor.
+2. Wall-attached is RARE, only for: pictures, mirrors, clocks, posters, wall-mounted TVs, curtains, windows, doors.
+3. Objects resting on furniture → parent is that furniture's instance name.
+4. Small items on a desk (lamp, monitor, keyboard, cup) → supported by that desk.
+5. Objects held by hand or floating → assign their NATURAL support (where they belong when not held); never use relation="held".
 
 ## OUTPUT FORMAT:
 ```json
 {{
   "objects": [
-    {{"id": <display_id>, "category": "<name>", "relation": "support|attached", "parent": <parent_id>}}
+    {{"instance": "<instance_name>", "category": "<name>", "relation": "support|attached", "parent": "<parent_instance_name_or_floor_or_wall_or_other_objects>"}}
   ]
 }}
 ```
-Where parent_id: 1=floor, 2=wall, or another object's display_id.
+Where parent is one of:
+- another object's instance name (e.g., "table_0") if the object clearly rests on / is attached to it;
+- "floor" if it stands on the ground;
+- "wall" if it is wall-mounted;
+- "other_objects" ONLY IF you CANNOT determine the exact supporter but it is clearly ON/ASSOCIATED WITH some other object (NOT the floor/wall).
 
 ## CRITICAL REQUIREMENTS:
-- You MUST output exactly {num_objects} objects (one for each ID: {display_ids_str})
-- Do NOT skip any object!
-- Do NOT use relation="held" — every object must have a physical support relation
-- If unsure and the object appears to be resting on a surface, default to: relation="support", parent=1 (floor)
+- Output ONLY the JSON code block above. No explanations, no reasoning, no text outside the JSON.
+- You MUST output exactly {num_objects} objects (one for each: {instance_names_str}). Do NOT skip any object.
+- Do NOT use relation="held" — every object must have a physical support relation.
+- If you are unsure of the exact supporter but the object is on/with another object, use parent="other_objects". Do NOT default to "floor" unless it clearly stands on the ground.
 
-Now analyze the image and output the complete JSON with all {num_objects} objects.
+Now output the complete JSON with all {num_objects} objects.
 '''
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-
-    try:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", enable_thinking=False
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt"
-        )
-    inputs = inputs.to(model.device)
-
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=1024)
-
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
-
-    return output_text
+    caller = "stage5_scene_graph"
+    # Qwen3.5-VL processor 对字符串只按 URL/base64 解析，不认本地文件路径，需先转 PIL Image
+    image = Image.open(image_path).convert("RGB")
+    # prompt 已要求"只输出 JSON、不写推理"，纯 JSON (22 物体≈1800 token) 足够，
+    # 降到 4096 以规避被 max_new_tokens 截断导致解析失败的风险
+    return vlm_inference(image, model, processor, prompt, max_new_tokens=4096, caller=caller)
 
 
 def parse_scene_graph_output(output_text: str) -> Dict[str, Any]:
-    """解析VLM输出为场景图JSON"""
-    if '```' in output_text:
-        text_after_thinking = output_text
-        if '```json' in text_after_thinking:
-            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', text_after_thinking)
-            if json_match:
-                try:
-                    return json.loads(json_match.group(1))
-                except json.JSONDecodeError:
-                    pass
-        json_match = re.search(r'```\s*([\s\S]*?)\s*```', text_after_thinking)
+    """解析VLM输出为场景图JSON (支持新旧两种格式)
+
+    新格式: {"objects": [{"instance": "duck_0", "parent": "plate_0", ...}]}
+    旧格式: {"objects": [{"id": 3, "category": "duck", "parent": 4, ...}]}
+
+    处理截断情况: 如果 JSON 不完整 (被 max_new_tokens 截断), 尝试提取前 N 个完整对象
+    """
+    # 1. 优先从 ```json ... ``` 代码块中提取
+    if '```json' in output_text:
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', output_text)
         if json_match:
             try:
                 return json.loads(json_match.group(1))
             except json.JSONDecodeError:
                 pass
 
-    json_match = re.search(r'\{\s*"objects"\s*:\s*\[[\s\S]*?\]\s*\}', output_text)
+    # 2. 从普通 ``` ... ``` 代码块中提取
+    json_match = re.search(r'```\s*([\s\S]*?)\s*```', output_text)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # 3. 尝试匹配完整 JSON (无代码块)
+    json_match = re.search(r'[{]\s*"objects"\s*:\s*\[[\s\S]*?\]\s*[{}]', output_text)
     if json_match:
         try:
             return json.loads(json_match.group())
         except json.JSONDecodeError:
             pass
 
+    # 4. 截断兜底: 找到 JSON 开头, 逐对象截断直到能解析
+    start = output_text.find('{"objects"')
+    if start >= 0:
+        truncated = output_text[start:]
+        # 删除 ``` 代码块标记
+        truncated = re.sub(r'```[\s\S]*?```', '', truncated)
+        try:
+            data = json.loads(truncated)
+            return data
+        except json.JSONDecodeError:
+            # 逐步截断最后一个不完整对象
+            obj_pattern = re.compile(r'[{]\s*"instance"\s*:\s*"[^"]+"\s*,\s*"category"\s*:\s*"[^"]+"\s*,\s*"relation"\s*:\s*"[^"]+"\s*,\s*"parent"\s*:\s*"[^"]*"\s*[{}]')
+            matches = obj_pattern.findall(truncated)
+            if matches:
+                # 用前 N 个完整对象重建 JSON
+                for n in range(len(matches), 0, -1):
+                    partial = {"objects": matches[:n]}
+                    try:
+                        return json.loads(json.dumps(partial))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    # 如果字符串里的 matches 已经是 dict 格式需要重新构造
+                # fallback: 用字符串拼接
+                for n in range(len(matches), 0, -1):
+                    objs_json = "[" + ", ".join(matches[:n]) + "]"
+                    try:
+                        return json.loads('{"objects":' + objs_json + "}")
+                    except json.JSONDecodeError:
+                        continue
+
     return {"objects": [], "parse_error": True, "raw_output": output_text}
 
 
 def post_process_scene_graph(objects: List[Dict]) -> List[Dict]:
     """
-    物理常识后处理: 纠正VLM的常见错误
+    物理常识后处理: 纠正VLM的常见错误 (适配新格式)
 
-    规则:
-      1. 柜子/桌子/椅子等必须 floor-supported
-      2. 画/镜子/时钟等必须 wall-attached
-      3. 过滤 floor/wall 本身
+    新格式: {"instance": "duck_0", "category": "duck", "relation": "support", "parent": "plate_0"}
     """
     filtered = []
     for obj in objects:
         category = obj.get('category', '').lower().replace(' ', '_')
         relation = obj.get('relation', 'support')
-        parent = obj.get('parent', 1)
+        parent = obj.get('parent', 'floor')
 
         if category in FILTER_CATEGORIES:
             continue
@@ -368,19 +357,24 @@ def post_process_scene_graph(objects: List[Dict]) -> List[Dict]:
 
         category_base = category.split('_')[0] if '_' in category else category
 
-        if category in MUST_BE_FLOOR_SUPPORTED or category_base in MUST_BE_FLOOR_SUPPORTED:
-            if relation == 'attached' and parent == 2:
+        # 规则 1: 家具类不应挂在墙上
+        if relation == 'attached' and (parent == 'wall' or parent == 2):
+            if category in MUST_BE_FLOOR_SUPPORTED or category_base in MUST_BE_FLOOR_SUPPORTED:
                 relation = 'support'
-                parent = 1
+                parent = 'floor'
 
-        if category in MUST_BE_WALL_ATTACHED or category_base in MUST_BE_WALL_ATTACHED:
-            if relation == 'support' and parent == 1:
+        # 规则 2: 挂墙类不应站在地上
+        if relation == 'support' and (parent == 'floor' or parent == 1):
+            if category in MUST_BE_WALL_ATTACHED or category_base in MUST_BE_WALL_ATTACHED:
                 if category_base in {'picture', 'painting', 'photo', 'mirror', 'clock', 'poster'}:
                     relation = 'attached'
-                    parent = 2
+                    parent = 'wall'
+                elif category_base in {'window', 'door', 'vent', 'air_vent', 'outlet', 'socket'}:
+                    relation = 'attached'
+                    parent = 'wall'
 
         filtered.append({
-            'id': obj.get('id'),
+            'instance': obj.get('instance', category),
             'category': obj.get('category', 'unknown'),
             'relation': relation,
             'parent': parent,
@@ -389,112 +383,47 @@ def post_process_scene_graph(objects: List[Dict]) -> List[Dict]:
     return filtered
 
 
-def convert_scene_graph_to_relations(
-    objects: List[Dict],
-    category_to_display_ids: Dict[str, List[int]],
-    original_relations: Dict[str, str],
-    display_id_offset: int = 3,
-) -> Dict[str, str]:
+def vote_relations(votes: List[Tuple[str, int]]) -> str:
     """
-    将场景图转换为 ReplicateAnyScene 的 categories_and_relations 格式
-
-    核心规则:
-      1. 只修改 "supported by other objects" 的物体关系
-      2. 已确定的关系 (floor/wall/embedded/attached) 不改变
-      3. 如果VLM判断不出具体关系, 保持原样 "supported by other objects"
-      4. 生成 per-instance 关系键 (如 "toy_0", "toy_1")，同一类别不同实例可有不同关系
-      5. 同时保留 category-level 键 (如 "toy")，值为该类别最常见的关系
+    多数投票决定关系
 
     参数:
-        objects: VLM推断的物体列表 [{id, category, relation, parent}, ...]
-        category_to_display_ids: {category: [display_id, ...]} 类别到显示ID的映射
-        original_relations: 原始的 categories_and_relations
-        display_id_offset: 显示ID偏移
+        votes: [(关系字符串, 权重), ...]
     返回:
-        更新后的 categories_and_relations (包含 category-level 和 instance-level 键)
+        投票决定的关系字符串
     """
-    id_to_object = {}
-    for obj in objects:
-        id_to_object[obj['id']] = obj
+    weighted_votes = defaultdict(int)
+    for rel, weight in votes:
+        weighted_votes[rel] += weight
 
-    display_id_to_category_instance = {}
-    for category, display_ids in category_to_display_ids.items():
-        for inst_idx, did in enumerate(display_ids):
-            display_id_to_category_instance[did] = (category, inst_idx)
+    if not weighted_votes:
+        # 返回 None 表示"无法判断"，调用方需根据原始关系决定保留还是降级
+        return None
 
-    refined_relations = dict(original_relations)
+    return max(weighted_votes, key=weighted_votes.get)
 
-    instance_relations = {}
-    for obj in objects:
-        obj_id = obj['id']
-        relation = obj['relation']
-        parent_id = obj['parent']
 
-        if obj_id not in display_id_to_category_instance:
-            continue
+def _get_original_relation(categories_and_relations: Dict[str, str], inst_name: str) -> str:
+    """
+    按实例名查询原始 (Stage 1) 关系，兼容 key 形式不一致:
 
-        category, inst_idx = display_id_to_category_instance[obj_id]
+      - 直接命中实例级 key (如 "bottle_0") → 返回其值
+      - 命中类别级 key (如 "bottle"，inst_name 去掉 _数字 后缀) → 返回其值
+      - 都查不到 → 返回默认 "supported by floor"
 
-        if original_relations.get(category) != "supported by other objects":
-            continue
-
-        if parent_id == 0:
-            continue
-        elif parent_id == 1 and relation == 'support':
-            rel_str = "supported by floor"
-        elif parent_id == 2 and relation == 'attached':
-            cat_lower = category.lower()
-            if any(w in cat_lower for w in ['window', 'door']):
-                rel_str = "embedded in wall"
-            else:
-                rel_str = "attached to wall"
-        elif parent_id in display_id_to_category_instance:
-            parent_category, parent_inst_idx = display_id_to_category_instance[parent_id]
-            parent_n_instances = len(category_to_display_ids.get(parent_category, []))
-            if relation == 'support':
-                if parent_n_instances > 1:
-                    rel_str = f"supported by {parent_category}_{parent_inst_idx}"
-                else:
-                    rel_str = f"supported by {parent_category}"
-            elif relation == 'attached':
-                if parent_n_instances > 1:
-                    rel_str = f"attached to {parent_category}_{parent_inst_idx}"
-                else:
-                    rel_str = f"attached to {parent_category}"
-            else:
-                continue
-        else:
-            continue
-
-        instance_relations[(category, inst_idx)] = rel_str
-
-    for category in category_to_display_ids:
-        if original_relations.get(category) != "supported by other objects":
-            continue
-
-        cat_instance_rels = {}
-        for (cat, idx), rel in instance_relations.items():
-            if cat == category:
-                cat_instance_rels[idx] = rel
-
-        if not cat_instance_rels:
-            continue
-
-        n_instances = len(category_to_display_ids[category])
-        for idx, rel in cat_instance_rels.items():
-            inst_key = f"{category}_{idx}"
-            refined_relations[inst_key] = rel
-
-        if n_instances == 1:
-            only_rel = list(cat_instance_rels.values())[0]
-            refined_relations[category] = only_rel
-        else:
-            from collections import Counter
-            rel_counts = Counter(cat_instance_rels.values())
-            most_common_rel = rel_counts.most_common(1)[0][0]
-            refined_relations[category] = most_common_rel
-
-    return refined_relations
+    这是防止 "original=other objects 被错误降级为 floor" 的关键:
+    若查询不兼容，inst_name 永远查不到，会回退成 floor，破坏 Stage 1 输入。
+    """
+    if inst_name in categories_and_relations:
+        return categories_and_relations[inst_name]
+    # 去掉末尾 _<数字> 后缀，回退到类别级 key
+    if '_' in inst_name:
+        base = inst_name.rsplit('_', 1)
+        if len(base) == 2 and base[1].isdigit():
+            category_key = base[0]
+            if category_key in categories_and_relations:
+                return categories_and_relations[category_key]
+    return "supported by floor"
 
 
 def infer_relations_scene_graph(
@@ -506,9 +435,12 @@ def infer_relations_scene_graph(
     id_scene_path: str = None,
     output_dir: str = None,
     preloaded_vlm: tuple = None,
+    optimal_frames_dir: str = None,
+    keyframes_dir: str = None,
+    dynamic_frames_dir: str = None,
 ) -> tuple:
     """
-    使用 SimRecon 场景图推断方式获取物体间关系
+    使用多帧投票方式推断物体间关系
 
     参数:
         scene_dir: 场景输出目录
@@ -519,63 +451,111 @@ def infer_relations_scene_graph(
         id_scene_path: 已有的ID标注图路径 (如果为None, 自动创建)
         output_dir: 输出目录 (默认为scene_dir)
         preloaded_vlm: 预加载的VLM (model, processor), 避免重复加载
+        optimal_frames_dir: optimal_frames 目录路径 (新增)
+        keyframes_dir: keyframes 目录路径 (新增)
+        dynamic_frames_dir: dynamic_pointclouds 目录路径 (用于动态物体首次出现帧权重)
     返回:
         (refined_relations, vlm_or_None): 更新后的关系字典 + VLM模型(供后续使用)
     """
     if output_dir is None:
         output_dir = scene_dir
+    output_dir = os.path.abspath(output_dir)
 
-    display_id_offset = 3
+    # 创建 labeled_images 子目录
+    labeled_images_dir = os.path.join(output_dir, "labeled_images")
+    os.makedirs(labeled_images_dir, exist_ok=True)
 
-    # ── Step 1: 获取或创建 ID 标注图 ──
-    if id_scene_path and os.path.exists(id_scene_path):
-        print(f"   📷 使用已有ID标注图: {id_scene_path}", flush=True)
-        category_to_display_ids = _load_category_display_ids(scene_dir, categories_and_relations, display_id_offset)
-    else:
-        print(f"   📷 创建ID标注图...", flush=True)
+    # ── Step 0: 准备数据 ──
+    print(f"   📷 准备数据...", flush=True)
 
-        if instance_masks is None:
-            instance_masks = _load_instance_masks_from_disk(scene_dir)
-        if colors is None:
-            colors = _load_colors_from_disk(scene_dir)
+    # 加载 instance_visibility.json 获取实例名
+    instance_visibility = {}
+    if optimal_frames_dir:
+        vis_path = os.path.join(optimal_frames_dir, "instance_visibility.json")
+        if os.path.exists(vis_path):
+            with open(vis_path, 'r') as f:
+                instance_visibility = json.load(f)
 
-        if instance_masks is None or colors is None:
-            print("   ❌ 无法加载mask或图像数据，回退到逐物体推断", flush=True)
-            return dict(categories_and_relations), None
+    # 构建实例名列表
+    instance_names = []
+    for key in categories_and_relations:
+        if key.lower() in FILTER_CATEGORIES:
+            continue
+        if '_' in key and key.rsplit('_', 1)[-1].isdigit():
+            instance_names.append(key)
+        else:
+            # 类别级 key，从 instance_visibility 展开
+            if key in instance_visibility:
+                for inst_key in instance_visibility[key]:
+                    instance_names.append(f"{key}_{inst_key}")
+            else:
+                instance_names.append(key)
 
-        best_frame_id = select_best_frame_for_labeling(instance_masks, colors)
-        frame_image = colors[best_frame_id]
-
-        annotated, category_to_display_ids = create_id_labeled_image(
-            frame_image, instance_masks, categories_and_relations, display_id_offset,
-            best_frame_id=best_frame_id
-        )
-
-        id_scene_path = os.path.join(output_dir, "id_scene.png")
-        cv2.imwrite(id_scene_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
-        print(f"   💾 ID标注图已保存: {id_scene_path}", flush=True)
-
-        # 保存 category_to_display_ids 映射
-        ids_map_path = os.path.join(output_dir, "id_scene_mapping.json")
-        serializable = {cat: [int(did) for did in dids] for cat, dids in category_to_display_ids.items()}
-        with open(ids_map_path, 'w') as f:
-            json.dump(serializable, f, indent=2)
-
-    # ── Step 2: 构建 object_ids 和 category_names ──
-    object_ids = []
-    category_names = []
-    for category, display_ids in category_to_display_ids.items():
-        for did in display_ids:
-            object_ids.append(did)
-            category_names.append(category)
-
-    if not object_ids:
+    if not instance_names:
         print("   ⚠️ 无可见物体，跳过场景图推断", flush=True)
         return dict(categories_and_relations), None
 
-    print(f"   📋 推断 {len(object_ids)} 个物体的关系: {dict(zip(category_names, object_ids))}", flush=True)
+    print(f"   📋 实例列表: {instance_names}", flush=True)
 
-    # ── Step 3: 加载VLM并推断 ──
+    # 加载 keyframes 可见性数据
+    keyframe_visibility = {}
+    if keyframes_dir:
+        meta_path = os.path.join(keyframes_dir, "keyframes_metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+            raw_visibility = metadata.get("frame_visibility", {})
+            for fidx_str, visible_names in raw_visibility.items():
+                vid_idx = int(fidx_str)
+                matched = []
+                for raw_name in visible_names:
+                    # 模糊匹配到实例名
+                    found = False
+                    for inst_name in instance_names:
+                        base = inst_name.split('_')[0]
+                        raw_base = raw_name.lower().strip().replace(' ', '_')
+                        if raw_base in base or base in raw_base:
+                            matched.append(inst_name)
+                            found = True
+                            break
+                    if not found:
+                        matched.append(raw_name)
+                keyframe_visibility[vid_idx] = matched
+
+    # 加载动态物体 trajectory 信息 — 记录每个动态实例的首次出现帧号
+    # 注意: traj_info key 格式为 "{category}_inst{idx}" (如 bottle_inst0),
+    # 而 instance_names 格式为 "{category}_{idx}" (如 bottle_0)，需要归一化
+    dynamic_first_frame_map = {}  # {inst_name: first_visible_frame_id}
+    if dynamic_frames_dir and os.path.isdir(dynamic_frames_dir):
+        traj_path = os.path.join(dynamic_frames_dir, "trajectory_info.json")
+        if os.path.exists(traj_path):
+            with open(traj_path, 'r') as f:
+                traj_info = json.load(f)
+            for traj_key, info in traj_info.items():
+                if not info.get("is_dynamic") or not info.get("visible_frames"):
+                    continue
+                # 将 traj key 转为 instance_name 格式: bottle_inst0 → bottle_0
+                if '_inst' in traj_key:
+                    cat, idx = traj_key.split('_inst')
+                    inst_name = f"{cat}_{idx}"
+                else:
+                    inst_name = traj_key
+                first_frame = min(info["visible_frames"])
+                dynamic_first_frame_map[inst_name] = first_frame
+                print(f"   🔄 动态物体 {inst_name}: 首次出现在帧 #{first_frame}", flush=True)
+
+    # 加载 colors 目录
+    if colors is None:
+        colors = _load_colors_from_disk(scene_dir)
+
+    if colors is None:
+        print("   ❌ 无法加载图像数据，跳过场景图推断", flush=True)
+        return dict(categories_and_relations), None
+
+    # ── Step 1: 全场景预览 (1 次 VLM 调用，仅供参考) ──
+    print(f"   📷 Step 1: 全场景预览...", flush=True)
+
+    # 加载 VLM
     if preloaded_vlm is not None:
         model, processor = preloaded_vlm
         print(f"   🤖 使用预加载VLM", flush=True)
@@ -596,64 +576,295 @@ def infer_relations_scene_graph(
         model.eval()
         processor = AutoProcessor.from_pretrained(vlm_checkpoint, trust_remote_code=True)
 
-    raw_output = infer_relations_from_scene_graph(
-        model, processor, id_scene_path, object_ids, category_names
-    )
+    # 选一帧能显示最多物体的帧做预览
+    if keyframe_visibility:
+        best_frame_id = max(keyframe_visibility, key=lambda k: len(keyframe_visibility[k]))
+    else:
+        best_frame_id = 0
 
-    print(f"\n   --- VLM Raw Output ---", flush=True)
-    print(f"   {raw_output[:500]}{'...' if len(raw_output) > 500 else ''}", flush=True)
-    print(f"   --- End of Raw Output ---\n", flush=True)
+    # ── Step 1: 全场景预览 + 投票 ──
+    print(f"   📷 Step 1: 全场景预览投票 (frame {best_frame_id})...", flush=True)
+    preview_votes = defaultdict(lambda: defaultdict(int))  # {inst_name: {rel_str: weight}}
 
-    # ── Step 4: 解析和后处理 ──
-    parsed = parse_scene_graph_output(raw_output)
-    objects = parsed.get("objects", [])
+    if best_frame_id < len(colors):
+        frame_image = colors[best_frame_id]
+        visible_in_frame = keyframe_visibility.get(best_frame_id, instance_names)
+        labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, best_frame_id)
+        preview_path = os.path.join(output_dir, "labeled_images", "preview_id_scene.png")
+        cv2.imwrite(preview_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
 
-    if objects:
-        print(f"   解析到 {len(objects)} 个物体，进行物理常识后处理...", flush=True)
-        objects = post_process_scene_graph(objects)
-        print(f"   后处理后剩余 {len(objects)} 个物体", flush=True)
+        raw_output = infer_relations_from_labeled_image(model, processor, preview_path, instance_names)
+        parsed = parse_scene_graph_output(raw_output)
+        for obj in parsed.get("objects", []):
+            inst = obj.get("instance", "")
+            if not inst or inst not in instance_names:
+                continue
+            relation = obj.get("relation", "support")
+            # 无法判断具体支撑物时默认 "other_objects" (保留原 stage1 语义)，不默认 floor
+            parent = obj.get("parent", "other_objects")
+            if parent == "other_objects":
+                rel_str = "supported by other objects"
+            elif relation == "support" and parent == "floor":
+                rel_str = "supported by floor"
+            elif relation == "support":
+                rel_str = f"supported by {parent}"
+            elif relation == "attached":
+                rel_str = f"attached to {parent}"
+            else:
+                rel_str = "supported by other objects"
+            preview_votes[inst][rel_str] += 1  # 全场景投票权重 1
+            print(f"   📊 preview: {inst} → {rel_str}", flush=True)
+        print(f"   📊 全场景预览共解析 {len(parsed.get('objects', []))} 个物体", flush=True)
+    else:
+        raw_output = ""
+        print(f"   ⚠️ 预览帧不可用，跳过全场景投票", flush=True)
 
-    # ── Step 5: 转换为 ReplicateAnyScene 格式 ──
-    refined_relations = convert_scene_graph_to_relations(
-        objects, category_to_display_ids, categories_and_relations, display_id_offset
-    )
+    # ── Step 2: 逐实例 3 图投票 ──
+    print(f"   📷 Step 2: 逐实例多帧投票...", flush=True)
 
-    # 保存结果
+    refined_relations = {}
+    inference_details = {}
+    optimal_frame_map = {}
+
+    # 从 optimal_frames 目录解析每个实例的最优帧号
+    if optimal_frames_dir and os.path.isdir(optimal_frames_dir):
+        for fname in os.listdir(optimal_frames_dir):
+            if not fname.lower().endswith(('.jpg', '.png', '.jpeg')):
+                continue
+            match = re.match(r'(.+)_inst(\d+)_frame(\d+)', os.path.splitext(fname)[0])
+            if match:
+                category = match.group(1)
+                inst_idx = match.group(2)
+                frame_id = int(match.group(3))
+                inst_name = f"{category}_{inst_idx}"
+                optimal_frame_map[inst_name] = frame_id
+
+    # 对每个实例进行投票
+    for inst_name in instance_names:
+        votes = list(preview_votes[inst_name].items())  # 先加入全场景预览投票
+
+        # 图1: optimal_frames 对应的帧
+        if inst_name in optimal_frame_map:
+            frame_id = optimal_frame_map[inst_name]
+            if frame_id < len(colors):
+                frame_image = colors[frame_id]
+                visible_in_frame = keyframe_visibility.get(frame_id, [inst_name])
+                labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, frame_id)
+                labeled_path = os.path.join(output_dir, "labeled_images", f"label_{inst_name}_optimal.png")
+                cv2.imwrite(labeled_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
+
+                raw_out = infer_relations_from_labeled_image(model, processor, labeled_path, instance_names)
+                parsed = parse_scene_graph_output(raw_out)
+                for obj in parsed.get("objects", []):
+                    if obj.get("instance") == inst_name:
+                        relation = obj.get("relation", "support")
+                        # 无法判断具体支撑物时默认 "other_objects" (保留原 stage1 的
+                        # "与其他物体有交互" 语义)，绝不默认 floor
+                        parent = obj.get("parent", "other_objects")
+                        if parent == "other_objects":
+                            rel_str = "supported by other objects"
+                        elif relation == "support" and parent == "floor":
+                            rel_str = "supported by floor"
+                        elif relation == "support":
+                            rel_str = f"supported by {parent}"
+                        elif relation == "attached":
+                            rel_str = f"attached to {parent}"
+                        else:
+                            rel_str = "supported by other objects"
+                        votes.append((rel_str, 2))
+                        break
+
+        # 图2~3: 从 keyframes 中找该实例可见的其他帧
+        keyframe_candidates = []
+        for vid_idx, visible in keyframe_visibility.items():
+            if inst_name in visible or any(inst_name.split('_')[0] in str(v) for v in [visible]):
+                keyframe_candidates.append(vid_idx)
+
+        # 动态物体: 锁定 trajectory 记录的首次出现帧作为主导帧 (权重 10)，
+        # 其余 keyframes 仅作辅助 (权重 1)
+        is_dynamic = inst_name in dynamic_first_frame_map
+        if is_dynamic:
+            first_dynamic_frame = dynamic_first_frame_map[inst_name]
+            # 把首次出现帧放到候选最前，并去重
+            ordered = [first_dynamic_frame] + [f for f in keyframe_candidates if f != first_dynamic_frame]
+            keyframe_candidates = ordered
+        else:
+            keyframe_candidates.sort()
+        vote_weights = []  # 为每帧分配权重
+        for kf_idx, kf_frame_id in enumerate(keyframe_candidates):
+            if is_dynamic and kf_idx == 0:
+                vote_weights.append(10)  # 首次出现帧最高权重
+            else:
+                vote_weights.append(1)
+
+        for local_idx, kf_frame_id in enumerate(keyframe_candidates[:2]):
+            if kf_frame_id == optimal_frame_map.get(inst_name):
+                continue
+            if kf_frame_id >= len(colors):
+                continue
+
+            frame_image = colors[kf_frame_id]
+            visible_in_frame = keyframe_visibility.get(kf_frame_id, [inst_name])
+            labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, kf_frame_id)
+            labeled_path = os.path.join(output_dir, "labeled_images", f"label_{inst_name}_kf{kf_frame_id}.png")
+            cv2.imwrite(labeled_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
+
+            raw_out = infer_relations_from_labeled_image(model, processor, labeled_path, instance_names)
+            parsed = parse_scene_graph_output(raw_out)
+            for obj in parsed.get("objects", []):
+                if obj.get("instance") == inst_name:
+                    relation = obj.get("relation", "support")
+                    parent = obj.get("parent", "floor")
+                    if relation == "support" and parent == "floor":
+                        rel_str = "supported by floor"
+                    elif relation == "support":
+                        rel_str = f"supported by {parent}"
+                    elif relation == "attached":
+                        rel_str = f"attached to {parent}"
+                    else:
+                        rel_str = "supported by floor"
+                    votes.append((rel_str, vote_weights[local_idx]))
+                    break
+
+        # 投票决定关系
+        # 注意: categories_and_relations 的 key 可能是类别级 ("bottle") 或实例级
+        # ("bottle_0")。inst_name 永远是实例级，需兼容两种 key 形式，否则查不到
+        # 时会错误回退成 floor，导致原 "other objects" 被降级。
+        original_relation = _get_original_relation(categories_and_relations, inst_name)
+        if votes:
+            decision = vote_relations(votes)
+        else:
+            decision = None
+
+        if decision is None:
+            # VLM 无法判断关系: 若原关系就是"与其他物体有交互"，则保持原判定，
+            # 不降级为 floor；否则默认 floor
+            if original_relation == "supported by other objects":
+                final_relation = original_relation
+                print(f"   ⚠️ {inst_name}: VLM未判断出交互对象，保留原始关系"
+                      f"'{original_relation}' (不降级为 floor)", flush=True)
+            else:
+                final_relation = "supported by floor"
+        else:
+            # VLM 有投票结果: 但仍需保护 Stage 1 输入不被错误覆盖
+            #   - 原关系是 "other objects" 且 VLM 仍没给出具体支撑物
+            #     (decision 是 floor 或 other objects) → 保持原 other objects，不降级
+            #   - 原关系是 floor 且 VLM 给出 other objects(未指明具体物) → 保持 floor
+            if original_relation == "supported by other objects":
+                if decision == "supported by floor" or decision == "supported by other objects":
+                    final_relation = original_relation
+                    print(f"   ⚠️ {inst_name}: 原关系为 other objects，VLM未明确具体支撑物"
+                          f"({decision})，保留原始关系不降级", flush=True)
+                else:
+                    final_relation = decision
+            elif original_relation == "supported by floor":
+                if decision == "supported by other objects":
+                    final_relation = original_relation
+                    print(f"   ⚠️ {inst_name}: 原关系为 floor，VLM未明确具体支撑物"
+                          f"(other objects)，保持 floor 不被篡改", flush=True)
+                else:
+                    final_relation = decision
+            else:
+                final_relation = decision
+
+        refined_relations[inst_name] = final_relation
+        inference_details[inst_name] = {
+            "votes": dict(defaultdict(int, {v: w for v, w in votes})),
+            "frame_count": len(votes),
+        }
+        vote_counts = defaultdict(int)
+        for v, w in votes:
+            vote_counts[v] += w
+        print(f"   ✅ {inst_name}: {final_relation} ({len(votes)} 票: {dict(vote_counts)})", flush=True)
+
+    # ── Step 3: 物理常识后处理 ──
+    print(f"   🔧 Step 3: 物理常识后处理...", flush=True)
+    corrected_relations = post_process_relationships(refined_relations, refined_relations)
+
+    # ── Step 4: 构建 scene_graph_objects ──
+    scene_graph_objects = []
+    for inst_name, rel in corrected_relations.items():
+        category = inst_name.rsplit('_', 1)[0] if '_' in inst_name else inst_name
+        try:
+            inst_idx = int(inst_name.rsplit('_', 1)[1])
+        except (ValueError, IndexError):
+            inst_idx = 0
+
+        if "attached to" in rel:
+            sg_relation = "attached"
+            sg_parent = rel.replace("attached to ", "")
+        elif "supported by" in rel:
+            sg_relation = "support"
+            sg_parent = rel.replace("supported by ", "")
+        else:
+            sg_relation = "support"
+            sg_parent = "floor"
+
+        scene_graph_objects.append({
+            "instance": inst_name,
+            "category": category,
+            "inst_idx": inst_idx,
+            "relation": sg_relation,
+            "parent": sg_parent,
+        })
+
+    # ── Step 5: 保存结果 ──
     refined_json_path = os.path.join(output_dir, "relations_scene_graph.json")
     with open(refined_json_path, 'w', encoding='utf-8') as f:
         json.dump({
-            'refined_relations': refined_relations,
-            'scene_graph_objects': objects,
-            'category_to_display_ids': {cat: [int(d) for d in dids] for cat, dids in category_to_display_ids.items()},
+            'refined_relations': corrected_relations,
+            'scene_graph_objects': scene_graph_objects,
+            'inference_details': inference_details,
         }, f, indent=2, ensure_ascii=False)
     print(f"   💾 场景图关系已保存: {refined_json_path}", flush=True)
 
     # 不卸载VLM, 返回给调用者供后续使用 (5.2 SP精修需要VLM判断精修程度)
-    return refined_relations, (model, processor)
+    return corrected_relations, (model, processor)
 
 
-def _load_category_display_ids(scene_dir, categories_and_relations, display_id_offset=3):
-    """从磁盘加载 category_to_display_ids 映射"""
-    ids_map_path = os.path.join(scene_dir, "id_scene_mapping.json")
-    if os.path.exists(ids_map_path):
-        with open(ids_map_path, 'r') as f:
-            return json.load(f)
+def post_process_relationships(relationships: Dict[str, str], all_relations: Dict[str, str]) -> Dict[str, str]:
+    """
+    物理常识后处理: 纠正VLM投票后的关系
 
-    category_to_display_ids = {}
-    display_id = display_id_offset
-    for category in categories_and_relations:
-        if category.lower() in FILTER_CATEGORIES:
-            continue
-        instance_visibility_path = os.path.join(scene_dir, "optimal_frames", "instance_visibility.json")
-        if os.path.exists(instance_visibility_path):
-            with open(instance_visibility_path, 'r') as f:
-                visibility = json.load(f)
-            n_instances = len(visibility.get(category, {}))
-        else:
-            n_instances = 1
-        category_to_display_ids[category] = list(range(display_id, display_id + n_instances))
-        display_id += n_instances
-    return category_to_display_ids
+    参数:
+        relationships: {实例名: 关系} VLM投票后的关系
+        all_relations: {实例名: 关系} 当前所有物体的关系
+    返回:
+        corrected: {实例名: 关系} 纠错后的关系
+    """
+    corrected = {}
+    for target_name, rel in relationships.items():
+        name = target_name.lower().strip().replace(' ', '_')
+        category_base = name.split('_')[0]
+
+        # 规则 1: 家具类不应挂在墙上
+        if name in MUST_BE_FLOOR_SUPPORTED or category_base in MUST_BE_FLOOR_SUPPORTED:
+            if "attached to wall" in rel or "embedded in wall" in rel:
+                print(f"  [纠错] '{target_name}': {rel} → supported by floor (物理常识)")
+                rel = "supported by floor"
+
+        # 规则 2: 挂墙类不应站在地上
+        if name in MUST_BE_WALL_ATTACHED or category_base in MUST_BE_WALL_ATTACHED:
+            if rel == "supported by floor":
+                if category_base in {'picture', 'painting', 'photo', 'mirror', 'clock', 'poster'}:
+                    print(f"  [纠错] '{target_name}': supported by floor → attached to wall (物理常识)")
+                    rel = "attached to wall"
+                elif category_base in {'window', 'door', 'vent', 'air_vent', 'outlet', 'socket'}:
+                    print(f"  [纠错] '{target_name}': supported by floor → embedded in wall (物理常识)")
+                    rel = "embedded in wall"
+
+        # 规则 3: "supported by X" 中 X 本身也是 "supported by other objects" → 修正为 supported by floor
+        if "supported by" in rel and "floor" not in rel and "other objects" not in rel:
+            supporter_name = rel.replace("supported by ", "").strip()
+            if supporter_name in all_relations:
+                supporter_rel = all_relations.get(supporter_name, "")
+                if supporter_rel == "supported by other objects":
+                    print(f"  [纠错] '{target_name}': 支撑物 '{supporter_name}' 本身也是 'other objects' → supported by floor")
+                    rel = "supported by floor"
+
+        corrected[target_name] = rel
+
+    return corrected
 
 
 def _load_instance_masks_from_disk(scene_dir):

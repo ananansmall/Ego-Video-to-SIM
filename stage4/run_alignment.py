@@ -135,6 +135,11 @@ def load_scene_instances(input_path):
         for geom_name in scene.geometry:
             mesh = scene.geometry[geom_name]
 
+            # Skip non-mesh geometries (e.g., Path3D for floor grids)
+            if not isinstance(mesh, trimesh.Trimesh):
+                print(f"  ⏭️ Skipping non-mesh geometry: {geom_name} (type={type(mesh).__name__})")
+                continue
+
             if geom_name in node_to_geom:
                 node_name, T = node_to_geom[geom_name]
             else:

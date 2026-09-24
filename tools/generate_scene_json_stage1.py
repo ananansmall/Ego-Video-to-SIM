@@ -52,6 +52,7 @@ from src.models import load_vggt_model, unload_model
 from src.utils import load_video_frames
 from src.vggt_predict import vggt_predict
 from src.sg_deduplication import UnionFind
+from src.vlm_logger import vlm_inference, set_vlm_log_dir
 
 # ============================================================
 # 常量定义
@@ -816,60 +817,7 @@ def _fix_json_string(json_str):
     return json_str
 
 
-# ============================================================
-# VLM 推理封装
-# ============================================================
-
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024, temperature=0.0, do_sample=False):
-    """
-    调用VLM进行单次推理（使用tokenize=True + enable_thinking=False）
-
-    参数:
-        image: PIL图像
-        model: VLM模型
-        processor: VLM处理器
-        prompt: 提示词
-        max_new_tokens: 最大生成token数 (默认512，检测任务足够)
-        temperature: 采样温度 (默认0.0=贪心解码，结果稳定)
-        do_sample: 是否采样 (默认False=贪心，检测/分类任务推荐False)
-    返回:
-        VLM输出的文本
-    """
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt}
-        ]}
-    ]
-
-    try:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", enable_thinking=False
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt"
-        )
-    inputs = inputs.to(model.device)
-
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": processor.tokenizer.eos_token_id,
-    }
-    if do_sample:
-        gen_kwargs["do_sample"] = True
-        gen_kwargs["temperature"] = max(temperature, 0.01)
-    else:
-        gen_kwargs["do_sample"] = False
-
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, **gen_kwargs)
-
-    generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return output_text
+# VLM 推理函数已从 src/vlm_logger 导入，不再在此处定义
 
 
 # ============================================================
@@ -990,7 +938,7 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_mod
         try:
             image = Image.open(frame_path).convert("RGB")
             start_time = time.time()
-            output_text = _vlm_inference(image, model, processor, VLM_DETECT_PROMPT, max_new_tokens=1024)
+            output_text = vlm_inference(image, model, processor, VLM_DETECT_PROMPT, max_new_tokens=1024, caller="stage1_detect")
             elapsed = time.time() - start_time
 
             json_str = _extract_json_from_text(output_text)
@@ -1073,7 +1021,7 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_mod
             try:
                 image = Image.open(frame_path).convert("RGB")
                 start_time = time.time()
-                output_text = _vlm_inference(image, aux_model, aux_processor, VLM_DETECT_PROMPT, max_new_tokens=1024)
+                output_text = vlm_inference(image, aux_model, aux_processor, VLM_DETECT_PROMPT, max_new_tokens=1024, caller="stage1_detect_aux")
                 elapsed = time.time() - start_time
 
                 json_str = _extract_json_from_text(output_text)
@@ -2372,6 +2320,9 @@ def main():
     print(f"🖼️  贪心采样帧数: {args.max_frames}")
     print(f"🖼️  VGGT重建帧数: {args.vggt_max_frames}")
     print("=" * 70 + "\n", flush=True)
+
+    # 设置 VLM 对话日志输出目录
+    set_vlm_log_dir(args.output_dir)
 
     try:
         # Step 0: VGGT 3D场景重建

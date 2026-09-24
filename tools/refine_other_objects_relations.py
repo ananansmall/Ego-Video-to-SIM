@@ -122,6 +122,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import torch
 
+from src.vlm_logger import vlm_inference, set_vlm_log_dir
+
 try:
     from transformers import AutoModelForVision2Seq, AutoProcessor
 except ImportError:
@@ -270,41 +272,7 @@ def _fix_json_string(json_str):
     return json_str
 
 
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024):
-    """调用VLM进行单次推理
-
-    参数:
-        image: PIL图像
-        model: VLM模型
-        processor: VLM处理器
-        prompt: 提示词文本
-        max_new_tokens: 最大生成token数
-    返回:
-        VLM生成的文本
-    """
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt}
-        ]}
-    ]
-    try:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", enable_thinking=False
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt"
-        )
-    inputs = inputs.to(model.device)
-
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=processor.tokenizer.eos_token_id)
-
-    generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    return processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+# VLM 推理函数已从 src/vlm_logger 导入，不再在此处定义
 
 
 def parse_optimal_frame_filename(filename):
@@ -1082,7 +1050,7 @@ def refine_other_objects_relations(
             print(f"      [{fi+1}/{len(frames)}] {src}...", end=" ", flush=True)
 
             try:
-                output_text = _vlm_inference(image, model, processor, prompt, max_new_tokens=1024)
+                output_text = vlm_inference(image, model, processor, prompt, max_new_tokens=1024, caller="stage5_refine_relations")
                 frame_rels = _parse_vlm_relationships(output_text, [inst_key], list(prompt_relations.keys()))
 
                 if not frame_rels:

@@ -5,6 +5,8 @@ import torch
 import trimesh
 from PIL import Image
 
+from src.vlm_logger import vlm_inference, set_vlm_log_dir
+
 try:
     from transformers import AutoModelForVision2Seq, AutoProcessor
 except ImportError:
@@ -42,28 +44,7 @@ def _load_vlm(checkpoint_path):
     return model, processor
 
 
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=64):
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt}
-        ]}
-    ]
-    try:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", enable_thinking=False
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt"
-        )
-    inputs = inputs.to(model.device)
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=processor.tokenizer.eos_token_id)
-    trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
-    return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+# VLM 推理函数已从 src/vlm_logger 导入，不再在此处定义
 
 
 def _check_mesh_size(instance_info, category, world_points, instance_masks, min_ratio=0.05, max_ratio=5.0):
@@ -192,7 +173,7 @@ def _check_vlm_render(instance_info, category, model, processor):
 
     prompt = f'Is this a 3D model of a "{category}"? Answer yes or no.'
     try:
-        output = _vlm_inference(pil_img, model, processor, prompt, max_new_tokens=10)
+        output = vlm_inference(pil_img, model, processor, prompt, max_new_tokens=10, caller="stage3_asset_verify")
         lower = output.lower()
         if 'yes' in lower:
             return True, f"VLM确认是'{category}' (回复: {output})"

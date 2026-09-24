@@ -98,10 +98,11 @@ vggt_prediction_results, deduplicated_all_masks, wall_masks, floor_masks = run_s
   5. 保存 `coordinate_alignment.json` (行 404-411)
   6. 保存 VGGT 中间结果: `color/`、`depth/`、`extrinsics/`、`intrinsic.txt`、`point_cloud.ply` (行 413-435)
   7. SAM3 video 逐类别分割+跟踪 (行 437-445)
-  8. 类内去重 `self_category_deduplicate` (行 447-452)
-  9. 跨类去重 `cross_category_deduplicate` (行 454-459)
-  10. 白名单过滤 (只保留 Stage1 发现的类别) (行 461-470)
-  11. 可视化 mask `instance_masks.mp4` (行 472-478)
+  8. 类内去重 `self_category_deduplicate` (行 458-464)
+  9. 跨类去重 `cross_category_deduplicate` (行 479-484)
+  10. 全量动态分裂合并 `merge_dynamic_splits_all` (行 487-496)
+  11. 白名单过滤 (只保留 Stage1 发现的类别) (行 509-514)
+  12. 可视化 mask `instance_masks.mp4` (行 517-520)
 - **产出**: `coordinate_alignment.json`、`point_cloud.ply`、`extrinsics/`、`instance_masks.mp4`、`deduplicated_all_masks`
 
 #### 步骤 3: Stage 3 资产生成 (行 1020-1025)
@@ -972,6 +973,8 @@ for im_entry in sorted_masks:
 
 ## 6. SP精修逻辑
 
+> 📌 **2026-08-25 更新**: SP 几何校验、深嵌投影法修复、穿模方向/步长修复等最新改动见 [stage5_refinement_analysis.md](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/docs/pipeline/stage5_refinement_analysis.md)。本章描述的是基础框架逻辑，仍适用。
+
 ### 6.1 核心原则
 
 **"supported by table 的精修等价于 supported by floor，只是 z=0 换成 supporter_top_z"**
@@ -1390,6 +1393,8 @@ segment_and_track → category_masks (去重前)
 deduplicated_category_masks (类内去重后)
   ↓ cross_category_deduplicate
 deduplicated_all_masks (跨类去重后)
+  ↓ merge_dynamic_splits_all (动态分裂+静态遮挡合并)
+deduplicated_all_masks (全量去重后)
   ↓ 白名单过滤 (json_categories_set)
 filtered_masks (只保留Stage1发现的类别)
   ↓ 传入 run_stage3 → generate_3d_asset_in_subprocess
@@ -1829,21 +1834,26 @@ camera_pos = -extrinsic[:3, :3].T @ extrinsic[:3, 3]  # 确认 VGGT extrinsics �
 | duck/plate 误判动态 | offset 仅 2-3cm | VGGT 漂移导致位置偏移 | 位置调整逻辑下游问题, 暂未修复 |
 | toy_4 跟踪丢失 | `valid_frames=5/51` | SAM3 在遮挡后丢失跟踪 | 需要时序连续性去重 (未来工作) |
 
-### 10.9 跨类去重改进: 同位置检测 (2026-06-26)
+### 10.9 去重架构重构: 三层流水线 (2026-07-13)
 
-**问题**: 同一位置的物体可能因 overlap 不足而未被合并.
+**问题**: 旧的 `cross_category_deduplicate` 同时处理同类和跨类实例，导致静态同类实例被错误合并；CLIP 外观特征在室内场景区分度极低。
 
-**修复** (`src/sg_deduplication.py` `cross_category_deduplicate`):
-```python
-centroid_dist = np.linalg.norm(mean(pts_i) - mean(pts_j))
-same_position = centroid_dist < 0.03 and cat_i != cat_j and size_ratio >= 0.4
-if same_position:
-    effective_thre = overlap_thre * 0.5  # 降低阈值
+**修复**: 采用三层流水线架构：
+
+```
+self_category_deduplicate (同类)   → overlap_ratio ≥ 0.3
+         ↓
+cross_category_deduplicate (跨类)  → 同类跳过，overlap_ratio ≥ 0.3
+         ↓
+merge_dynamic_splits_all (全量)    → 静态重叠 + 静态遮挡(子集关系) + 动态分裂(衔接处overlap)
 ```
 
-- 质心距离 < 0.03m + 不同类别 + 尺寸相近 → 判定为 "同位置"
-- 同位置时 overlap 阈值降低到 0.15 (原 0.3)
-- 跨类保护 (size_ratio < 0.4) 在同位置时不生效, 避免漏合并
+**`merge_dynamic_splits_all` 合并条件:**
+1. 静态重叠: ov1 ≥ 0.3 or ov2 ≥ 0.3 → 合并
+2. 静态遮挡: 单向 overlap ≥ 0.5（子集关系）AND 子集方帧数更少 → 合并
+3. 动态分裂: lifespan_ratio < 0.5 AND time_gap ≤ 10 AND 衔接帧 overlap ≥ 0.2 → 合并
+
+**删除**: CLIP 模型加载代码、`_merge_dynamic_splits` 旧函数
 
 ---
 
@@ -1886,6 +1896,7 @@ if same_position:
 | 2026-06-26 | GeoCalib 新增 R[2,2] 质量检查: abs(R[2,2]) < 0.5 时返回 identity (对齐失败) | geometry_utils.py |
 | 2026-06-26 | align_via_geocalib 新增 extrinsics 参数 (必需), 更新 mainv2.py + test 调用 | mainv2.py, test_alignment_basic_pick_place.py |
 | 2026-06-26 | cross_category_deduplicate 新增同位置检测: 质心距离 < 0.03m 时降低 overlap 阈值 (×0.5) | sg_deduplication.py |
+| 2026-07-13 | 去重架构重构: 三层流水线 (同类去重 → 跨类去重 → 全量动态分裂合并)，删除 CLIP，新增 merge_dynamic_splits_all，新增 stage2_pre/post_dedup.pkl 保存 | sg_deduplication.py, mainv2.py |
 | 2026-06-26 | 文档更新 §10.3 (gravity 相机→世界变换), §10.6 (新流程+质量检查), 新增 §10.6.1 (中心点选择), §10.8 (scene15分析), §10.9 (同位置去重) | mainv2_technical_doc.md |
 | 2026-06-26 | 修复 camera_positions 提取 bug: w2c 的 t 不是相机位置, 改用 `-R.T @ t` (Scene 7 z 轴方向反转的根因) | geometry_utils.py |
 | 2026-06-26 | coordinate_alignment.json 新增 extrinsics_convention + camera_position_formula 字段, GeoCalib 返回值新增 gravity_transform/camera_position_transform/floor_centroid | mainv2.py, geometry_utils.py |

@@ -174,6 +174,15 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from src.vlm_logger import vlm_inference, set_vlm_log_dir
+
+
+def _load_vlm_model(checkpoint):
+    """加载 VLM 模型 (策略判定/精修程度判断用). 懒加载复用 Stage1 的加载逻辑."""
+    from tools.generate_scene_json_stage1 import load_vlm_model
+    return load_vlm_model(checkpoint)
+
+
 PLACEMENT_STRATEGIES = {
     "on_top": "放在支撑物顶面",
     "inside": "放在支撑物内部",
@@ -197,61 +206,7 @@ def _resolve_vlm_checkpoint(checkpoint_arg):
     return None
 
 
-def _load_vlm_model(checkpoint):
-    """加载VLM模型和处理器"""
-    import torch
-    try:
-        from transformers import AutoModelForVision2Seq, AutoProcessor
-    except ImportError:
-        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
-        from transformers import AutoProcessor
-
-    print(f"   📥 加载VLM: {checkpoint}", flush=True)
-    processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        checkpoint,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-    return model, processor
-
-
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=256):
-    """调用VLM进行单次推理"""
-    import torch
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt}
-        ]}
-    ]
-    try:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt", enable_thinking=False
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt"
-        )
-    inputs = inputs.to(model.device)
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs, max_new_tokens=max_new_tokens,
-            pad_token_id=processor.tokenizer.eos_token_id
-        )
-
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    return processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
+# VLM 模型加载和推理函数已从 src/vlm_logger 导入，不再在此处定义
 
 
 def _extract_json_from_text(text):
@@ -643,8 +598,8 @@ def _judge_refinement_degree_with_vlm(vlm_model, vlm_processor, image,
             f"Answer:"
         )
 
-        result = _vlm_inference(image, vlm_model, vlm_processor, prompt,
-                                max_new_tokens=max_new_tokens)
+        result = vlm_inference(image, vlm_model, vlm_processor, prompt,
+                                max_new_tokens=max_new_tokens, caller="stage5_refinement_degree")
         result = result.strip().lower()
 
         if "major" in result:
@@ -721,7 +676,41 @@ def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_off
     supported_bottom_z = transformed_mesh.bounds[0, 2]
 
     supporter_mesh = _get_transformed_mesh(supporter_info)
-    supporter_top_z = supporter_mesh.bounds[1, 2]
+    
+    # 从瓶子底部投影到支撑物：取瓶子底部顶点，投影到支撑物表面，取支撑面 z 的平均
+    supporter_vertices = supporter_mesh.vertices
+    supported_center_xy = transformed_mesh.bounds.mean(axis=0)[:2]
+    supported_half_size = (transformed_mesh.bounds[1, :2] - transformed_mesh.bounds[0, :2]) / 2
+    
+    # 取瓶子底部 z 值接近 minimum 的顶点（整个底面，不是单个点）
+    bottom_z_threshold = 0.01
+    bottom_verts_mask = np.abs(transformed_mesh.vertices[:, 2] - supported_bottom_z) < bottom_z_threshold
+    bottom_vertices = transformed_mesh.vertices[bottom_verts_mask]
+    
+    if len(bottom_vertices) > 0:
+        # 对每个底部顶点，投影到支撑物上找 (x,y) 范围内 z <= supported_bottom_z 的点
+        supporting_z_values = []
+        for bv in bottom_vertices:
+            bx, by = bv[0], bv[1]
+            # 投影：在支撑物顶点中找 (x,y) 接近底部顶点、且 z <= supported_bottom_z 的点
+            in_x = np.abs(supporter_vertices[:, 0] - bx) < supported_half_size[0]
+            in_y = np.abs(supporter_vertices[:, 1] - by) < supported_half_size[1]
+            below = supporter_vertices[:, 2] <= supported_bottom_z
+            mask = in_x & in_y & below
+            matching_pts = supporter_vertices[mask]
+            if len(matching_pts) > 0:
+                # 取这些点的 z 值平均（该投影点对应的支撑面高度）
+                supporting_z_values.append(np.mean(matching_pts[:, 2]))
+        
+        if supporting_z_values:
+            # 所有底部顶点对应的支撑面 z 值取平均 → 支撑面高度
+            supporter_top_z = np.mean(supporting_z_values)
+        else:
+            # fallback: 用 bounding box 顶面
+            supporter_top_z = supporter_mesh.bounds[1, 2]
+    else:
+        # fallback: 用 bounding box 顶面
+        supporter_top_z = supporter_mesh.bounds[1, 2]
 
     z_offset = supporter_top_z - supported_bottom_z
 
@@ -1179,7 +1168,8 @@ def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
 
 def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                          categories_and_relations=None, dry_run=False,
-                         max_iterations=8, scene_dir=None):
+                         max_iterations=8, scene_dir=None,
+                         shared_penetration=False):
     """全局穿模检测与解决
 
     策略:
@@ -1198,6 +1188,11 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
         max_iterations: 最大迭代次数 (默认8, 比旧版5更多)
         scene_dir: 场景目录路径. 若提供, 尝试加载 relations_scene_graph.json,
                    使用 scene_graph_objects 的 parent 层级确定大小物体 (比字符串解析更可靠)
+        shared_penetration: bool, 是否启用共享穿模修复 (默认False)
+                           True时，穿模的两个物体各自退一半距离（sep_dist/2），
+                           离原始位置都更近，点云匹配度更高。
+                           仅对两个可移动物体有效（排除floor/wall/被支撑小物体）。
+                           如果一方不可移动，自动回退为单方面推开。
     返回:
         更新后的 all_instances
     """
@@ -1237,7 +1232,7 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
     supporter_to_supported = {}
 
     # 方式 A (优先): 从 relations_scene_graph.json 加载 parent 层级
-    # 比 "supported by X" 字符串解析更可靠, 直接使用 scene graph 的 parent ID
+    # 新格式: scene_graph_objects.parent 是实例名字符串 (如 "table_0") 或 "floor"
     sg_loaded = False
     if scene_dir:
         sg_path = os.path.join(scene_dir, "relations_scene_graph.json")
@@ -1246,29 +1241,35 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 with open(sg_path, 'r') as f:
                     sg_data = json.load(f)
                 sg_objects = sg_data.get("scene_graph_objects", [])
-                cat_to_ids = sg_data.get("category_to_display_ids", {})
-                # 构建 display_id → (category, instance_idx) 映射
-                display_to_inst = {}
-                for cat, ids in cat_to_ids.items():
-                    for inst_idx, did in enumerate(ids):
-                        display_to_inst[did] = (cat.lower().strip(), inst_idx)
+
                 # 用 parent 层级构建 supporter_to_supported
-                # parent=1 → floor (大物体/supporter); parent=其他 → 小物体 (supported)
+                # parent="floor" → 大物体/supporter (跳过); parent="X_0" → 小物体 (supported)
                 for obj in sg_objects:
-                    parent = obj.get("parent", 1)
-                    if parent == 1:  # floor → 大物体, 跳过
+                    parent = obj.get("parent", "floor")
+                    if parent == "floor":
                         continue
-                    supported_did = obj["id"]
-                    supporter_did = parent
-                    if supported_did not in display_to_inst or supporter_did not in display_to_inst:
+                    supported_key = (obj.get("category", "unknown").lower().strip(), obj.get("inst_idx", 0))
+
+                    # parent 是 "table_0" 格式，需要解析
+                    if '_' in parent:
+                        s_cat, s_idx_str = parent.rsplit('_', 1)
+                        try:
+                            s_idx = int(s_idx_str)
+                        except ValueError:
+                            if verbose:
+                                print(f"   ⚠️ 解析 parent '{parent}' 失败", flush=True)
+                            continue
+                    else:
+                        if verbose:
+                            print(f"   ⚠️ parent '{parent}' 不是实例格式，跳过", flush=True)
                         continue
-                    supported_key = display_to_inst[supported_did]
-                    supporter_key = display_to_inst[supporter_did]
+
+                    supporter_key = (s_cat.lower().strip(), s_idx)
                     supporter_to_supported.setdefault(supporter_key, []).append(supported_key)
                     # 同步更新 supported_names: 小物体 (parent != floor) 的类别加入 supported_names
-                    # 这样 move_is_supported 判定与层级修复一致
                     supported_cat_name = supported_key[0]
                     supported_names.add(supported_cat_name)
+
                 if supporter_to_supported and verbose:
                     print(f"   📊 使用 scene_graph_objects parent 层级: "
                           f"{len(supporter_to_supported)} 个 supporter → "
@@ -1400,27 +1401,113 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 else:
                     sep_dist = pen_depth + 0.01
 
-                translation_vec = np.array([0.0, 0.0, 0.0])
-                translation_vec[sep_axis] = direction * sep_dist
+                # ── 共享穿模修复: 两物体各自退一半 ──
+                # 条件: shared_penetration=True, 且两个物体都可移动（非 floor/wall, 非 z-only 受限小物体）
+                use_shared = (
+                    shared_penetration
+                    and not both_small
+                    and not (cat_i_is_floor or cat_i_is_wall)
+                    and not (cat_j_is_floor or cat_j_is_wall)
+                    and not move_is_supported
+                )
 
-                old_pos = move_info["T"][:3, 3].copy()
+                def _apply_translation(mesh_key, info_key, translate_vec, half=False):
+                    """应用平移并更新 all_meshes 和 all_instances"""
+                    scale = 0.5 if half else 1.0
+                    actual_vec = translate_vec * scale
+                    old_pos = info_key["T"][:3, 3].copy()
+                    new_T = trimesh.transformations.translation_matrix(actual_vec) @ info_key["T"]
+                    info_key["T"] = new_T
+                    new_mesh = _get_transformed_mesh(info_key)
+                    if new_mesh.bounds[0, 2] < 0.0:
+                        z_fix = -new_mesh.bounds[0, 2]
+                        info_key["T"] = trimesh.transformations.translation_matrix(
+                            np.array([0.0, 0.0, z_fix])
+                        ) @ info_key["T"]
+                        new_mesh = _get_transformed_mesh(info_key)
+                    all_meshes[mesh_key] = (
+                        all_meshes[mesh_key][0],
+                        all_meshes[mesh_key][1],
+                        new_mesh,
+                        info_key,
+                    )
+                    return old_pos
 
-                new_T = trimesh.transformations.translation_matrix(translation_vec) @ move_info["T"]
-                move_info["T"] = new_T
+                if use_shared:
+                    # 共享模式: 两个物体各退一半
+                    half_dist = sep_dist / 2.0
+                    # move_idx 方向: 推离对方
+                    translate_move = np.array([0.0, 0.0, 0.0])
+                    translate_move[sep_axis] = direction * half_dist
+                    old_pos_move = _apply_translation(move_idx, move_info, translate_move, half=True)
 
-                new_mesh = _get_transformed_mesh(move_info)
-                if new_mesh.bounds[0, 2] < 0.0:
-                    z_fix = -new_mesh.bounds[0, 2]
-                    move_info["T"] = trimesh.transformations.translation_matrix(
-                        np.array([0.0, 0.0, z_fix])
-                    ) @ move_info["T"]
+                    # other_idx 方向: 反向推
+                    other_idx = j if move_idx == i else i
+                    other_cat = all_meshes[other_idx][0]
+                    other_info = all_meshes[other_idx][3]
+                    other_cat_key = other_cat.lower().strip()
+                    translate_other = np.array([0.0, 0.0, 0.0])
+                    translate_other[sep_axis] = -direction * half_dist
+                    old_pos_other = _apply_translation(other_idx, other_info, translate_other, half=True)
+
+                    all_instances[move_cat][move_idx_orig] = move_info
+                    all_instances[other_cat][all_meshes[other_idx][1]] = other_info
+
+                    # 层级传播: 共享模式下, 两个物体都是可移动大物体, 各自传播
+                    for side_name, side_idx, side_info, side_old_pos in [
+                        ("move", move_idx, move_info, old_pos_move),
+                        ("other", other_idx, other_info, old_pos_other),
+                    ]:
+                        side_cat = all_meshes[side_idx][0]
+                        side_is_supported = (
+                            cat_i_is_supported if side_idx == i else cat_j_is_supported
+                        )
+                        if not side_is_supported:
+                            new_pos = side_info["T"][:3, 3]
+                            xy_delta = np.array([new_pos[0] - side_old_pos[0],
+                                                 new_pos[1] - side_old_pos[1], 0.0])
+                            if np.linalg.norm(xy_delta[:2]) > 1e-6:
+                                supporter_key = (side_cat.lower().strip(), all_meshes[side_idx][1])
+                                for s_cat, s_idx in supporter_to_supported.get(supporter_key, []):
+                                    if s_cat not in all_instances or s_idx >= len(all_instances[s_cat]):
+                                        continue
+                                    s_info = all_instances[s_cat][s_idx]
+                                    s_info["T"] = trimesh.transformations.translation_matrix(xy_delta) @ s_info["T"]
+                                    for m_idx in range(len(all_meshes)):
+                                        m_cat, m_idx_orig, _, _ = all_meshes[m_idx]
+                                        if m_cat.lower().strip() == s_cat and m_idx_orig == s_idx:
+                                            all_meshes[m_idx] = (m_cat, m_idx_orig, _get_transformed_mesh(s_info), s_info)
+                                            break
+                                    if verbose:
+                                        print(f"      📎 层级跟随(共享): {s_cat}_{s_idx} 跟随 {side_cat}_{all_meshes[side_idx][1]} "
+                                              f"xy偏移 ({xy_delta[0]:+.4f}, {xy_delta[1]:+.4f})", flush=True)
+
+                    if verbose:
+                        print(f"      🔧 共享穿模修复: {pair_desc} | {axis_name}轴各退 {half_dist:.4f}m"
+                              f" (共 {sep_dist:.4f}m)", flush=True)
+                else:
+                    # 单侧模式（原逻辑）
+                    translation_vec = np.array([0.0, 0.0, 0.0])
+                    translation_vec[sep_axis] = direction * sep_dist
+
+                    old_pos = move_info["T"][:3, 3].copy()
+                    new_T = trimesh.transformations.translation_matrix(translation_vec) @ move_info["T"]
+                    move_info["T"] = new_T
+
                     new_mesh = _get_transformed_mesh(move_info)
+                    if new_mesh.bounds[0, 2] < 0.0:
+                        z_fix = -new_mesh.bounds[0, 2]
+                        move_info["T"] = trimesh.transformations.translation_matrix(
+                            np.array([0.0, 0.0, z_fix])
+                        ) @ move_info["T"]
+                        new_mesh = _get_transformed_mesh(move_info)
 
-                all_meshes[move_idx] = (move_cat, move_idx_orig, new_mesh, move_info)
-                all_instances[move_cat][move_idx_orig] = move_info
+                    all_meshes[move_idx] = (move_cat, move_idx_orig, new_mesh, move_info)
+                    all_instances[move_cat][move_idx_orig] = move_info
 
                 # 层级传播: supporter (大物体) 移动时, supported (小物体) 跟随 x,y
-                if not move_is_supported:
+                # 共享模式下已在 if use_shared 内部完成层级传播, 这里跳过
+                if not use_shared and not move_is_supported:
                     new_pos = move_info["T"][:3, 3]
                     xy_delta = np.array([new_pos[0] - old_pos[0], new_pos[1] - old_pos[1], 0.0])
                     if np.linalg.norm(xy_delta[:2]) > 1e-6:
@@ -2033,7 +2120,8 @@ def refine_inter_object_relations(all_instances, refined_relations,
     # ── 全局穿模解决 ──
     all_instances = resolve_penetrations(all_instances, refined_relations, verbose=verbose,
                                          categories_and_relations=categories_and_relations,
-                                         scene_dir=scene_dir)
+                                         scene_dir=scene_dir,
+                                         shared_penetration=True)
 
     # 保存 SP精修+穿模修复后的中间结果 (GLB #3)
     if scene_dir is not None:
@@ -2063,6 +2151,16 @@ def refine_inter_object_relations(all_instances, refined_relations,
         all_instances, refined_relations=refined_relations,
         categories_and_relations=categories_and_relations, verbose=verbose
     )
+
+    # Phase1 旋转对齐/Phase2 悬空修复会改变物体足印, 可能重新引入穿模
+    # (此前 resolve_penetrations 的成果被旋转作废) → 稳定性检查后再解决一次
+    if verbose:
+        print(f"\n🛡️ 稳定性检查后再次穿模检测与解决...", flush=True)
+    all_instances = resolve_penetrations(
+        all_instances, refined_relations, verbose=verbose,
+        categories_and_relations=categories_and_relations,
+        scene_dir=scene_dir,
+        shared_penetration=True)
 
     # 保存 check_stability 后的最终结果 (GLB #4 / GLB #5)
     if scene_dir is not None:

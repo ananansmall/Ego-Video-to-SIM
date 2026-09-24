@@ -28,6 +28,10 @@ ReplicateAnyScene V2 — 完整自动化流水线
     5.1: 细化 "supported by other objects" 关系 (VLM判断具体支撑物)
     5.2: 物体间支撑关系空间位置精修 (纯几何计算)
 
+  Stage 6: 材质感知的物理参数标注 (默认关闭，--enable_stage6 启用)
+           VLM 推断物体材质 → 查映射表 → 输出 SAPIEN 物理参数
+           输出: materials.json + materials_debug.json
+
 GLB 文件说明 (按启用的 Stage 决定文件名):
   final_scene.glb          = Stage3 基础精修产物 (固定起点, 不再更改)
   final_scene_stage4.glb   = Stage4 产物 (视觉-空间对齐后)
@@ -50,6 +54,7 @@ GLB 文件说明 (按启用的 Stage 决定文件名):
   --enable_stage4     启用Stage 4视觉-空间对齐
   --enable_stage5     启用Stage 5高级语义精修 (5.1+5.2)
   --stage5_method     Stage5.1关系推断方式: scene_graph(默认) | per_object
+  --enable_stage6     启用Stage 6材质感知物理标注
   --stage4_iterations Stage4 ICP迭代次数 (默认8)
   --stage4_temporal_radius Stage4时序邻域半径 (默认5)
   --stage4_use_mast3r Stage4使用MASt3R匹配
@@ -164,6 +169,7 @@ from src.utils import load_video_frames, vis_instance_masks
 from src.geometry_utils import (
     align_to_room_coordinate_system,
     align_via_objects,
+    align_via_vlm_floor_points,
     align_via_large_plane,
     align_via_geocalib,
     align_vggt_predictions,
@@ -258,7 +264,7 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=12, v
         sys.exit(1)
 
     # 读取Stage1输出的场景JSON
-    with open(stage1_json, 'r') as f:
+    with open(stage1_json, 'r', encoding='utf-8') as f:
         categories_and_relations = json.load(f)
 
     # 同步 keyframes: generate_scene_json_stage1 将关键帧保存到
@@ -297,7 +303,18 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=12, v
     return stage1_json, categories_and_relations
 
 
-def run_stage2(input_video, output_path, categories_and_relations, max_frames=120, vggt_model_type="vggt"):
+def _load_vlm_model(checkpoint):
+    """加载 VLM 模型 (Stage2.5/Stage3 对齐兜底分支用).
+
+    复用 Stage1 的加载逻辑 (支持 Qwen3.5-FP8 / Qwen2.5-VL / Qwen3-VL 等),
+    懒加载避免拖慢模块导入。
+    """
+    from tools.generate_scene_json_stage1 import load_vlm_model
+    return load_vlm_model(checkpoint)
+
+
+def run_stage2(input_video, output_path, categories_and_relations, max_frames=120,
+               vggt_model_type="vggt", vlm_checkpoint=None):
     """
     Stage 2: VGGT 3D重建 + SAM3空间去重 (与main.py一致)
 
@@ -359,7 +376,7 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         vggt_prediction_results['colors'], sam3_image_model
     )
 
-    # 四阶段坐标系对齐 (Stage1 严格 → Stage2 放宽 → Stage3 大平面 → Stage4 GeoCalib)
+    # 五阶段坐标系对齐 (Stage1 严格 → Stage2 放宽 → Stage2.5 VLM辅助 → Stage3 大平面 → Stage4 GeoCalib)
     R, t = align_to_room_coordinate_system(
         vggt_prediction_results['world_points'], wall_masks, floor_masks
     )
@@ -373,12 +390,38 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         )
         alignment_stage = "stage2_relaxed"
 
+    # Stage 2.5: VLM 辅助 - 场景类型识别 + 针对性 floor 分割
     if np.allclose(R, np.eye(3), atol=1e-6):
-        print("   Stage2 (relaxed) 失败, 尝试 Stage3 (large_plane)...", flush=True)
+        vlm_model, vlm_processor = _load_vlm_model(vlm_checkpoint)
+        if vlm_model is not None:
+            print("   Stage2 (relaxed) 失败, 尝试 Stage 2.5 (VLM辅助)...", flush=True)
+            R, t, alignment_info = align_via_vlm_floor_points(
+                vggt_prediction_results['world_points'],
+                vggt_prediction_results['colors'],
+                sam3_image_model,
+                vlm_model,
+                vlm_processor,
+                num_sample_frames=8,
+            )
+            alignment_stage = "stage2.5_vlm_assisted"
+            vlm_model = unload_model(vlm_model) if hasattr(vlm_model, 'cpu') else None
+        else:
+            print("   Stage 2.5 跳过 (VLM 模型不可用)", flush=True)
+
+    if np.allclose(R, np.eye(3), atol=1e-6):
+        print("   Stage 2.5 (VLM辅助) 失败, 尝试 Stage3 (large_plane)...", flush=True)
+        vlm_model, vlm_processor = _load_vlm_model(vlm_checkpoint)
         R, t, alignment_info = align_via_large_plane(
-            vggt_prediction_results['world_points'], floor_masks
+            vggt_prediction_results['world_points'],
+            floor_masks,
+            vggt_prediction_results['colors'],
+            sam3_image_model,
+            vlm_model,
+            vlm_processor,
         )
         alignment_stage = "stage3_large_plane"
+        if vlm_model is not None:
+            vlm_model = unload_model(vlm_model) if hasattr(vlm_model, 'cpu') else None
 
     if np.allclose(R, np.eye(3), atol=1e-6):
         print("   Stage3 (large_plane) 失败, 尝试 Stage4 (GeoCalib)...", flush=True)
@@ -386,7 +429,6 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
             vggt_prediction_results['colors'],
             vggt_prediction_results['world_points'],
             extrinsics=vggt_prediction_results['extrinsics'],
-            max_frames=8,
         )
         alignment_stage = "stage4_geocalib"
 
@@ -409,7 +451,7 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         "camera_position_formula": "cam_pos = -R_w2c.T @ t_w2c (不是 t 本身)",
     }
     coord_align_path = os.path.join(output_path, "coordinate_alignment.json")
-    with open(coord_align_path, 'w') as f:
+    with open(coord_align_path, 'w', encoding='utf-8') as f:
         json.dump(coord_align_info, f, indent=2, ensure_ascii=False)
     print(f"   💾 坐标系对齐信息已保存: {coord_align_path}", flush=True)
 
@@ -454,8 +496,38 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
             vggt_prediction_results['world_points'],
             vggt_prediction_results['world_points_conf'],
             category_name=category,
+            overlap_thre=0.3,
         )
         all_masks[category] = deduplicated_category_masks
+
+    # 跨类去重 — 先加载 CLIP 用于 appearance feature 比较
+    print(f"   [Stage 2] 加载 CLIP 模型用于跨类合并...", flush=True)
+    try:
+        from transformers import CLIPModel, CLIPProcessor
+        clip_model = CLIPModel.from_pretrained("/mnt/data/lza/models/clip-vit-base-patch32").cuda()
+        clip_model.eval()
+        clip_processor = CLIPProcessor.from_pretrained("/mnt/data/lza/models/clip-vit-base-patch32")
+        print(f"   [Stage 2] CLIP 加载成功", flush=True)
+    except Exception as e:
+        print(f"   [Stage 2] CLIP 加载失败: {e}，跳过跨类合并", flush=True)
+        clip_model = None
+        clip_processor = None
+
+    # 构建 images_dict: frame_id → RGB image
+    colors = vggt_prediction_results['colors']
+    images_dict = {}
+    for fid, img in enumerate(colors):
+        images_dict[fid] = img.copy()  # RGB, (H, W, 3)
+
+    # === 保存去重前的 all_masks 用于 CLIP 测试 ===
+    _pre_dedup_path = os.path.join(output_path, '_pre_dedup_masks.pkl')
+    import pickle as _pk
+    _pk.dump({
+        'all_masks': all_masks,
+        'images_dict': images_dict,
+        'world_points': vggt_prediction_results['world_points'],
+    }, open(_pre_dedup_path, 'wb'), protocol=5)
+    print(f"   [SAVE] 去重前数据已保存到 {_pre_dedup_path}", flush=True)
 
     # 跨类去重
     json_categories_set = set(categories_and_relations.keys())
@@ -463,6 +535,9 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         all_masks,
         vggt_prediction_results['world_points'],
         vggt_prediction_results['world_points_conf'],
+        images_dict=images_dict,
+        clip_model=clip_model,
+        clip_processor=clip_processor,
     )
 
     # JSON白名单过滤: 只保留Stage1发现的类别
@@ -515,19 +590,15 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
         all_optimal_frame_ids[category] = []
         for inst_idx, instance_masks in enumerate(category_masks):
             optimal_frame_id, is_dynamic, motion_info = get_optimal_view_frame_id(
-                vggt_prediction_results['world_points'], instance_masks
+                vggt_prediction_results['world_points'], instance_masks,
+                world_points_conf=vggt_prediction_results.get('world_points_conf')
             )
             all_optimal_frame_ids[category].append(optimal_frame_id)
             tag = "DYNAMIC" if is_dynamic else "STATIC"
-            if is_dynamic:
-                dynamic_count += 1
-            else:
-                static_count += 1
-            print(f"   {category}_{inst_idx}: [{tag}] median_disp={motion_info['median_disp']}m, "
-                  f"max_disp={motion_info['max_disp']}m, "
-                  f"valid_frames={motion_info['num_valid_frames']} → frame {optimal_frame_id}", flush=True)
+            print(f"   {category}_{inst_idx}: [SELECT] area={motion_info['max_area']:.0f}px, "
+                  f"frames={motion_info['num_valid_frames']} → frame {optimal_frame_id}", flush=True)
 
-    print(f"\n   📊 动态/静态统计: {dynamic_count} 动态, {static_count} 静态", flush=True)
+    print(f"\n   📊 注意: 动态判定由第二轮滑动窗口逻辑统一处理", flush=True)
 
     # 保存最优视角帧图像（文件名格式: {category}_inst{idx}_frame{fid}.jpg）
     optimal_frames_dir = os.path.join(output_path, 'optimal_frames')
@@ -560,6 +631,9 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
     )
 
     # 动态物体: 位置调整到首次可见帧 (用最大帧生成mesh, 但位置摆在每个实例初始被SAM3检测到的位置)
+    traj_info = {}
+    world_points_conf = vggt_prediction_results.get(
+        'world_points_conf', np.ones_like(vggt_prediction_results['depths'], dtype=np.float32))
     for category, category_masks in deduplicated_all_masks.items():
         for inst_idx, (instance_masks, instance_info) in enumerate(zip(category_masks, all_instances[category])):
             optimal_frame_id = all_optimal_frame_ids[category][inst_idx]
@@ -567,6 +641,7 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
             sorted_masks = sorted(instance_masks, key=lambda im: im['frame_id'])
             first_visible_frame_id = sorted_masks[0]['frame_id']
 
+            # ── 置信度加权质心计算 ──
             centroid_data = []
             for im in sorted_masks:
                 fid = im['frame_id']
@@ -576,55 +651,270 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                 if not np.any(valid):
                     continue
                 pts = pointmap[valid]
+                confs = world_points_conf[fid][valid]
                 finite = np.all(np.isfinite(pts), axis=-1)
                 if not np.any(finite):
                     continue
-                centroid_data.append((fid, np.mean(pts[finite], axis=0)))
+                # 自适应置信度阈值: 取 conf 的 10th percentile，避免硬编码 1.5 过滤过多点
+                conf_thresh = np.percentile(confs[finite], 10)
+                conf_mask = finite & (confs > conf_thresh)
+                if not np.any(conf_mask):
+                    conf_mask = finite  # fallback
+                weights = confs[conf_mask]
+                w_pts = pts[conf_mask]
+                centroid = np.average(w_pts, axis=0, weights=weights)
+                centroid_data.append((fid, centroid))
 
             if len(centroid_data) < 2:
                 continue
 
-            disps = [np.linalg.norm(centroid_data[i][1] - centroid_data[i-1][1]) for i in range(1, len(centroid_data))]
-            median_disp = float(np.median(disps))
-            n_h = max(1, len(centroid_data) // 5)
-            head_mean = np.mean([c for _, c in centroid_data[:n_h]], axis=0)
-            tail_mean = np.mean([c for _, c in centroid_data[-n_h:]], axis=0)
+            # ── 位移计算 + MAD 离群点剔除 ──
+            disps = np.array([np.linalg.norm(centroid_data[i][1] - centroid_data[i-1][1])
+                              for i in range(1, len(centroid_data))])
+            med = np.median(disps)
+            mad = np.median(np.abs(disps - med))
+            if mad > 1e-6:
+                z_scores = 0.6745 * (disps - med) / mad
+                inlier_mask = np.abs(z_scores) < 3.5
+            else:
+                inlier_mask = np.ones(len(disps), dtype=bool)
+            clean_disps = disps[inlier_mask]
+
+            median_disp = float(np.median(clean_disps))
+            mean_disp = float(np.mean(clean_disps)) if len(clean_disps) > 0 else 0.0
+            max_disp = float(np.max(clean_disps)) if len(clean_disps) > 0 else 0.0
+
+            # ── 鲁棒 global_disp: 四分位均值 (前25% vs 后25%) ──
+            n_q = max(3, len(centroid_data) // 4)
+            head_mean = np.mean([c for _, c in centroid_data[:n_q]], axis=0)
+            tail_mean = np.mean([c for _, c in centroid_data[-n_q:]], axis=0)
             global_disp = float(np.linalg.norm(tail_mean - head_mean))
-            is_dynamic_inst = median_disp > 0.02 or global_disp > max(0.04, 0.02 * 2)
+
+            # ── 有位移帧占比 (阈值 0.05m, 高于 VGGT 噪声) ──
+            moving_disps = [d for d in clean_disps if d > 0.05]
+            moving_ratio = len(moving_disps) / len(clean_disps) if len(clean_disps) > 0 else 0.0
+
+            # ── 连续高位移分析: 统计位移 > p50 的连续帧数最大值 ──
+            #    真实运动: 有大量连续帧的中等位移 (如拿起杯子)
+            #    跟踪漂移: 高位移帧是零散的, 连续帧数少
+            p50 = np.percentile(clean_disps, 50) if len(clean_disps) > 0 else 0.0
+            high_mask = clean_disps > p50
+            max_consecutive_high = 0
+            cur_consecutive = 0
+            for h in high_mask:
+                if h:
+                    cur_consecutive += 1
+                    max_consecutive_high = max(max_consecutive_high, cur_consecutive)
+                else:
+                    cur_consecutive = 0
+
+            # ── 最小可见帧数: <15帧不判动态 (统计不可靠) ──
+            if len(centroid_data) < 15:
+                print(f"   {category}_{inst_idx}: [SKIP] only {len(centroid_data)} frames (< 15), "
+                      f"too few for reliable dynamic detection", flush=True)
+                continue
+
+            # ── 动态判定逻辑 (修正: 区分真实运动 vs 跟踪漂移):
+            #    使用单条件判定: max_consecutive_high > 30
+            #    真实运动: consec≥48 (如拿起杯子，持续运动)
+            #    跟踪漂移: consec≤29 (零散位移，不连续)
+            is_dynamic_inst = max_consecutive_high > 30
 
             if not is_dynamic_inst:
                 continue
 
+            reasons = []
+            if max_consecutive_high > 30: reasons.append(f"consec>{max_consecutive_high}")
+            print(f"   {category}_{inst_idx}: [DYNAMIC] mean_disp={mean_disp:.4f}m, "
+                  f"median_disp={median_disp:.4f}m, max_disp={max_disp:.4f}m, "
+                  f"consec_high={max_consecutive_high}, frames={len(centroid_data)} → {', '.join(reasons)}", flush=True)
+
+            # ── 动态物体点云轨迹输出 ──
+            dyn_output_dir = os.path.join(output_path, "dynamic_pointclouds")
+            os.makedirs(dyn_output_dir, exist_ok=True)
+
+            # 提取每个可见帧的点云
+            frame_ids = []
+            frame_pts = []
+            for im in sorted_masks:
+                fid = im['frame_id']
+                mask = im['mask']
+                pointmap = vggt_prediction_results['world_points'][fid]
+                valid = mask > 0
+                if not np.any(valid):
+                    continue
+                pts = pointmap[valid]
+                finite_mask = np.all(np.isfinite(pts), axis=1)
+                pts = pts[finite_mask]
+                if pts.size == 0:
+                    continue
+                # 每帧最多采样 5000 个点
+                if len(pts) > 5000:
+                    indices = np.random.choice(len(pts), 5000, replace=False)
+                    pts = pts[indices]
+                frame_ids.append(fid)
+                frame_pts.append(pts)
+
+            # 写入 PLY 文件, 用红→蓝渐变表示时间顺序
+            total_frames = len(frame_ids)
+            for fi, (fid, pts) in enumerate(zip(frame_ids, frame_pts)):
+                t_ratio = fi / max(total_frames - 1, 1)
+                r = int(255 * (1 - t_ratio))
+                g = int(0)
+                b = int(255 * t_ratio)
+                color_rgb = np.full((pts.shape[0], 3), [r, g, b], dtype=np.uint8)
+                combined = np.hstack([pts.astype(np.float64), color_rgb.astype(np.float64)])
+
+                ply_header = (
+                    "ply\n"
+                    "format ascii 1.0\n"
+                    f"element vertex {len(combined)}\n"
+                    "property float x\n"
+                    "property float y\n"
+                    "property float z\n"
+                    "property uchar red\n"
+                    "property uchar green\n"
+                    "property uchar blue\n"
+                    "end_header\n"
+                )
+                ply_filename = f"{category}_inst{inst_idx}_dynamic.ply"
+                ply_path = os.path.join(dyn_output_dir, ply_filename)
+                with open(ply_path, 'w') as f:
+                    f.write(ply_header)
+                    np.savetxt(f, combined, fmt='%.6f %.6f %.6f %d %d %d')
+                print(f"   {category}_{inst_idx}: 动态点云轨迹已保存: {ply_path} ({len(combined)} vertices)", flush=True)
+
+            # 计算轨迹信息 (复用已有的 centroid_data)
+            visible_frames = [fid for fid, _ in centroid_data]
+            centroids = [c.tolist() for _, c in centroid_data]
+
+            if len(centroids) >= 2:
+                total_disp = float(np.linalg.norm(np.array(centroids[-1]) - np.array(centroids[0])))
+                motion_dir = np.array(centroids[-1]) - np.array(centroids[0])
+                motion_dir_norm = float(np.linalg.norm(motion_dir))
+                motion_dir = (motion_dir / motion_dir_norm).tolist() if motion_dir_norm > 0 else [0.0, 0.0, 0.0]
+            else:
+                total_disp = 0.0
+                motion_dir = [0.0, 0.0, 0.0]
+
+            traj_info[f"{category}_inst{inst_idx}"] = {
+                "is_dynamic": True,
+                "category": category,
+                "instance_idx": inst_idx,
+                "visible_frames": visible_frames,
+                "centroids": centroids,
+                "total_displacement": total_disp,
+                "motion_direction": motion_dir
+            }
+
             # ── 点云清理: 动态物体只保留首帧点云, 剔除其他帧的点云 ──
             # 动态物体在运动, 其他帧的点云是"残影", 会污染下游 (SP精修/Stage4/对齐)
             # 保留 first_visible_frame_id 的点云 (物体放置位置), 其余帧该实例 mask 区域置 NaN
-            cleaned_count = 0
-            for im_entry in sorted_masks:
-                fid_clean = im_entry['frame_id']
-                if fid_clean == first_visible_frame_id:
-                    continue
-                mask_clean = im_entry['mask']
-                vggt_prediction_results['world_points'][fid_clean][mask_clean > 0] = np.nan
-                cleaned_count += 1
-            if cleaned_count > 0:
-                print(f"   {category}_{inst_idx}: [DYNAMIC] 点云清理: 保留首帧{first_visible_frame_id}, "
-                      f"剔除其他 {cleaned_count} 帧的实例点云", flush=True)
+            # *** 已注释: 会破坏下游 world_points 数据, 影响 Pick/Place 检测和 Stage4 对齐 ***
+            #
+            # cleaned_count = 0
+            # for im_entry in sorted_masks:
+            #     fid_clean = im_entry['frame_id']
+            #     if fid_clean == first_visible_frame_id:
+            #         continue
+            #     mask_clean = im_entry['mask']
+            #     vggt_prediction_results['world_points'][fid_clean][mask_clean > 0] = np.nan
+            #     cleaned_count += 1
+            # if cleaned_count > 0:
+            #     print(f"   {category}_{inst_idx}: [DYNAMIC] 点云清理: 保留首帧{first_visible_frame_id}, "
+            #           f"剔除其他 {cleaned_count} 帧的实例点云", flush=True)
 
             first_visible_centroid = None
             optimal_centroid = None
+            first_visible_pts = None
+            optimal_pts = None
             for fid, c in centroid_data:
                 if fid == first_visible_frame_id and first_visible_centroid is None:
                     first_visible_centroid = c
+                    # 提取首帧点云
+                    for im_entry in sorted_masks:
+                        if im_entry['frame_id'] == first_visible_frame_id:
+                            mask_fv = im_entry['mask']
+                            pointmap_fv = vggt_prediction_results['world_points'][first_visible_frame_id]
+                            pts_fv = pointmap_fv[mask_fv > 0]
+                            finite_fv = np.all(np.isfinite(pts_fv), axis=1)
+                            first_visible_pts = pts_fv[finite_fv]
+                            break
                 if fid == optimal_frame_id:
                     optimal_centroid = c
+                    # 提取最优帧点云
+                    for im_entry in sorted_masks:
+                        if im_entry['frame_id'] == optimal_frame_id:
+                            mask_opt = im_entry['mask']
+                            pointmap_opt = vggt_prediction_results['world_points'][optimal_frame_id]
+                            pts_opt = pointmap_opt[mask_opt > 0]
+                            finite_opt = np.all(np.isfinite(pts_opt), axis=1)
+                            optimal_pts = pts_opt[finite_opt]
+                            break
 
+            # ── 位置 + 旋转调整 ──
+            # 平移：mesh 从最优帧位置移到首帧位置
+            # 旋转：用 PCA 估计两帧的朝向差，旋转到首帧朝向
             if first_visible_centroid is not None and optimal_centroid is not None and first_visible_frame_id != optimal_frame_id:
                 offset = first_visible_centroid - optimal_centroid
+                needs_adjust = False
+
+                # 平移调整
                 if np.linalg.norm(offset) > 0.01:
                     T = instance_info["T"].copy()
                     T[:3, 3] += offset
-                    instance_info["T"] = T
-                    print(f"   {category}_{inst_idx}: [DYNAMIC] 位置调整: mesh帧{optimal_frame_id} → 首次可见帧{first_visible_frame_id}, offset={np.linalg.norm(offset):.4f}m", flush=True)
+                    needs_adjust = True
+
+                # 旋转调整: PCA 估计主方向
+                rot_applied = False
+                if (first_visible_pts is not None and optimal_pts is not None
+                        and len(first_visible_pts) > 10 and len(optimal_pts) > 10):
+                    try:
+                        # 中心化点云
+                        pts_fv_c = first_visible_pts - first_visible_centroid
+                        pts_opt_c = optimal_pts - optimal_centroid
+
+                        # PCA: 求协方差矩阵的主轴
+                        _, _, V_fv = np.linalg.svd(pts_fv_c.T @ pts_fv_c, full_matrices=True)
+                        _, _, V_opt = np.linalg.svd(pts_opt_c.T @ pts_opt_c, full_matrices=True)
+
+                        # V 的行就是主轴方向 (按方差降序排列)
+                        # 旋转矩阵 R = V_fv @ V_opt.T
+                        R_pca = V_fv @ V_opt.T
+
+                        # 检查是否是合法旋转矩阵（反射矩阵行列式=-1需要修正）
+                        if np.linalg.det(R_pca) < 0:
+                            V_fv[:, 2] *= -1
+                            R_pca = V_fv @ V_opt.T
+
+                        # 旋转角 (用于日志)
+                        trace_R = np.trace(R_pca)
+                        rot_angle = np.degrees(np.arccos(np.clip((trace_R - 1) / 2, -1, 1)))
+
+                        if rot_angle > 5.0:  # 旋转角 > 5度才调整
+                            # 如果还没创建 T，先创建；如果有平移，复用已创建的 T
+                            if not needs_adjust:
+                                T = instance_info["T"].copy()
+                            T[:3, :3] = R_pca @ T[:3, :3]
+                            needs_adjust = True
+                            rot_applied = True
+
+                        if needs_adjust:
+                            instance_info["T"] = T
+                            msg = f"   {category}_inst{inst_idx}: [DYNAMIC] 位置+旋转调整: mesh帧{optimal_frame_id} → 首次可见帧{first_visible_frame_id}, offset={np.linalg.norm(offset):.4f}m"
+                            if rot_applied:
+                                msg += f", rot={rot_angle:.1f}deg"
+                            print(msg, flush=True)
+
+                    except Exception as e:
+                        print(f"   {category}_inst{inst_idx}: [WARN] 旋转调整失败: {e}", flush=True)
+
+    # 写入 trajectory_info.json
+    if traj_info:
+        traj_file = os.path.join(output_path, "dynamic_pointclouds", "trajectory_info.json")
+        with open(traj_file, 'w', encoding='utf-8') as f:
+            json.dump(traj_info, f, indent=2)
+        print(f"   💾 trajectory_info.json 已保存 ({len(traj_info)} 个动态物体)", flush=True)
 
     # 3D Mesh 去重: 在生成后二次检查，移除重复3D资产
     all_instances, deduplicated_all_masks, mesh_dedup_removed = deduplicate_3d_assets(
@@ -636,7 +926,8 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
             all_optimal_frame_ids[category] = []
             for instance_masks in category_masks:
                 optimal_fid, _, _ = get_optimal_view_frame_id(
-                    vggt_prediction_results['world_points'], instance_masks
+                    vggt_prediction_results['world_points'], instance_masks,
+                    world_points_conf=vggt_prediction_results.get('world_points_conf')
                 )
                 all_optimal_frame_ids[category].append(optimal_fid)
 
@@ -804,6 +1095,8 @@ def run_stage5(output_path, categories_and_relations, all_instances,
             instance_masks=deduplicated_all_masks,
             colors=vggt_prediction_results['colors'],
             output_dir=output_path,
+            optimal_frames_dir=os.path.join(output_path, 'optimal_frames'),
+            keyframes_dir=os.path.join(output_path, 'keyframes'),
         )
     else:
         has_other_objects = any(
@@ -1018,6 +1311,11 @@ def main(args):
         sys.exit(1)
     print(f"🤖 VLM模型: {vlm_checkpoint}", flush=True)
 
+    # 设置 VLM 对话日志输出目录
+    from src.vlm_logger import set_vlm_log_dir
+    set_vlm_log_dir(args.output_path)
+    print(f"📝 VLM对话日志将保存到: {os.path.join(args.output_path, 'vlm_conversation.jsonl')}", flush=True)
+
     # ── Stage 1: VGGT引导的智能物体发现 ──
     _t1 = time.time()
     stage1_json, categories_and_relations = run_stage1(
@@ -1032,6 +1330,7 @@ def main(args):
     vggt_prediction_results, deduplicated_all_masks, wall_masks, floor_masks = run_stage2(
         args.input_video, args.output_path, categories_and_relations,
         max_frames=args.max_frames, vggt_model_type=args.vggt_model,
+        vlm_checkpoint=vlm_checkpoint,
     )
     _stage2_time = time.time() - _t2
 
@@ -1178,11 +1477,27 @@ def main(args):
 
             import json as _json
             report_path = os.path.join(args.output_path, "physics_report.json")
-            with open(report_path, 'w') as f:
+            with open(report_path, 'w', encoding='utf-8') as f:
                 _json.dump(physics_report, f, indent=2, ensure_ascii=False)
             print(f"  💾 物理验证报告: {report_path}", flush=True)
     else:
         print("\n⏭️  Stage 5 高级精修已跳过 (使用 --enable_stage5 启用)", flush=True)
+
+    # ── Stage 6: 材质感知的物理参数标注 (可选，默认关闭) ──
+    _stage6_time = 0
+    if args.enable_stage6:
+        _t6 = time.time()
+        from tools.material_annotator import run_stage6
+        materials = run_stage6(
+            args.output_path, all_instances, refined_relations,
+            vlm_checkpoint,
+            instance_masks=deduplicated_all_masks,
+            colors=vggt_prediction_results['colors'],
+            preloaded_vlm=None,
+        )
+        _stage6_time = time.time() - _t6
+    else:
+        print("\n⏭️  Stage 6 材质物理标注已跳过 (使用 --enable_stage6 启用)", flush=True)
 
         # Stage5未启用时，物理验证仍可单独调用 (实验性功能)
         if args.enable_physics_validation:
@@ -1215,12 +1530,12 @@ def main(args):
 
             import json as _json
             report_path = os.path.join(args.output_path, "physics_report.json")
-            with open(report_path, 'w') as f:
+            with open(report_path, 'w', encoding='utf-8') as f:
                 _json.dump(physics_report, f, indent=2, ensure_ascii=False)
             print(f"💾 物理验证报告: {report_path}", flush=True)
 
     # 保存最终关系JSON
-    with open(os.path.join(args.output_path, "final_relations.json"), 'w') as f:
+    with open(os.path.join(args.output_path, "final_relations.json"), 'w', encoding='utf-8') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
 
     # 保存位姿变化JSON (每个物体在各阶段的位置历史 + 坐标系对齐变换 + 相机外参变化)
@@ -1228,7 +1543,7 @@ def main(args):
     # 合并坐标系对齐信息 (由 run_stage2 保存的 coordinate_alignment.json)
     coord_align_path = os.path.join(args.output_path, "coordinate_alignment.json")
     if os.path.exists(coord_align_path):
-        with open(coord_align_path, 'r') as f:
+        with open(coord_align_path, 'r', encoding='utf-8') as f:
             coord_align = json.load(f)
         # 提取所有帧的相机外参变化 (从 extrinsics/ 目录读取原始外参, 与对齐后对比)
         extrinsics_dir = os.path.join(args.output_path, "extrinsics")
@@ -1249,7 +1564,7 @@ def main(args):
         }
     else:
         pose_output = pose_history
-    with open(pose_path, 'w') as f:
+    with open(pose_path, 'w', encoding='utf-8') as f:
         json.dump(pose_output, f, indent=2, ensure_ascii=False)
     print(f"💾 位姿变化已保存: {pose_path}", flush=True)
 
@@ -1283,6 +1598,8 @@ def main(args):
         _stage_times.append(("Stage 4 (视觉-空间对齐)", _stage4_time))
     if _stage5_time > 0:
         _stage_times.append(("Stage 5 (语义精修)", _stage5_time))
+    if _stage6_time > 0:
+        _stage_times.append(("Stage 6 (材质物理标注)", _stage6_time))
 
     _other_time = total_time - sum(t for _, t in _stage_times)
     _stage_times.append(("其他 (IO/初始化等)", max(0, _other_time)))
@@ -1330,6 +1647,8 @@ if __name__ == "__main__":
                         help="Stage4 时序邻域半径 (默认5)")
     parser.add_argument("--stage4_use_mast3r", action="store_true",
                         help="Stage4 使用MASt3R匹配 (需要GPU)")
+    parser.add_argument("--enable_stage6", action="store_true",
+                        help="启用Stage 6材质感知物理标注 (默认关闭)")
     parser.add_argument("--enable_physics_validation", action="store_true",
                         help="启用z轴合理性验证 (Stage5.3 或独立模式, 默认不启用)")
     parser.add_argument("--physics_sim_steps", type=int, default=300,

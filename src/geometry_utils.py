@@ -243,6 +243,10 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
     mean_floor_normal = np.mean([info['normal'] for info in floor_plane_infos], axis=0)
     mean_floor_normal = mean_floor_normal / np.linalg.norm(mean_floor_normal)
     vaild_floor_plane_infos = [info for info in floor_plane_infos if abs(np.dot(info['normal'], mean_floor_normal)) > np.cos(np.radians(30))]
+    if len(vaild_floor_plane_infos) == 0:
+        # 各帧 floor 平面法向分歧过大 (>30°), 无法一致对齐 → 返回单位阵表示失败,
+        # 让 run_stage2 回退到 Stage2-relaxed / VLM / large_plane / GeoCalib 兜底链
+        return np.eye(3), np.zeros(3)
     floor_plane_info = max(vaild_floor_plane_infos, key=lambda x: x['area'])
     floor_normal = floor_plane_info['normal']
     # choose the wall plane with the largest area and orthogonal (within 5 degrees) to the floor
@@ -418,26 +422,48 @@ def align_via_objects(world_points, wall_masks, floor_masks,
     }
 
 
-def align_via_large_plane(world_points, large_plane_masks, floor_mean_distance_thres=0.05):
+def align_via_large_plane(world_points, large_plane_masks, colors=None, sam3_image_model=None,
+                          vlm_model=None, vlm_processor=None, floor_mean_distance_thres=0.05):
     '''
     阶段3: 用SAM3大平面mask拟合floor平面.
 
-    从所有大平面mask中, 选最大面积的平面作为 floor.
-    用点云 PCA 确定水平方向.
+    增强版: 如果提供了 VLM 模型, 先用场景类型识别来选择更有针对性的 prompt.
 
     Args:
       world_points: (T, H, W, 3)
       large_plane_masks: list of dicts with 'frame_id' and 'mask'
+      colors: (S, H, W, 3) RGB 图像 (可选, 用于 VLM 场景类型识别)
+      sam3_image_model: SAM3 image model (可选, 用于 VLM 辅助分割)
+      vlm_model: VLM 模型 (可选, 用于场景类型识别)
+      vlm_processor: VLM processor (可选)
+      floor_mean_distance_thres: 平面拟合 mean_distance 阈值
 
     Returns:
       (R, t, info_dict): 成功
       (np.eye(3), np.zeros(3), info_dict): 失败
     '''
-    if len(large_plane_masks) == 0:
-        return np.eye(3), np.zeros(3), {'reason': 'no_large_plane', 'n_masks': 0}
+    # 如果没有 large_plane_masks 但有 VLM, 尝试用 VLM 辅助分割
+    enhanced_masks = list(large_plane_masks) if large_plane_masks else []
+    scene_info = {}
+    if len(enhanced_masks) == 0 and colors is not None and sam3_image_model is not None and vlm_model is not None:
+        from src.object_segmentation import segment_large_flat_surfaces
+        print("   大平面 mask 为空, 尝试 VLM 增强的大平面分割...", flush=True)
+        enhanced_masks = segment_large_flat_surfaces(
+            colors, sam3_image_model,
+            vlm_model=vlm_model, vlm_processor=vlm_processor,
+            min_mask_area=5000, sample_frame_for_vlm=0
+        )
+        scene_info['enhanced_from_vlm'] = True
+
+    if len(enhanced_masks) == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'no_large_plane',
+            'n_masks': len(large_plane_masks),
+            'n_enhanced': len(enhanced_masks),
+        }
 
     plane_infos = []
-    for pm in large_plane_masks:
+    for pm in enhanced_masks:
         frame_id = pm['frame_id']
         mask = pm['mask']
         pointmap = world_points[frame_id]
@@ -446,7 +472,9 @@ def align_via_large_plane(world_points, large_plane_masks, floor_mean_distance_t
             plane_infos.append(info)
 
     if len(plane_infos) == 0:
-        return np.eye(3), np.zeros(3), {'reason': 'no_valid_plane', 'n_masks': len(large_plane_masks)}
+        info_dict = {'reason': 'no_valid_plane', 'n_masks': len(enhanced_masks)}
+        info_dict.update(scene_info)
+        return np.eye(3), np.zeros(3), info_dict
 
     floor_plane_info = max(plane_infos, key=lambda x: x['area'])
     floor_normal = floor_plane_info['normal']
@@ -457,12 +485,14 @@ def align_via_large_plane(world_points, large_plane_masks, floor_mean_distance_t
 
     R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
 
-    return R, t, {
+    result_info = {
         'method': 'large_plane+pca',
         'floor_area': float(floor_plane_info['area']),
         'floor_mean_distance': float(floor_plane_info['mean_distance']),
         'n_planes': len(plane_infos),
     }
+    result_info.update(scene_info)
+    return R, t, result_info
 
 
 def align_via_vlm_floor_points(world_points, images, sam3_image_model,
@@ -561,7 +591,7 @@ def align_via_vlm_floor_points(world_points, images, sam3_image_model,
     }
 
 
-def align_via_geocalib(images, world_points, extrinsics, max_frames=8, mad_threshold=3.0):
+def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_threshold=3.0, quality_threshold=0.3):
     '''
     阶段4: 用 GeoCalib 从图像估计重力方向, 构造坐标系对齐.
 
@@ -574,14 +604,15 @@ def align_via_geocalib(images, world_points, extrinsics, max_frames=8, mad_thres
       2. 用 extrinsics 将每帧 gravity 从相机坐标变换到世界坐标
       3. 置信度加权的球面平均 + MAD 异常值剔除 → 世界坐标系下的 gravity
       4. floor_normal = -gravity (UP), 用 bottom-percentile 估计 floor_centroid
-      5. 构造 R, t; 若 |R[2,2]| < 0.5 则判定对齐失败
+      5. 构造 R, t; 若 |R[2,2]| < quality_threshold 则判定对齐失败
 
     Args:
       images: numpy array of shape (S, H, W, 3), uint8 RGB
       world_points: (T, H, W, 3)
       extrinsics: (N, 4, 4) or (N, 3, 4) w2c 外参, 与 images 帧数对应
-      max_frames: 最多处理多少帧 (GeoCalib 推理较慢, 默认8帧)
+      max_frames: 最多处理多少帧 (GeoCalib 推理较慢, 默认30帧)
       mad_threshold: MAD 异常值剔除阈值 (默认3.0)
+      quality_threshold: 质量阈值, |R[2,2]| < threshold 判定失败 (默认0.3, 原0.5)
 
     Returns:
       (R, t, info_dict): 成功
@@ -698,8 +729,8 @@ def align_via_geocalib(images, world_points, extrinsics, max_frames=8, mad_thres
     R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
 
     # 质量检查: R[2,2] = floor_normal[2], 理想值 ≈ ±1.0
-    # |R[2,2]| < 0.5 说明 floor 法线偏离竖直 > 60°, 对齐失败
-    if abs(R[2, 2]) < 0.5:
+    # |R[2,2]| < quality_threshold 说明 floor 法线偏离竖直角度过大, 对齐失败
+    if abs(R[2, 2]) < quality_threshold:
         return np.eye(3), np.zeros(3), {
             'reason': f'geocalib_poor_alignment R[2,2]={R[2,2]:.4f}',
             'method': 'geocalib',
@@ -756,16 +787,17 @@ def align_vggt_predictions(predictions, R, t):
     predictions['point_cloud_data'].apply_transform(np.vstack([np.hstack([R, t.reshape(3, 1)]), [0, 0, 0, 1]]))
     return predictions
 
-def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.10):
+def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.10, world_points_conf=None):
     '''
     Get the optimal view frame id for each instance.
     Uses robust motion detection: computes per-frame centroid displacement,
     then uses median displacement to distinguish true motion from VGGT drift.
-    
+
     Args:
         world_points: numpy array of shape (T, H, W, 3)
         instance_masks: list of dicts with 'frame_id' and 'mask'
         motion_threshold: median displacement threshold (meters) for dynamic classification
+        world_points_conf: optional numpy array of shape (T, H, W), confidence weights (≥1.05)
     Returns:
         (optimal_frame_id, is_dynamic, motion_info)
         - optimal_frame_id: int
@@ -786,7 +818,20 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.1
         if not np.any(finite):
             centroids.append((frame_id, None))
             continue
-        centroids.append((frame_id, np.mean(pts[finite], axis=0)))
+        # 置信度加权质心
+        if world_points_conf is not None:
+            confs = world_points_conf[frame_id][valid]
+            # 自适应置信度阈值: 取 conf 的 10th percentile
+            conf_thresh = np.percentile(confs[finite], 10)
+            conf_mask = finite & (confs > conf_thresh)
+            if not np.any(conf_mask):
+                conf_mask = finite
+            weights = confs[conf_mask]
+            w_pts = pts[conf_mask]
+            centroid = np.average(w_pts, axis=0, weights=weights)
+        else:
+            centroid = np.mean(pts[finite], axis=0)
+        centroids.append((frame_id, centroid))
 
     valid_centroids = [(fid, c) for fid, c in centroids if c is not None]
     num_valid_frames = len(valid_centroids)
@@ -797,13 +842,34 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.1
                        'first_valid_frame': first_valid_frame, 'num_valid_frames': num_valid_frames}
         return first_valid_frame, False, motion_info
 
+    # 时间平滑: 中值滤波 (窗口=5)
+    from scipy.signal import medfilt
+    centroid_arr = np.array([c for _, c in valid_centroids])
+    if len(centroid_arr) >= 5:
+        smoothed = np.zeros_like(centroid_arr)
+        for axis in range(3):
+            smoothed[:, axis] = medfilt(centroid_arr[:, axis], kernel_size=5)
+        valid_centroids = [(valid_centroids[i][0], smoothed[i]) for i in range(len(valid_centroids))]
+
     consecutive_disps = []
     for i in range(1, len(valid_centroids)):
         disp = np.linalg.norm(valid_centroids[i][1] - valid_centroids[i-1][1])
         consecutive_disps.append(disp)
 
-    median_disp = float(np.median(consecutive_disps))
-    max_disp = float(np.max(consecutive_disps))
+    disps = np.array(consecutive_disps)
+
+    # MAD 离群点剔除
+    med = np.median(disps)
+    mad = np.median(np.abs(disps - med))
+    if mad > 1e-6:
+        z_scores = 0.6745 * (disps - med) / mad
+        inlier_mask = np.abs(z_scores) < 3.5
+        clean_disps = disps[inlier_mask]
+    else:
+        clean_disps = disps
+
+    median_disp = float(np.median(clean_disps)) if len(clean_disps) > 0 else 0.0
+    max_disp = float(np.max(clean_disps)) if len(clean_disps) > 0 else 0.0
     first_valid_frame = valid_centroids[0][0]
 
     is_dynamic = median_disp > motion_threshold

@@ -1,0 +1,202 @@
+{
+  "materials": {
+    "hardwood": {
+      "description": "Hardwood furniture material (oak, maple, cherry, etc.)",
+      "sapien": {
+        "density": 750,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.20
+      }
+    },
+    "softwood": {
+      "description": "Softwood material (pine, fir, spruce, etc.)",
+      "sapien": {
+        "density": 550,
+        "static_friction": 0.50,
+        "dynamic_friction": 0.40,
+        "restitution": 0.20
+      }
+    },
+    "hard_plastic": {
+      "description": "Rigid plastic (bottles, containers, toys, electronics casing)",
+      "sapien": {
+        "density": 1375,
+        "static_friction": 0.40,
+        "dynamic_friction": 0.30,
+        "restitution": 0.50
+      }
+    },
+    "soft_plastic": {
+      "description": "Flexible/soft plastic (bags, soft toys, rubber-like plastics)",
+      "sapien": {
+        "density": 935,
+        "static_friction": 0.30,
+        "dynamic_friction": 0.20,
+        "restitution": 0.40
+      }
+    },
+    "glass": {
+      "description": "Glass (cups, windows, containers, vases)",
+      "sapien": {
+        "density": 2500,
+        "static_friction": 0.40,
+        "dynamic_friction": 0.40,
+        "restitution": 0.60
+      }
+    },
+    "ceramic": {
+      "description": "Ceramic (bowls, plates, vases, tiles)",
+      "sapien": {
+        "density": 2250,
+        "static_friction": 0.50,
+        "dynamic_friction": 0.40,
+        "restitution": 0.30
+      }
+    },
+    "steel": {
+      "description": "Steel/metal (tools, utensils, structural parts)",
+      "sapien": {
+        "density": 7900,
+        "static_friction": 0.70,
+        "dynamic_friction": 0.60,
+        "restitution": 0.20
+      }
+    },
+    "aluminum": {
+      "description": "Aluminum (lightweight metal parts, electronics)",
+      "sapien": {
+        "density": 2700,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.35
+      }
+    },
+    "rubber": {
+      "description": "Rubber (pads, balls, grips, toys)",
+      "sapien": {
+        "density": 1000,
+        "static_friction": 0.90,
+        "dynamic_friction": 0.80,
+        "restitution": 0.70
+      }
+    },
+    "fabric": {
+      "description": "Fabric/textile (cushions, curtains, clothing, upholstery)",
+      "sapien": {
+        "density": 200,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.10
+      }
+    },
+    "paper": {
+      "description": "Paper/cardboard (books, boxes, magazines)",
+      "sapien": {
+        "density": 750,
+        "static_friction": 0.50,
+        "dynamic_friction": 0.40,
+        "restitution": 0.10
+      }
+    },
+    "foam": {
+      "description": "Foam/sponge (cushions, toys, packaging)",
+      "sapien": {
+        "density": 35,
+        "static_friction": 0.40,
+        "dynamic_friction": 0.30,
+        "restitution": 0.20
+      }
+    },
+    "leather": {
+      "description": "Leather (sofas, bags, chairs)",
+      "sapien": {
+        "density": 950,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.30
+      }
+    },
+    "concrete": {
+      "description": "Concrete (floors, columns, walls)",
+      "sapien": {
+        "density": 2400,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.10
+      }
+    },
+    "stone": {
+      "description": "Stone/masonry (surfaces, decor, slabs)",
+      "sapien": {
+        "density": 2600,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.10
+      }
+    },
+    "marble": {
+      "description": "Marble (countertops, sculptures, decorative surfaces)",
+      "sapien": {
+        "density": 2700,
+        "static_friction": 0.40,
+        "dynamic_friction": 0.30,
+        "restitution": 0.15
+      }
+    },
+    "ice": {
+      "description": "Ice (special scenarios)",
+      "sapien": {
+        "density": 917,
+        "static_friction": 0.05,
+        "dynamic_friction": 0.03,
+        "restitution": 0.30
+      }
+    },
+    "wood": {
+      "description": "Generic wood (when hardness cannot be determined)",
+      "sapien": {
+        "density": 650,
+        "static_friction": 0.55,
+        "dynamic_friction": 0.45,
+        "restitution": 0.20
+      }
+    },
+    "plastic": {
+      "description": "Generic plastic (when hardness cannot be determined)",
+      "sapien": {
+        "density": 1150,
+        "static_friction": 0.35,
+        "dynamic_friction": 0.25,
+        "restitution": 0.45
+      }
+    },
+    "cardboard": {
+      "description": "Cardboard/paperboard material",
+      "sapien": {
+        "density": 700,
+        "static_friction": 0.60,
+        "dynamic_friction": 0.50,
+        "restitution": 0.10
+      }
+    },
+    "metal": {
+      "description": "Generic metal (when type cannot be determined)",
+      "sapien": {
+        "density": 7000,
+        "static_friction": 0.65,
+        "dynamic_friction": 0.55,
+        "restitution": 0.25
+      }
+    }
+  },
+  "default": {
+    "description": "Fallback material when VLM fails to recognize or material is not in mapping table",
+    "sapien": {
+      "density": 1000,
+      "static_friction": 0.50,
+      "dynamic_friction": 0.50,
+      "restitution": 0.30
+    }
+  }
+}

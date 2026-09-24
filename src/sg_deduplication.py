@@ -1,6 +1,7 @@
 import os
 import cv2
 import numpy as np
+import torch
 import trimesh
 import open3d as o3d
 
@@ -59,7 +60,7 @@ def get_overlap_ratio(source_pts, target_pts):
 
 def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, category_name=""):
     '''
-    Deduplication inside a single category
+    Deduplication inside a single category (only 3D point cloud overlap_ratio)
     Args:
         category_masks: A list of segmented masks returned by segment_and_track function
         world_points: numpy array of shape (S, H, W, 3)
@@ -72,6 +73,7 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
     '''
     if not category_masks:
         return []
+
     print(f"  [类内去重] {category_name}: {len(category_masks)} 个原始实例, overlap_thre={overlap_thre}")
 
     # back-project instance masks into pointcloud 
@@ -130,8 +132,6 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
     uf = UnionFind(range(len(instance_point_arrays)))
     n = len(instance_point_arrays)
 
-    instance_centroids = [np.mean(pts, axis=0) for pts in instance_point_arrays]
-    
     merge_details = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -185,203 +185,315 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
             print(d)
     return deduplicated_category_masks
 
-def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3):
-    '''
-    Deduplication across all categories
-    Args:
-        all_masks: A dict, key is the category name and value is a list of segmented masks
-                   (list of list of dicts with frame_id and mask)
-        world_points: numpy array of shape (S, H, W, 3)
-        world_points_conf: numpy array of shape (S, H, W)
-        conf_k: Only keep top conf_k percent confidence 3D points
-        overlap_thre: Merge instance if overlap ratio exceeds overlap_thre (same as self-category)
-    Returns:
-        deduplicated_all_masks: A dict (same format as input) containing deduplicated instances
-    '''
-    print(f"Starting cross-category deduplication...")
-    
+
+def _build_candidates(all_masks, world_points, world_points_conf, conf_k=30):
+    """从 all_masks 构建 candidate 列表，每个 candidate 包含 3D 点云、时间信息等。"""
     all_candidates = []
-    
     for cat_name, instances_list in all_masks.items():
         for inst_idx, instance_frames in enumerate(instances_list):
+            frame_ids = [f['frame_id'] for f in instance_frames]
             obj_pts_list = []
             obj_conf_list = []
-            
             for frame_data in instance_frames:
                 frame_id = frame_data['frame_id']
                 mask = frame_data['mask']
-                
                 if frame_id >= world_points.shape[0]:
                     continue
-                    
                 pts_frame = world_points[frame_id]
                 conf_frame = world_points_conf[frame_id]
-                
                 valid_pixels = mask > 0
                 if not np.any(valid_pixels):
                     continue
-                
                 v_pts = pts_frame[valid_pixels]
                 v_conf = conf_frame[valid_pixels]
-                
                 if len(v_conf) > 0:
                     obj_pts_list.append(v_pts)
                     obj_conf_list.append(v_conf)
-
             if obj_pts_list:
                 full_pts = np.concatenate(obj_pts_list, axis=0)
                 full_conf = np.concatenate(obj_conf_list, axis=0)
-                
                 thresh = 0.0
                 if conf_k > 0:
                     thresh = np.percentile(full_conf, conf_k)
                 conf_mask = (full_conf >= thresh) & (full_conf > 1e-5)
-                
                 if np.any(conf_mask):
                     final_pts = full_pts[conf_mask]
-                    
                     if len(final_pts) >= 50:
                         all_candidates.append({
                             "category": cat_name,
+                            "inst_idx": inst_idx,
                             "points": final_pts,
-                            "original_masks": instance_frames 
+                            "original_masks": instance_frames,
+                            "frame_ids": set(frame_ids),
+                            "time_start": min(frame_ids),
+                            "time_end": max(frame_ids),
+                            "time_total": len(frame_ids),
                         })
+    return all_candidates
 
+
+def _merge_candidates_to_masks(all_candidates, uf, N):
+    """根据 Union-Find 分组结果，合并 candidate 的 masks 为 all_masks dict。"""
+    final_groups = {}
+    for i in range(N):
+        root = uf.find(i)
+        if root not in final_groups:
+            final_groups[root] = []
+        final_groups[root].append(i)
+
+    deduplicated_all_masks = {}
+    for group_indices in final_groups.values():
+        # 选择长寿命实例的 category
+        target_idx = max(group_indices, key=lambda x: all_candidates[x]['time_total'])
+        cat = all_candidates[target_idx]["category"]
+
+        merged_masks_dict = {}
+        for idx in group_indices:
+            for frame_data in all_candidates[idx]["original_masks"]:
+                fid = frame_data['frame_id']
+                msk = frame_data['mask']
+                if fid not in merged_masks_dict:
+                    merged_masks_dict[fid] = np.zeros_like(msk)
+                merged_masks_dict[fid] = np.logical_or(merged_masks_dict[fid], msk)
+
+        merged_masks_list = []
+        for fid in sorted(merged_masks_dict.keys()):
+            merged_masks_list.append({'frame_id': fid, 'mask': merged_masks_dict[fid]})
+
+        if len(merged_masks_list) < 2:
+            continue
+        if cat not in deduplicated_all_masks:
+            deduplicated_all_masks[cat] = []
+        deduplicated_all_masks[cat].append(merged_masks_list)
+
+    return deduplicated_all_masks
+
+
+def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, **kwargs):
+    '''
+    Cross-category deduplication (only different categories, only 3D overlap_ratio).
+    Same-category pairs are skipped — they are handled by self_category_deduplicate.
+    Dynamic splits and static occlusion are handled by merge_dynamic_splits_all (called separately).
+
+    Args:
+        all_masks: dict {category: list[list[dict{frame_id, mask}]]}
+        world_points: numpy array of shape (S, H, W, 3)
+        world_points_conf: numpy array of shape (S, H, W)
+        conf_k: confidence percentile threshold
+        overlap_thre: merge threshold for overlap_ratio
+    Returns:
+        deduplicated_all_masks: dict (same format as input)
+    '''
+    print(f"Starting cross-category deduplication (only different categories)...")
+
+    all_candidates = _build_candidates(all_masks, world_points, world_points_conf, conf_k)
     if len(all_candidates) <= 1:
         return all_masks
 
     N = len(all_candidates)
-    overlap_matrix = {} 
-    print(f"  [跨类去重] Comparing {N} instances globally, overlap_thre={overlap_thre}...")
-    uf = UnionFind(range(N))
 
-    cross_merge_details = []
+    # 计算 **仅不同类别** 实例对的 overlap
+    print(f"  [跨类去重] 计算 {N} 个实例中不同类别的 3D 点云 overlap...")
+    overlap_matrix = {}
     for i in range(N):
         for j in range(i + 1, N):
-            pts_i = all_candidates[i]["points"]
-            pts_j = all_candidates[j]["points"]
-            
-            ov1 = get_overlap_ratio(pts_i, pts_j) 
-            ov2 = get_overlap_ratio(pts_j, pts_i)
+            ci, cj = all_candidates[i], all_candidates[j]
+            if ci['category'] == cj['category']:
+                continue
+            ov1 = get_overlap_ratio(ci['points'], cj['points'])
+            ov2 = get_overlap_ratio(cj['points'], ci['points'])
             overlap_matrix[(i, j)] = (ov1, ov2)
 
-            if uf.find(i) != uf.find(j):
-                cat_i = all_candidates[i]["category"]
-                cat_j = all_candidates[j]["category"]
-                pts_i_count = len(all_candidates[i]["points"])
-                pts_j_count = len(all_candidates[j]["points"])
-                size_ratio = min(pts_i_count, pts_j_count) / max(pts_i_count, pts_j_count)
+    uf = UnionFind(range(N))
+    cross_merge_details = []
 
-                centroid_dist = float(np.linalg.norm(
-                    np.mean(pts_i, axis=0) - np.mean(pts_j, axis=0)
-                ))
-
-                # 同位置去重: 质心距离 < 0.03m 说明两个物体几乎在同一位置
-                # 降低 overlap 阈值 (×0.5), 捕获 moderate-overlap 的同位置重复
-                effective_thre = overlap_thre
-                same_position = centroid_dist < 0.03 and cat_i != cat_j and size_ratio >= 0.4
-                if same_position:
-                    effective_thre = overlap_thre * 0.5
-
-                should_merge = ov1 >= effective_thre or ov2 >= effective_thre
-
-                # 跨类去重保护: 不同类别的物体，如果面积差异大，不应合并
-                # 场景: 小物体(eye/scissor)放在大物体(table)上，3D空间重叠度高
-                # 但它们是不同物体，不应被吞并
-                if should_merge and cat_i != cat_j and size_ratio < 0.4 and not same_position:
-                    # 只有双向 overlap 都高才合并 (说明确实是同一个物体)
-                    should_merge = ov1 >= overlap_thre and ov2 >= overlap_thre
-                    if not should_merge and (ov1 >= overlap_thre or ov2 >= overlap_thre):
-                        cross_merge_details.append(
-                            f"    🛡️ {cat_i}_{i} + {cat_j}_{j} 跨类保护: "
-                            f"size_ratio={size_ratio:.2f}, ov1={ov1:.3f}, ov2={ov2:.3f}, "
-                            f"centroid_dist={centroid_dist:.4f}m → 不合并"
-                        )
-
-                if should_merge:
-                    uf.union(i, j)
-                    reason = []
-                    if ov1 >= effective_thre:
-                        reason.append(f"ov1={ov1:.3f}>={effective_thre:.3f}")
-                    if ov2 >= effective_thre:
-                        reason.append(f"ov2={ov2:.3f}>={effective_thre:.3f}")
-                    if same_position:
-                        reason.append(f"same_pos(dist={centroid_dist:.4f}m)")
-                    cross_merge_details.append(f"    {cat_i}_{i} + {cat_j}_{j} ← {', '.join(reason)}")
-    final_groups = {}
     for i in range(N):
-        root = uf.find(i)
-        if root not in final_groups: 
-            final_groups[root] = []
-        final_groups[root].append(i) 
-        
-    final_objects = []
-    
-    for group_indices in final_groups.values():
-        if len(group_indices) == 1:
-            final_objects.append(all_candidates[group_indices[0]])
-        else:
-            target_idx = group_indices[0]
-            min_avg_overlap = float('inf')
-            
-            for i in group_indices:
-                total_overlap = 0.0
-                count = 0
-                for j in group_indices:
-                    if i == j: continue
-                    key = (min(i, j), max(i, j))
-                    ov1, ov2 = overlap_matrix[key]
-                    overlap_val = ov1 if i < j else ov2
-                    
-                    total_overlap += overlap_val
-                    count += 1
-                
-                avg_overlap = total_overlap / count if count > 0 else 0
-                
-                if avg_overlap < min_avg_overlap:
-                    min_avg_overlap = avg_overlap
-                    target_idx = i
-            
-            target = all_candidates[target_idx]
-            
-            all_pts = [all_candidates[idx]["points"] for idx in group_indices]
-            merged_pts = np.concatenate(all_pts, axis=0)
-            
-            merged_masks_dict = {}
-            for idx in group_indices:
-                for frame_data in all_candidates[idx]["original_masks"]:
-                    fid = frame_data['frame_id']
-                    msk = frame_data['mask']
-                    if fid not in merged_masks_dict:
-                        merged_masks_dict[fid] = np.zeros_like(msk)
-                    merged_masks_dict[fid] = np.logical_or(merged_masks_dict[fid], msk)
-            
-            merged_masks_list = []
-            for fid in sorted(merged_masks_dict.keys()):
-                merged_masks_list.append({
-                    'frame_id': fid,
-                    'mask': merged_masks_dict[fid]
-                })
+        for j in range(i + 1, N):
+            ci, cj = all_candidates[i], all_candidates[j]
 
-            final_objects.append({
-                "category": target["category"], 
-                "points": merged_pts,
-                "original_masks": merged_masks_list
-            })
+            # 同类实例跳过，已由 self_category_deduplicate 处理
+            if ci['category'] == cj['category']:
+                continue
 
-    deduplicated_all_masks = {}
-    for obj in final_objects:
-        if len(obj["original_masks"]) < 2:
-            continue
-        cat = obj["category"]
-        if cat not in deduplicated_all_masks:
-            deduplicated_all_masks[cat] = []
-        deduplicated_all_masks[cat].append(obj["original_masks"])
+            if uf.find(i) == uf.find(j):
+                continue
 
-    filtered_object_count = sum(len(instances) for instances in deduplicated_all_masks.values())
-    print(f"  -> 跨类去重: {sum(len(v) for v in all_masks.values())} instances → {filtered_object_count} instances")
+            key = (i, j)
+            if key not in overlap_matrix:
+                continue
+
+            ov1, ov2 = overlap_matrix[key]
+
+            if ov1 >= overlap_thre or ov2 >= overlap_thre:
+                uf.union(i, j)
+                cross_merge_details.append(
+                    f"    {ci['category']}_{ci['inst_idx']} + {cj['category']}_{cj['inst_idx']} ← "
+                    f"overlap: ov1={ov1:.3f}, ov2={ov2:.3f}"
+                )
+
+    deduplicated_all_masks = _merge_candidates_to_masks(all_candidates, uf, N)
+
+    total_before = sum(len(v) for v in all_masks.values())
+    total_after = sum(len(v) for v in deduplicated_all_masks.values())
+    print(f"  -> 跨类去重: {total_before} instances → {total_after} instances")
     if cross_merge_details:
         for d in cross_merge_details:
+            print(d)
+    return deduplicated_all_masks
+
+
+def merge_dynamic_splits_all(all_masks, world_points, world_points_conf, conf_k=30,
+                              overlap_thre=0.3, subset_thre=0.5, dynamic_ov_thre=0.2,
+                              lifespan_thre=0.5, gap_thre=10):
+    '''
+    全量动态分裂 + 静态遮挡合并（不分同类/跨类，所有实例统一处理）。
+
+    三种合并条件（按优先级）:
+      1. 静态重叠: ov1 >= overlap_thre or ov2 >= overlap_thre → 合并
+      2. 静态遮挡: 单向 overlap >= subset_thre（子集关系）AND 子集方帧数更少 → 合并
+      3. 动态分裂: lifespan_ratio < lifespan_thre AND time_gap <= gap_thre
+                   AND 衔接帧 overlap >= dynamic_ov_thre → 合并
+
+    Args:
+        all_masks: dict {category: list[list[dict{frame_id, mask}]]}
+        world_points: numpy array of shape (S, H, W, 3)
+        world_points_conf: numpy array of shape (S, H, W)
+        conf_k: confidence percentile threshold
+        overlap_thre: bidirectional overlap merge threshold
+        subset_thre: one-directional overlap threshold for static occlusion
+        dynamic_ov_thre: junction overlap threshold for dynamic splits
+        lifespan_thre: max lifespan_ratio for dynamic split candidates
+        gap_thre: max time gap (frames) for dynamic split candidates
+    Returns:
+        deduplicated_all_masks: dict (same format as input)
+    '''
+    print(f"Starting merge_dynamic_splits_all (all instances, static occlusion + dynamic splits)...")
+
+    all_candidates = _build_candidates(all_masks, world_points, world_points_conf, conf_k)
+    if len(all_candidates) <= 1:
+        return all_masks
+
+    N = len(all_candidates)
+
+    # 预计算所有实例的 overlap matrix
+    print(f"  [动态/遮挡合并] 计算 {N} 个实例的 3D 点云 overlap...")
+    overlap_matrix = {}
+    for i in range(N):
+        for j in range(i + 1, N):
+            ci, cj = all_candidates[i], all_candidates[j]
+            ov1 = get_overlap_ratio(ci['points'], cj['points'])
+            ov2 = get_overlap_ratio(cj['points'], ci['points'])
+            overlap_matrix[(i, j)] = (ov1, ov2)
+
+    uf = UnionFind(range(N))
+    merge_details = []
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            if uf.find(i) == uf.find(j):
+                continue
+
+            ci, cj = all_candidates[i], all_candidates[j]
+            key = (i, j)
+            if key not in overlap_matrix:
+                continue
+
+            ov1, ov2 = overlap_matrix[key]
+            label_i = f"{ci['category']}_{ci['inst_idx']}"
+            label_j = f"{cj['category']}_{cj['inst_idx']}"
+
+            # ===== 1. 静态重叠 =====
+            if ov1 >= overlap_thre or ov2 >= overlap_thre:
+                uf.union(i, j)
+                merge_details.append(f"    {label_i} + {label_j} ← static_overlap: ov1={ov1:.3f}, ov2={ov2:.3f}")
+                continue
+
+            # ===== 2. 静态遮挡（单向子集关系）=====
+            # 短命实例的 3D 点云大部分在长命实例内部 → 说明是同一物体被遮挡后的碎片
+            max_ov = max(ov1, ov2)
+            min_ov = min(ov1, ov2)
+            if max_ov >= subset_thre and min_ov < overlap_thre:
+                # ov1 高 → i 的点在 j 内部 → i 可能是 j 的碎片
+                # ov2 高 → j 的点在 i 内部 → j 可能是 i 的碎片
+                if ov1 >= subset_thre and ci['time_total'] < cj['time_total']:
+                    uf.union(i, j)
+                    merge_details.append(
+                        f"    {label_i} + {label_j} ← static_occlusion(subset): "
+                        f"ov(i→j)={ov1:.3f}>={subset_thre}, i帧数({ci['time_total']})<j帧数({cj['time_total']})"
+                    )
+                    continue
+                elif ov2 >= subset_thre and cj['time_total'] < ci['time_total']:
+                    uf.union(i, j)
+                    merge_details.append(
+                        f"    {label_i} + {label_j} ← static_occlusion(subset): "
+                        f"ov(j→i)={ov2:.3f}>={subset_thre}, j帧数({cj['time_total']})<i帧数({ci['time_total']})"
+                    )
+                    continue
+
+            # ===== 3. 动态分裂 =====
+            lifespan_ratio = min(ci['time_total'], cj['time_total']) / max(ci['time_total'], cj['time_total'])
+            if lifespan_ratio >= lifespan_thre:
+                continue
+
+            time_gap = min(
+                abs(ci['time_start'] - cj['time_end']),
+                abs(cj['time_start'] - ci['time_end'])
+            )
+            if time_gap > gap_thre:
+                continue
+
+            # 在衔接帧范围内计算点云 overlap
+            merge_window = range(
+                max(ci['time_start'], cj['time_start']) - time_gap,
+                min(ci['time_end'], cj['time_end']) + time_gap + 1
+            )
+            merge_window = [f for f in merge_window if 0 <= f < world_points.shape[0]]
+
+            if not merge_window:
+                continue
+
+            joint_ov1 = 0.0
+            joint_ov2 = 0.0
+            joint_count = 0
+
+            for fid in merge_window:
+                mask_i = next((f['mask'] for f in ci['original_masks'] if f['frame_id'] == fid), None)
+                mask_j = next((f['mask'] for f in cj['original_masks'] if f['frame_id'] == fid), None)
+
+                if mask_i is None or mask_j is None:
+                    continue
+
+                pts_i = world_points[fid][mask_i > 0]
+                pts_j = world_points[fid][mask_j > 0]
+
+                if len(pts_i) < 10 or len(pts_j) < 10:
+                    continue
+
+                joint_ov1 += get_overlap_ratio(pts_i, pts_j)
+                joint_ov2 += get_overlap_ratio(pts_j, pts_i)
+                joint_count += 1
+
+            if joint_count == 0:
+                continue
+
+            avg_ov1 = joint_ov1 / joint_count
+            avg_ov2 = joint_ov2 / joint_count
+
+            if avg_ov1 >= dynamic_ov_thre or avg_ov2 >= dynamic_ov_thre:
+                uf.union(i, j)
+                merge_details.append(
+                    f"    {label_i} + {label_j} ← dynamic_split: "
+                    f"lifespan_ratio={lifespan_ratio:.2f}, gap={time_gap}, "
+                    f"junction_overlap={avg_ov1:.3f}/{avg_ov2:.3f}"
+                )
+
+    deduplicated_all_masks = _merge_candidates_to_masks(all_candidates, uf, N)
+
+    total_before = sum(len(v) for v in all_masks.values())
+    total_after = sum(len(v) for v in deduplicated_all_masks.values())
+    print(f"  -> 动态/遮挡合并: {total_before} instances → {total_after} instances")
+    if merge_details:
+        for d in merge_details:
             print(d)
     return deduplicated_all_masks
 

@@ -467,7 +467,8 @@ def run_stage4(scene_dir, vggt_data, all_instances, args, categories_and_relatio
     from tools.refine_inter_object_placement import resolve_penetrations, check_stability
     all_instances = resolve_penetrations(all_instances, verbose=True,
                                          categories_and_relations=categories_and_relations,
-                                         scene_dir=scene_dir)
+                                         scene_dir=scene_dir,
+                                         shared_penetration=True)
     all_instances, _ = check_stability(all_instances, verbose=True,
                                        categories_and_relations=categories_and_relations)
 
