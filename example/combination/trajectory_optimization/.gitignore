@@ -1,0 +1,16 @@
+# 优化产物（轨迹、视频、日志、npz），不纳入版本控制
+output/
+*.mp4
+*.log
+*.npz
+
+# 字节码缓存
+__pycache__/
+*.pyc
+
+# 临时备份
+*.bak
+
+# 回收站 / 临时产物 (2026-09-12 补: trimesh 曾达 404M, 会卡住 push)
+trimesh/
+graphify-out/

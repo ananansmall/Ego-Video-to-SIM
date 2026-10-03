@@ -1,0 +1,16 @@
+retargeting:
+  type: position
+  # URDF 路径在运行时通过 override 动态替换
+  urdf_path: PLACEHOLDER
+
+  # 单夹爪优化两个 prismatic 手指关节
+  target_joint_names: ["left_gripper_finger_joint1", "left_gripper_finger_joint2"]
+  # 3 个目标点: 2 指尖 (位置精确对齐) + 手腕 (方向约束)
+  target_link_names: ["left_gripper_finger_link1", "left_gripper_finger_link2", "left_gripper_link"]
+  target_link_human_indices: [4, 8, 0]
+
+  # 添加 dummy free joint 优化夹爪根位姿 (6-DOF)
+  add_dummy_free_joint: True
+  # 低通滤波: 不滤波
+  low_pass_alpha: 1
+  ignore_mimic_joint: False

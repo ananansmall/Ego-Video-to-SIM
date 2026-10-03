@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 统一仿真配置 (2026-10-02)
+#   ★ key **就是真实 env 名** ⇒ 由 sim_config.py 写入 os.environ ⇒
+#     现有代码**零改动**即可生效 ✓ (不覆盖已有 env/CLI ⇒ 优先级: CLI > env > 本文件 > 代码默认)
+#   ⚠ 本文件是**默认基线**; 任何"为了通过而放宽"的改动都必须在这里显式记录原因 ✗
+# ═══════════════════════════════════════════════════════════════════════════
+meta:
+  note: "480 物理步/秒; 控制 30Hz; 每控制点 16 子步; GPU 不可用(驱动535 < CUDA13要求)"
+  rollout_cost_s: 195          # 实测: 一次 rollout ≈193~200s (物理仅占 ~3% ⇒ 瓶颈在物理之外)
+
+physics:
+  _PHYS_DT: 0.0020833333333333333     # 1/480 ⇒ 480 步/秒
+  _CONTROL_HZ: 30                     # 控制频率
+  # 子步数由 (1/30)/_PHYS_DT 自动得出 = 16
+
+reproducibility:                       # ★ 2026-10-02 首批必修: 结果此前**不可复现** ✗
+  _SEED: 12345                         # 固定 np/random/torch 种子 (实测同码两次 35.66 vs 71.67N ✗)
+  _ENGINE_ENHANCED_DET: 1              # PhysX 增强确定性 (更可复现; 代价见实测)
+
+engine:                                # PhysX 配置 (默认基本都开着; 见 f2 三态)
+  _ENGINE_TGS: 1                       # 默认已是 True
+  _ENGINE_PCM: 1                       # 默认已是 True
+  _ENGINE_FRICTION_EVERY_ITER: 1       # 默认已是 True
+  _ENGINE_CCD: 0                       # 默认 False; 开过无差异(且该对照按 f2 判 INVALID)
+
+gripper:                               # Stage1 成功配方 (勿轻改 ✗)
+  _FINGER_PD_K: 1000.0
+  _FINGER_PD_D: 200.0
+  _FINGER_PD_FORCE_LIMIT: 100.0
+  _VIRTUAL_PD_K: 50000.0
+  _VIRTUAL_PD_D: 600.0
+
+stage1:
+  _S1_N_FRAMES: 350
+  _S1_CLOSE_FRAMES: 130
+  _S1_CLOSE_OVERCLOSURE_MM: 3.0        # ⚠ >2mm 嵌入会让 CoACD 重叠凸包法向冲突 ⇒ 弹射
+  _S1_CLOSE_OVERCLOSURE_MAX_MM: 3.0
+  _S1_PRELOAD_M: 0.0015
+  _S1_T8_EXTRA_MM: 2.0
+  _S1_T8_STEP_MM: 0.05
+  _S1_LEVEL_FINGERS: 1
+  _S1_AUTO_CENTER: 1
+  _S1_CENTER_MEASURE: close
+  _S1_VERIFY_RESERVE: 3                # 搜索必须给终验留的预算 (md §09)
+
+stage2:
+  _S2_LIFT_OFF_M: 0.030                # vertical_planar 抬升
+  _S2_LIFT_POINTS: 15                  # 抬升占用的控制点数 (分段 smoothstep ⇒ 首拍仅 ~0.84mm)
+  _S2_ENTRY_PATH_TOL_MM: 5.0
+  _S2_MIN_NORM_N: 0.5                  # ⚠ 未标定, 仅诊断阈值
+  _S2_BUDGET: 6
+
+object:
+  _OBJ_SCALE: 0.5
+  _OBJ_SCALE_TARGET: glb_4
+  _COACD_TARGET: glb_4
+  _COACD_ALL: 1
+
+run:
+  _Q_OPEN: 0.030
+  # ★ 2026-10-02 用户定策 ✓: "**测试成功了再录像**" ✓
+  #   ⇒ 搜索/测试阶段**默认不录**(实测 23s/rollout vs 录像 200s/rollout ✓ ~8.7×)
+  #   ⇒ 交付/成功后: 加 `--views cam` + `_GIF_EXPORT=1` 即可拿到录像+GIF ✓
+  #     (Stage1 已内建"拿到最优 best_grasp **后**才录那一次" ✓ 搜索中不录 ✓)
+  _GIF_EXPORT: 0

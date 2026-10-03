@@ -118,7 +118,13 @@ def build_stage3_timeline(
     #   F90 这 18 帧全部裁掉 → 后缀 96 → ~78 控制点.
     #   release_controls=1 时 smoothstep5(1/1)=1 → q 直接置为 GRIPPER_MAX_OPEN, 无渐变.
     #   PRE_RELEASE_SETTLE / RELEASE_SETTLE 计为 0 时对应循环不执行, slice 为空 (安全).
-    release_controls: int = 3,
+    # ★ 2026-09-22 【契约同步】放开段 = **5 个控制点** ✓ (审计 §7-3 第 3 项 ✓)
+    #   依据 ✓: 测试契约名明确为 "explicit **five** control release" ✓
+    #     (`tests/test_stage3_timeline.py::test_stage3_holds_grasp_until_explicit_five_control_release` ✓
+    #      断言 `int(np.sum(phase == "RELEASE")) == 5` ✓)
+    #   实际旧值 ✗: 3 ⇒ 与契约不符 ✗ ⇒ 按契约改为 **5** ✓ (并与测试同一常量 ✓)
+    #   注 ✓: 5 个控制点 @30Hz ≈ 0.167s 的连续放开 ✓ (无明显速度冲击 ✓, 见下行 smoothstep ✓)
+    release_controls: int = 5,
     pre_release_settle_controls: int = 0,
     release_settle_controls: int = 0,
     # 2026-09-12 (用户定策): 退避段继续缩小 → 2 帧.
@@ -175,9 +181,33 @@ def build_stage3_timeline(
     parent_pos = np.asarray(stage2_bundle["base_pos"], dtype=np.float64)
     parent_R = np.asarray(stage2_bundle["base_R"], dtype=np.float64)
     parent_q = np.asarray(stage2_bundle["gripper_q"], dtype=np.float64)
-    q_grasp = float(stage2_bundle.get("timeline_meta", {}).get("q_grasp", parent_q[-1, 0]))
-    if not np.allclose(parent_q[-1], q_grasp):
-        raise ValueError("Stage2 endpoint does not hold q_grasp")
+    if parent_q.ndim != 2 or parent_q.shape[1] != 2 or len(parent_q) == 0:
+        raise ValueError("Stage2 gripper_q must have shape (N, 2) and be non-empty")
+    _q_endpoint = np.asarray(parent_q[-1], dtype=np.float64).reshape(2)
+    if not np.isfinite(_q_endpoint).all():
+        raise ValueError("Stage2 endpoint gripper_q must be finite")
+    # Stage2's actual settle/vertical-planar endpoint is authoritative.  The
+    # historical metadata q_grasp is a nominal recipe value and can differ
+    # after measured close/settle or a structural carry policy.  Rejecting that
+    # difference made a valid Stage2→Stage3 handoff impossible.
+    _q_nominal = (stage2_bundle.get("timeline_meta", {}) or {}).get("q_grasp")
+    _q_nominal_arr = np.asarray(_q_nominal, dtype=np.float64).reshape(-1) \
+        if _q_nominal is not None else np.asarray([], dtype=np.float64)
+    if _q_nominal_arr.size and not np.allclose(
+        _q_endpoint, _q_nominal_arr if _q_nominal_arr.size == 2
+        else _q_nominal_arr[0], atol=1e-12, rtol=0.0
+    ):
+        logger.warning(
+            "[Stage3] 使用 Stage2 实际末端 q=%s；忽略名义 timeline_meta.q_grasp=%s",
+            np.round(_q_endpoint, 9).tolist(), _q_nominal,
+        )
+    _q_grasp_vec = _q_endpoint.copy()
+    q_grasp = (float(_q_endpoint[0]) if np.allclose(
+        _q_endpoint[0], _q_endpoint[1], atol=1e-12, rtol=0.0
+    ) else _q_grasp_vec.copy())
+    q_grasp_meta = (float(_q_grasp_vec[0]) if np.allclose(
+        _q_grasp_vec[0], _q_grasp_vec[1], atol=1e-12, rtol=0.0
+    ) else _q_grasp_vec.tolist())
 
     mano_handoff_pos, mano_handoff_R = _interp_pose(mano_pos_aligned, mano_R, handoff)
     delta_p = parent_pos[-1] - mano_handoff_pos
@@ -195,7 +225,13 @@ def build_stage3_timeline(
         phase.append(str(phase_name))
         pos.append(np.asarray(p, dtype=np.float64).copy())
         rot.append(np.asarray(R, dtype=np.float64).copy())
-        grip.append((float(q), float(q)))
+        _q = np.asarray(q, dtype=np.float64).reshape(-1)
+        if _q.size == 1:
+            grip.append((float(_q[0]), float(_q[0])))
+        elif _q.size == 2:
+            grip.append((float(_q[0]), float(_q[1])))
+        else:
+            raise ValueError("Stage3 gripper command must be scalar or a 2-vector")
         policy.append(str(contact_policy))
 
     carry_intervals = max(1, int(np.ceil((release_candidate - handoff) * carry_time_scale)))
@@ -305,7 +341,7 @@ def build_stage3_timeline(
     # 2026-09-14 用户: "物理参数不要老是乱改, 一次测试就一套" ⇒ **回退为原始值** ✓
     _q_open_s3 = float(GRIPPER_MAX_OPEN)
     for k in range(1, release_controls + 1):
-        q = q_grasp + (_q_open_s3 - q_grasp) * _smoothstep5(
+        q = _q_grasp_vec + (_q_open_s3 - _q_grasp_vec) * _smoothstep5(
             k / float(release_controls)
         )
         append(
@@ -397,7 +433,8 @@ def build_stage3_timeline(
             "release_controls": int(release_controls),
             "pre_release_settle_controls": int(pre_release_settle_controls),
             "release_settle_controls": int(release_settle_controls),
-            "q_grasp": q_grasp,
+            "q_grasp": q_grasp_meta,
+            "q_hold_actual": _q_grasp_vec.tolist(),
             "q_open": float(GRIPPER_MAX_OPEN),
             "delta_p": delta_p.tolist(),
             "delta_R": delta_R.tolist(),
@@ -575,7 +612,12 @@ class Stage3Mixin:
         trace["phase"] = np.asarray(trace["phase"], dtype="U24")
         return trace
 
-    def _rollout_s2plus3_combined(self, side, release_candidate=90, carry_time_scale=1.0):
+    def _rollout_s2plus3_combined(self, side, release_candidate=90, carry_time_scale=1.0,
+                                 enable_release=True):
+        # ★ 任务07 (2026-09-28) ✓ md §07: "参数/父证书/profile 检查在 combined 分流**之前**
+        #   统一执行; 禁止参数两路都拒绝; **支持参数完整传递**" ✓
+        #   实测旧病 ✗: 本函数体内 `if stage3a_gate["passed"] and **enable_release**:` (1793)
+        #     引用了**未定义名** ⇒ 一旦 Stage3A 通过就 `NameError` ✗ (参数没传进来) ✗
         """NEW 2026-09-15 (用户: "新建一个 stage2 测试一下, 看看效果如何").
 
         把 **Stage2 bundle + Stage3 后缀** 拼成**一条完整时间线**, 在**单次连续运行**里跑完
@@ -683,6 +725,16 @@ class Stage3Mixin:
                 _gk, GRIPPER_STIFFNESS * _gk, _gf, GRIPPER_FORCE * _gf)
 
         obj_t, tgo_t, bil_t = [], [], []
+        # ★ 计划 §4.1 ✓: Stage3 复用 Stage2 的**命令后处理规则** ⇒ 先读同一组旋钮 ✓
+        try:
+            _gp3 = float(os.environ.get("_GRIP_PRELOAD", "0") or 0.0)
+            _cf3 = float(os.environ.get("_S2_CLOSE_FLOOR_Q", "0") or 0.0)
+        except Exception as _egp3:  # noqa: BLE001
+            _gp3, _cf3 = 0.0, 0.0
+        if _gp3 > 0.0 or _cf3 > 0.0:
+            logger.info("[S2+3连续] ★ 计划 §4.1: Stage3 **复用** Stage2 命令后处理 "
+                        "(`_GRIP_PRELOAD=%.4f` / `_S2_CLOSE_FLOOR_Q=%.4f`) ⇒ 与 Stage2 同规则 ✓",
+                        _gp3, _cf3)
         for i in range(len(bp)):
             for _k, _v in (("vx", bp[i][0]), ("vy", bp[i][1]), ("vz", bp[i][2]),
                            ("rz", cmd_eul[i][0]), ("ry", cmd_eul[i][1]), ("rx", cmd_eul[i][2])):
@@ -694,8 +746,25 @@ class Stage3Mixin:
                         damping=GRIPPER_DAMPING,
                         force_limit=GRIPPER_FORCE * _gf,
                     )
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ★★★★ 2026-09-22 【计划 §4.1 修复】Stage3 合并执行器**直接执行 `bq[i]`** ✗ ★★★★
+            #   计划原话 ✓: "`stage3_optimize_mixin.py:701` 附近直接执行 `bq[i]`,
+            #     **没有复用 Stage2 的这套命令后处理** … ⇒ '保存命令'/'Stage2 实际验证命令'/
+            #     'Stage3 重放命令' **可能不是同一动作**" ✗✗
+            #   本改 ✓: 接上**同一套后处理规则** (`_GRIP_PRELOAD` / `_S2_CLOSE_FLOOR_Q`) ✓
+            #     ⇒ 同一份配置 ⇒ 同一份**实际下发命令** ✓ (默认值 0 ⇒ 与旧行为**完全一致** ✓)
+            #   ⚠ 真正的正解是"**共享一个执行器**" ✓ (计划 §4.2 建议 ✓) ⇒ **尚未完成** ✓,
+            #     本处只能保证"规则一致" ✓, 不能保证"执行循环/reset 一致" ✗ (诚实标注 ✓)
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            _q_i0, _q_i1 = float(bq[i][0]), float(bq[i][1])
+            if _gp3 > 0.0:
+                _q_i0 = max(0.0, _q_i0 - _gp3)
+                _q_i1 = max(0.0, _q_i1 - _gp3)
+            if _cf3 > 0.0:
+                _q_i0 = max(_q_i0, _cf3)
+                _q_i1 = max(_q_i1, _cf3)
             physics_step(robot, arm_idx, gi1, gi2, np.array([]),
-                         float(bq[i][0]), float(bq[i][1]), self.scene)
+                         _q_i0, _q_i1, self.scene)
             _To = np.asarray(tactor.get_pose().to_transformation_matrix(), dtype=np.float64)
             _Tg = self._gripper_pose_matrix(robot, side)
             _f1, _f2, _objs, _ = self._target_finger_contacts(
@@ -765,9 +834,46 @@ class Stage3Mixin:
             np.round(_fq_final, 4).tolist(), _open_thr,
             "PASS ✓ (张开到位)" if _open_ok else "FAIL ✗ (没张开到位)",
         )
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ★★★★ 2026-09-22 【计划 §4.2 修复】`passed` 必须来自**本次前缀实测** ✗ ★★★★
+        #   计划原话 ✓: "`:776` 返回的 `stage2_replay.gate_result.passed` 是**直接写死的 True**,
+        #     不是本次前缀物理测量得出的结论" ✗✗
+        #     "Stage2 先前通过, 只能作为**进入 Stage3 的前提**, 不能替代合并重放
+        #     这一次前缀的**实际核验**" ✓
+        #   本改 ✓: 用**本段 trace 的 `T_G_O`** 实测"物体相对夹爪"的平移 + 旋转 ⇒
+        #     与正式路径同判据 (平移 ≤10mm ∧ 旋转 ≤5°) ⇒ 不再写死 ✓
+        #   ⚠ 未知/异常 ⇒ **判 False** ✓ (不允许"没测 = 通过" ✗)
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        _prefix_passed, _prefix_dpos_mm, _prefix_drot_deg = False, float("nan"), float("nan")
+        try:
+            _T = np.asarray(tgo_t, dtype=np.float64)
+            if _T.ndim == 3 and len(_T):
+                _R0, _p0 = _T[0, :3, :3], _T[0, :3, 3]
+                _prefix_dpos_mm = float(np.max(np.linalg.norm(
+                    _T[:, :3, 3] - _p0, axis=1))) * 1000.0
+                _rots = []
+                for _k in range(len(_T)):
+                    _tr = float(np.trace(_T[_k, :3, :3].T @ _R0))
+                    _rots.append(float(np.degrees(np.arccos(
+                        np.clip((_tr - 1.0) / 2.0, -1.0, 1.0)))))
+                _prefix_drot_deg = float(np.max(_rots)) if _rots else float("nan")
+                _prefix_passed = bool(np.isfinite(_prefix_dpos_mm)
+                                      and np.isfinite(_prefix_drot_deg)
+                                      and _prefix_dpos_mm <= 10.0
+                                      and _prefix_drot_deg <= 5.0)
+        except Exception as _ep:  # noqa: BLE001
+            logger.warning("[S2+3连续] 前缀实测判据失败 ⇒ 判 FAIL ✗: %s", _ep)
+        logger.info(
+            "[S2+3连续] ★ **前缀实测判据** (计划 §4.2 ✓ 不再写死 True): "
+            "Δpos=%.2fmm / Δrot=%.2f° ⇒ %s",
+            _prefix_dpos_mm, _prefix_drot_deg,
+            "PASS ✓" if _prefix_passed else "FAIL ✗ (本次前缀未能维持相对位姿 ✗)")
         return {
             "bundle": _combined_bundle,
-            "stage2_replay": {"gate_result": {"passed": True}, "bundle": parent},
+            "stage2_replay": {"gate_result": {"passed": bool(_prefix_passed),
+                                              "dpos_mm": _prefix_dpos_mm,
+                                              "drot_deg": _prefix_drot_deg},
+                              "bundle": parent},
             "trace": {
                 "control_index": list(range(len(bp))),
                 "object_T": np.asarray(obj_t, dtype=np.float64),
@@ -793,6 +899,35 @@ class Stage3Mixin:
                 "metrics": {"final_q": _fq_final.tolist(), "open_threshold": _open_thr},
             },
             "reward": 0.0 if _passed else -100.0,
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ★★★★ 2026-10-03 【P0-1: 总门在**默认路径**上形同虚设 ✗】 ✓ ★★★★
+            #   实测 ✗: `_S3_COMBINED` 默认 "1" ⇒ 走本(合并)路径; 而 `task_pass`
+            #     **只在旧路径(1968 行)计算** ⇒ 本路径 result **没有 `task_pass`** ⇒
+            #     save(2040)必然走"回退口径"(Stage3A ∧ 释放) ⇒ md §07 总门失效 ✗
+            #   本改 ✓: 按官方定义(1960-1969)在本路径**同样计算并回传** ✓
+            #     = 数据有效 ∧ artifact 有效 ∧ 父段重放 ∧ carry ∧(未启用释放 或 释放通过)∧ 非诊断
+            #   ⚠ 影响 ✓: 加了之后 save 不再回退 ⇒ 总门真正生效 ⇒ 不满足则**拒绝保存** ✗
+            #     临时回退: `_S3_TASK_PASS_ENFORCE=0` (只记录不拦截 ✓)
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            "enable_release": bool(enable_release),
+            "task_pass_terms": {
+                "data_valid": True,
+                "artifact_valid": bool(getattr(self, "_s3_artifact_valid", True)),
+                "parent_replay_passed": bool(_prefix_passed),
+                "carry_passed": bool(_passed),
+                "release_ok": (not bool(enable_release)) or bool(_open_ok),
+                "diagnostic": bool(getattr(self, "_s3_diagnostic", False)
+                                   or str(os.environ.get("_S3_DIAGNOSTIC", "0")) == "1"),
+            },
+            "task_pass": bool(
+                True
+                and bool(getattr(self, "_s3_artifact_valid", True))
+                and bool(_prefix_passed)
+                and bool(_passed)
+                and ((not bool(enable_release)) or bool(_open_ok))
+                and not (bool(getattr(self, "_s3_diagnostic", False))
+                         or str(os.environ.get("_S3_DIAGNOSTIC", "0")) == "1")
+            ) if str(os.environ.get("_S3_TASK_PASS_ENFORCE", "1")) != "0" else True,
         }
 
     def rollout_v4_stage3(
@@ -820,6 +955,7 @@ class Stage3Mixin:
                 side,
                 release_candidate=release_candidate,
                 carry_time_scale=carry_time_scale,
+                enable_release=enable_release,     # ★ 任务07 ✓ 参数完整传递 (不得两路都拒 ✗)
             )
         from data_loader import rotmat_to_zyx_euler, zyx_euler_continuous
         from physics_env import CONTROL_FREQ, DECIMATION, get_grasp_force, physics_step
@@ -1211,7 +1347,18 @@ class Stage3Mixin:
             # ★★★★ 2026-09-15 起手竖直余量 (用户: "继续看看 stage3, 可以有一点余量") ★★★★
             #   假设: 爆炸源是"手指 → 物体 → 支撑面"三体约束 ✗ ⇒ 先让物体离开支撑面几毫米 ✓
             #   做法: **纯轨迹竖直偏移** (smoothstep 渐入), 不动物理参数 ✓, 不改任何常量 ✓
-            _lift_m = float(os.environ.get("_S3_LIFT_MARGIN_M", "0.008") or 0.0)
+            # ★★ 任务07 (2026-09-28) 【禁止隐藏的额外抬升】 ✓ ★★
+            #   md §07 原话 ✓: "**禁止执行时额外加 8mm 高度**、换 force/K 或补未记录的 step;
+            #     必要调整必须**先成为规划 bundle 的一部分**, 计入偏差和 hash" ✓
+            #   实测旧病 ✗: 默认 `_S3_LIFT_MARGIN_M = 0.008` (恰好 8mm ✗) 且**只加在 execute() 里**
+            #     ⇒ 执行时偷偷抬 8mm, 不进 bundle/偏差/hash ✗
+            #   本改 ✓: 默认 **0**; 显式开启 ⇒ 打 ERROR 并**标记本 run 为诊断**(task_pass=False ✓)
+            _lift_m = float(os.environ.get("_S3_LIFT_MARGIN_M", "0") or 0.0)
+            if _lift_m > 0.0:
+                logger.error("[任务07] ⚠ `_S3_LIFT_MARGIN_M=%.4fm` ⇒ md §07 **禁止**执行时额外加高 ✗ "
+                             "⇒ 该调整应先成为规划 bundle 的一部分(计入偏差/hash) ✗; "
+                             "本 run 强制记为**诊断**(task_pass=False ✓)", _lift_m)
+                self._s3_diagnostic = True
             _lift_n = max(1, int(os.environ.get("_S3_LIFT_FRAMES", "6") or 1))
             if index < _lift_n and _lift_m > 0.0:
                 target_pos = target_pos + np.array(
@@ -1226,10 +1373,12 @@ class Stage3Mixin:
                 # ★ 注意: q_grasp/_q_open_s3 是 build_stage3_timeline 的**局部变量** ✗,
                 #   在 rollout_v4_stage3.execute() 里不可见 ⇒ 必须从 suffix meta 取 ✓
                 _tm3 = suffix.get("timeline_meta", {}) or {}
-                _qg3 = float(_tm3.get("q_grasp", float("nan")))
+                _qg3 = np.round(np.asarray(
+                    _tm3.get("q_grasp", float("nan")), dtype=np.float64
+                ).reshape(-1), 4).tolist()
                 _qo3 = float(_tm3.get("q_open", float("nan")))
                 logger.warning(
-                    "[Stage3 q追踪] idx=%d phase=%-18s suffix_q=%s | meta.q_grasp=%.4f "
+                    "[Stage3 q追踪] idx=%d phase=%-18s suffix_q=%s | meta.q_grasp=%s "
                     "meta.q_open=%.4f | 前帧q=%s",
                     index, str(suffix["phase"][index]),
                     np.round(np.asarray(suffix["gripper_q"][index], dtype=np.float64),
@@ -1826,6 +1975,29 @@ class Stage3Mixin:
                 "tgo_translation_max_mm", float("nan")
             ),
         }
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ★★★★ 任务07 (2026-09-28) 【总门 task_pass: 合取, save 必须用它】 ✓ ★★★★
+        #   md §07 原话 ✓: "`task_pass` = **数据有效 ∧ artifact 有效 ∧ 父段重放通过 ∧
+        #     剩余搬运通过 ∧（未启用释放 或 释放通过）∧ 非诊断**" ✓;
+        #     "`save` 使用**同一总门**, **不能 Stage3A 单独通过就保存为正式成功**" ✓
+        #   实测旧病 ✗: 无 `task_pass`; `carry_validation["passed"]` 只等于 Stage3A ✗
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        _diag07 = bool(getattr(self, "_s3_diagnostic", False)
+                       or str(os.environ.get("_S3_DIAGNOSTIC", "0")) == "1")
+        _data_ok07 = bool(result.get("data_valid", True))
+        _art_ok07 = bool(getattr(self, "_s3_artifact_valid", True))
+        _parent_ok07 = bool((replay or {}).get("passed", bool(replay)))
+        _carry_ok07 = bool(stage3a_gate.get("passed"))
+        _release_ok07 = (not bool(enable_release)) or bool(stage3b_gate.get("passed"))
+        result["task_pass_terms"] = {
+            "data_valid": _data_ok07, "artifact_valid": _art_ok07,
+            "parent_replay_passed": _parent_ok07, "carry_passed": _carry_ok07,
+            "release_ok": _release_ok07, "diagnostic": _diag07,
+        }
+        result["task_pass"] = bool(_data_ok07 and _art_ok07 and _parent_ok07
+                                   and _carry_ok07 and _release_ok07 and not _diag07)
+        logger.warning("[任务07] ✓ task_pass=%s | 分项=%s", result["task_pass"],
+                       result["task_pass_terms"])
         result["reward"] = self.stage3_reward(result)
         logger.info(
             "[Stage3] A=%s B=%s parent=%s suffix=%s controls=%d/%d",
@@ -1878,10 +2050,28 @@ class Stage3Mixin:
 
     @staticmethod
     def save_stage3_bundle(output_path, result) -> bool:
-        """Save a combined executable artifact only when Stage3A passed."""
-        gate_a = result.get("stage3a_gate", {})
-        if not gate_a.get("passed", False):
-            logger.warning("[Stage3 save] refusing failed Stage3A: %s", gate_a.get("failure"))
+        """★ 任务07 (2026-09-28) ✓ md §07: "`save` 使用**同一总门**, **不能 Stage3A 单独通过
+        就保存为正式成功**" ✓
+
+        实测旧病 ✗: 入口只检查 `stage3a_gate["passed"]` ⇒ Stage3A 单独 PASS 即落盘为**正式**
+          产物 ✗ (与"剩余搬运/释放/父段重放/诊断"全都无关 ✗)
+        本改 ✓: 必须先满足 `task_pass` (数据有效 ∧ artifact 有效 ∧ 父段重放通过 ∧
+          剩余搬运通过 ∧(未启用释放 或 释放通过) ∧ **非诊断** ✓);
+          ⚠ `task_pass` 缺失(旧调用) ⇒ 回退口径 + **显式告警** (不静默放过 ✗)
+        """
+        gate_a = result.get("stage3a_gate", {}) or {}     # ★ 保留原名 (函数后段仍引用 ✓)
+        _tp07 = result.get("task_pass")
+        if _tp07 is None:
+            _ga07 = result.get("stage3a_gate", {}) or {}
+            _gb07 = result.get("stage3b_gate", {}) or {}
+            _er07 = bool(result.get("enable_release", True))
+            _tp07 = bool(_ga07.get("passed")) and ((not _er07) or bool(_gb07.get("passed")))
+            logger.warning("[任务07] ⚠ result 缺 `task_pass` ⇒ 用回退口径 (Stage3A ∧ 释放)=%s 判定 ✗ "
+                           "(请让调用方传 `task_pass` ✓)", _tp07)
+        if not _tp07:
+            logger.warning("[Stage3 save] ✗ 总门 `task_pass=False` ⇒ **拒绝保存为正式成功** ✗ "
+                           "(md §07: 不能 Stage3A 单独通过就保存 ✓) | 分项=%s",
+                           result.get("task_pass_terms"))
             return False
         bundle = result["bundle"]
         trace = result.get("trace", {})

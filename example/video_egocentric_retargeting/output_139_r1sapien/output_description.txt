@@ -1,0 +1,93 @@
+R1 SAPIEN Simulation Output - 2026-05-18 22:09:43
+======================================================================
+
+[输出文件说明]
+
+  1. r1_sapien_sim.mp4
+     R1 机器人仿真视频（SAPIEN 3D / 软件回退）
+     视频叠加监测变量HUD：关节角度、末端位置、FK误差、帧率
+     包含 Warmup 过渡帧（从初始姿态平滑插值到第一帧IK结果）
+
+  2. overlay.mp4
+     原始视频 + MediaPipe 手部骨架叠加 + 抓取状态标注
+
+  3. trajectory.pkl
+     完整轨迹数据（手部关键点、手腕6DoF位姿、夹爪关节值、抓取状态）
+
+  4. pipeline_info.log
+     详细参数日志（含时间戳），记录管道运行全过程
+
+  5. pipeline_info.json
+     结构化参数数据（机器可读），包含所有配置和统计信息
+
+  6. render_evaluation.pkl
+     渲染评估数据（FK误差、关节舒适度、逐帧详细验证）
+
+  7. output_description.txt
+     本文件，输出说明文档
+
+======================================================================
+
+[管道配置]
+  输入视频:       /home/an/data/MP4/egodex_small/test/basic_pick_place/139.mp4
+  手别:           Right (selfie=True)
+  工作臂:         right
+  相机视角:       egocentric
+  帧率:           30 fps
+  分辨率:         1920x1080
+  R1 URDF:        /home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/robot_glb.urdf
+  抓取阈值:       0.04
+  释放阈值:       0.06
+  Warmup帧数:     30
+  安全距离:       0.075m
+
+[手腕轨迹分析]
+  质心:           [0.44670212491159095, -0.08645511185777234, -0.08248220071643704]
+  运动范围:       X=0.3781185768101871, Y=0.10960196169230256, Z=0.1356362650245318
+
+[检测结果]
+  检测率:         100.0%
+  有效帧:         62/62
+  间隙填充帧:     0
+  抓取帧数:       52
+  张开帧数:       10
+
+[IK 求解结果]
+  求解率:         100.0%
+  超出臂展帧:     0
+  IK失败帧:       0
+  工作空间映射偏移(base): [-0.14670212491159096, 0.08645511185777234, -0.16751779928356297]
+  安全偏移(base):       [-0.05761659596980319, -0.0, 0.04801382997483599]
+
+[渲染信息]
+  SAPIEN 渲染:    失败（使用软件回退）
+
+[夹爪物理限制]
+  finger_joint1:  [0, 0.05] m
+  finger_joint2:  [-0.05, 0] m
+
+[监测变量说明（视频HUD）]
+  [Phase] Frame/FPS/T: 运行阶段/帧号/帧率/已用时间
+  --- Gripper ---
+  Status:         抓取状态（GRASP/OPEN）和手指距离
+  J1/J2:          夹爪两个手指的关节值（米）
+  --- Arm Joints ---
+  J1-J6:          臂部6关节角度（度）
+  --- Kinematics ---
+  Base:           臂基座世界坐标
+  Wrist:          手腕世界坐标（MediaPipe检测）
+  IK tgt:         IK目标世界坐标（映射后）
+  EE act:         末端执行器实际位置（FK计算）
+  EE tgt:         末端执行器IK目标位置
+  FK err:         FK位置误差（厘米），<2cm绿/<5cm橙/>5cm红
+  Reach:          到臂基座距离/臂展（%），<70%绿/<90%橙/>90%红
+  Comfort:        关节舒适度（1.0=最佳），>0.6绿/>0.3橙/<0.3红
+  Map off:        工作空间映射偏移量
+
+[重新生成命令]
+  conda run -n dex python r1_sapien_sim.py \
+    --video-path /home/an/data/MP4/egodex_small/test/basic_pick_place/139.mp4 \
+    --output-dir output_139_r1sapien \
+    --hand Right \
+    --view egocentric \
+    --fps 30

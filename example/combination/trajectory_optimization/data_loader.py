@@ -427,7 +427,14 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             # v4.14g: 摩擦 3.0 退步 (物体被卡住推不开 f1), 保持 2.0
             # v4.14m: 摩擦 2.5 与 2.0 无差别 (v4.14k base_z 锁定后物体 xy 跟随主要受摩擦力影响, 但 2.5 vs 2.0 几乎一致)
             phys_material = scene.create_physical_material(
-                static_friction=2.0, dynamic_friction=2.0, restitution=0.0
+                # ★★★★ 2026-09-20 【用户】"**抓住要抓紧一点**" ★★★★
+                #   物理事实 ✓: 有效摩擦 = **min(夹爪摩擦, 物体摩擦)** ✓
+                #     ⇒ 只调 `_GRIP_FRICTION`(4.0) 而物体**硬编码 2.0** ✗ ⇒ 有效摩擦只有 **2.0** ✗
+                #       ⇒ "抓紧"根本没生效 ✗ (实测: 改夹爪摩擦对抓取毫无影响 ✓ 自洽 ✓)
+                #   现在 ✓: 物体摩擦也可调 `_OBJ_FRICTION` (默认 2.0 行为不变 ✓)
+                static_friction=float(os.environ.get("_OBJ_FRICTION", "2.0")),
+                dynamic_friction=float(os.environ.get("_OBJ_FRICTION", "2.0")),
+                restitution=0.0
             )
             body_type = "dynamic"
 
@@ -446,16 +453,185 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
 
         builder = scene.create_actor_builder()
 
+        # ★★★★ 2026-09-20 【用户】"**渲染一定要和仿真一致**, 我一直强调这一点" ★★★★
+        #   背景 ✓: 之前**只有碰撞体**会用 CoACD 的 64 个凸包替换 ✗, 视觉始终是 GLB 原网格 ✗
+        #     ⇒ 渲染里看到的形状 **≠** 物理真正在用的碰撞形状 ✗ ⇒ 判读全靠猜 ✗
+        #   本旋钮 ✓: 让**视觉 = 真实碰撞几何** ✓
+        #     `_VIS_COACD_HULLS=1` ⇒ **只显示 CoACD 凸包** (绿色 ✓, 原网格不画 ✓) = 仿真所见 ✓
+        #     `_VIS_COACD_HULLS=2` ⇒ 原网格 + 半透明凸包叠层 ✓
+        #     `_VIS_COACD_HULLS=0` ⇒ 恢复原网格 (只作对照 ✓, 与仿真**不一致** ✗)
+        #   ★★ 默认改为 **1** ⇒ 渲染与仿真一致成为默认行为 ✓ (用户明确要求 ✓)
+        _vis_hulls = str(os.environ.get("_VIS_COACD_HULLS", "1"))
+        _coacd_target_pv = os.environ.get("_COACD_TARGET", "")
+        _coacd_pv = bool(_coacd_target_pv) and _coacd_target_pv.lower() != "none" and (
+            _coacd_target_pv == f"glb_{geom_idx}" or _coacd_target_pv in real_name)
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ★★★★ 2026-09-23 【用户要求】"把**每个模块**都用 coacd, 和被抓取的**一样**的物理仿真" ✓ ★★★★
+        #   用户原话 ✓: "不然你还是把**每个模块都用 coacd** 和被抓取一样的物理仿真一下吧" ✓
+        #   现状 ✗: 只能指定**单个** `_COACD_TARGET` (其余 dynamic 物体走 `_OBJ_SHAPE=box` ✗)
+        #     ⇒ 场景里"被抓的物体是凸包、其它是 box" ⇒ **物理不一致** ✗ (也与用户原则冲突 ✓)
+        #   本改 ✓: 新增 `_COACD_ALL=1` ⇒ **所有 dynamic 物体**都用 CoACD 分解 ✓
+        #     (默认 0 ⇒ 行为不变 ✓; 与 `_COACD_TARGET` 可叠加 ✓)
+        #   ⚠ 复现注意 ✓ (用户提到的"**stage0 的重复使用**" ✓): 场景加载属于 stage0 ✓,
+        #     而 stage0 产物 (`transform_params.npz` / `preprocess_traj.npz`) 会**被复用** ✓
+        #     ⇒ 若沿用旧 run 目录 ⇒ **复用的是旧配置** ✗ ⇒ 必须**换新输出目录** (或删旧缓存 ✓)
+        #       才能让"全 CoACD"真正生效 ✓
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        _coacd_all_pv = str(os.environ.get("_COACD_ALL", "0")) == "1"
+        if _coacd_all_pv and body_type == "dynamic":
+            _coacd_pv = True
+            logger.info("    [load_glb] %s: **_COACD_ALL=1** ⇒ 该 dynamic 物体**也用 CoACD 凸包** ✓ "
+                        "(与目标物同一物理口径 ✓)", real_name)
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ★★★★ 2026-09-23 【我引入的"物体看不见"回归】修掉 ✗ ★★★★
+            #   用户反馈 ✓: "**后面的物体也不加载了**" ✓ —— 自审查明: **物理全部加载了** ✓ (8/8 ✓),
+            #     变的是**渲染**: `_COACD_ALL=1` ⇒ 所有 dynamic 视觉被换成**凸包** ✗
+            #     (`[load_glb] toy_1: 视觉 = **CoACD 凸包** (原网格已跳过, _VIS_COACD_HULLS=1)` ✗)
+            #     ⇒ 小物体的凸包**碎/退化** ⇒ 视觉上"几乎看不见" ✗ ⇒ 被感知为"不加载" ✓
+            #   本改 ✓: **目标物**仍用凸包(保持"渲染=物理" ✓); **非目标**物体
+            #     ⇒ **凸包 + 原网格一起画** ✓ (物理仍是凸包 ✓ 但**看得见** ✓)
+            #     开关 ✓ `_VIS_ALSO_MESH_ON_COACD_ALL` (默认 **1** ✓)
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ⚠ 2026-09-23 修正我自己的崩溃 ✗: 上一版引用了**后面才定义**的 `_is_target`
+            #   ⇒ `UnboundLocalError: local variable '_is_target' referenced before assignment`
+            #   ⇒ **场景加载直接失败** ✗ (正是用户看到的"物体不加载" ✓)
+            #   本改 ✓: 自包含判断, 只依赖环境变量与当前物体名 ✓
+            _tgt_name_pv = str(os.environ.get("_VIS_TARGET_NAME", "") or "")
+            _is_tgt_here = bool(_tgt_name_pv) and (
+                _tgt_name_pv in real_name or _tgt_name_pv == f"glb_{geom_idx}")
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ★★★★ 2026-09-23 【撤回我自己造成的渲染失败】✗ ★★★★
+            #   实测铁证 ✓: `[render] 渲染帧失败 … Failed to load scene: Unable to open file
+            #     "/tmp/grasp_glb_4171341_1.ply"` ✗✗
+            #   ⇒ 本补丁把**临时 ply** 当视觉源引用 ✗, 而该临时文件在场景加载后被**清理** ✗
+            #     ⇒ **整个场景渲染加载失败** ⇒ 视频**一帧都没有** (44 字节空 mp4 ✗)
+            #     ⇒ 这正是用户"**完全看不出区别**"的直接原因 ✓
+            #   本改 ✓: **默认关闭** (`_VIS_ALSO_MESH_ON_COACD_ALL` 默认 **0** ✗) +
+            #     仍打开时必须**文件存在** ✓ ⇒ 不再引用缺失文件 ✓
+            #   ※ 物体"看不见"的正解是**相机距离/缩放**(0.5 缩放 + 0.9m 远景 ✗),
+            #     不是靠补画网格 ✗ —— 我不再走这条路 ✗
+            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            if (str(os.environ.get("_VIS_ALSO_MESH_ON_COACD_ALL", "0")) == "1"
+                    and not _is_tgt_here
+                    and os.path.exists(str(temp_ply))):
+                try:
+                    builder.add_visual_from_file(filename=temp_ply)
+                    logger.info("    [load_glb] %s: 额外补**原网格视觉** ✓ "
+                                "(物理仍是 CoACD 凸包 ✓ ⇒ 既一致又看得见 ✓)", real_name)
+                except Exception as _evm:  # noqa: BLE001
+                    logger.warning("    [load_glb] %s: 原网格视觉补画失败: %s", real_name, _evm)
+
         # CPU 降级模式: 跳过视觉, 仅创建碰撞体 (避免 RenderMaterial 失败)
         render_ok = getattr(scene, "_render_available", True)
-        if render_ok:
-            if avg_color is not None:
+        # ★★★★ 2026-09-21 【目标物体高亮】用户: "**我都没看到被抓取物体在正确的位置上**" ★★★★
+        #   现象 ✓: 目标 `glb_4` 是"**粉色**"物体 (rgb≈(0.66,0.07,0.61) ✓,
+        #     日志 `[find_pink_object] 选中: glb_4` ✓) —— 但经场景光照后**发白** ✗
+        #     ⇒ 在 cam 视角截图里和夹爪/桌面对比度太低 ⇒ **无法确认它到底在哪** ✗
+        #   本旋钮 ✓: `_VIS_TARGET_HIGHLIGHT=1` ⇒ 把**目标物体**画成**亮品红**
+        #     ⇒ 一眼能在 GIF 里定位"被抓取物体" ✓ (与 `obj_center` 数值对照 ✓)
+        _vis_hi = os.environ.get("_VIS_TARGET_HIGHLIGHT", "0") == "1"
+        # ⚠ 2026-09-21 实测: 用 `_coacd_pv` 判断目标 **没生效** ✗ (日志计数 = 0 ✗)
+        #   原因: `_coacd_pv` 由 `_COACD_TARGET == f"glb_{geom_idx}"` 推出 ⇒ 几何序号
+        #     与实际物体名**未必对应** ✗ ⇒ 高亮条件为假 ✗
+        #   修法 ✓: 允许**直接给物体名** `_VIS_TARGET_NAME=glb_4` ✓ (最可靠 ✓),
+        #     并保留 `_coacd_pv` 作为回退 ✓
+        _vis_name = str(os.environ.get("_VIS_TARGET_NAME", "") or "")
+        # ★ 2026-09-29 修 (用户指出"渲染全是品红, 分不清哪个是目标" ✗) ✓:
+        #   旧判定 `... or _coacd_pv` ✗ —— 而 `_COACD_ALL=1` 时**所有** dynamic 的
+        #   `_coacd_pv=True` ⇒ **全部物体都被染成目标品红** ✗ (实测 s76/s79 帧 ✓)
+        #   本改 ✓: 视觉高亮**只认** `_VIS_TARGET_NAME` ✓ (物理口径 `_coacd_pv` 与视觉高亮
+        #     是两回事 ✓ —— 全 CoACD 是物理决策, 不该改变"谁是目标"的视觉语义 ✓)
+        _is_target = bool(_vis_name and (real_name == _vis_name or _vis_name in real_name))
+
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ★★★★ 2026-09-21 【用户原则 (最高优先级)】★★★★
+        #   "**规划全部用 coacd, 不要再用 bbox**, 不然这样怎么行呢?
+        #    你**物理仿真用什么, 你的规划就用什么** —— 这个是原则!
+        #    **包括渲染也是**, 其他渲染是 bbox 就用 bbox 展示,
+        #    不要老是渲染不对、物理仿真不对, 这个需要解决" ✓
+        #   ⇒ 落实为**三段一致**: 物理 = 规划 = 渲染 ✓
+        #   ★ 现状 (本文件, 改前) ✗:
+        #     · 物理: 目标物 = **CoACD 凸包** ✓ / 其他 dynamic = **box** ✓ / static = 凸包 ✓
+        #     · 渲染: 只有 CoACD 目标走凸包 ✓, 其他 dynamic 仍画**原网格** ✗
+        #       ⇒ 看到的形状 ≠ 物理在用的形状 ✗ (被反复指出 ✓)
+        #   本改 ✓ (2 步):
+        #     ① **先判定"该物体在物理里会用什么"** ⇒ 写进 `obj_info[...]['collision_mode']`
+        #        (供**规划侧**消费: N-5/Stage1 必须用同一几何 ✓)
+        #     ② 视觉按 `collision_mode` 走 ✓: `coacd` ⇒ 凸包 ✓; `box` ⇒ **画同尺寸 box** ✓
+        #        (`_VIS_MATCH_PHYSICS=1`, 默认 **1** ✓; 设 0 回旧行为仅作对照 ✗)
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        _vis_match = str(os.environ.get("_VIS_MATCH_PHYSICS", "1")) == "1"
+        _phys_mode = "mesh"
+        if body_type == "dynamic":
+            _shape_pv = str(os.environ.get("_OBJ_SHAPE", "box")).lower()
+            _shape_tgt_pv = os.environ.get("_OBJ_SHAPE_TARGET", "")
+            _shape_here_pv = _shape_pv != "box" and bool(_shape_tgt_pv) and (
+                _shape_tgt_pv in real_name or _shape_tgt_pv == f"glb_{geom_idx}")
+            if _coacd_pv:
+                _phys_mode = "coacd"
+            elif _shape_here_pv:
+                _phys_mode = _shape_pv          # cylinder / sphere / convex
+            else:
+                _phys_mode = "box"
+        _oi_key = f"glb_{geom_idx}"
+        obj_info[_oi_key]["collision_mode"] = _phys_mode
+        if _phys_mode == "box":
+            obj_info[_oi_key]["collision_box_half"] = (bbox_size / 2.0).tolist()
+        _vis_desc = {
+            "coacd": "CoACD 凸包 ✓ (同物理)",
+            "box": "box ✓ (同物理)" if (_vis_match and _vis_hulls != "0") else "原网格 ✗ (与物理 box 不一致)",
+            "mesh": "原网格 ✓",
+        }.get(_phys_mode, _phys_mode)
+        if _shape_here_pv and _phys_mode in ("cylinder", "sphere", "convex"):
+            _vis_desc = f"{_phys_mode} (物理) / 原网格 (视觉)"
+        logger.info(
+            f"    [load_glb] {real_name}: **物理=%s** | **视觉=%s** | 一致=%s",
+            _phys_mode, _vis_desc,
+            "✓" if (_phys_mode != "box" or (_vis_match and _vis_hulls != "0")) else "✗")
+
+        # ★ 视觉: 与物理同几何 ✓ (`_VIS_MATCH_PHYSICS=1` 时 box 走 box 视觉 ✓)
+        _skip_mesh_visual = ((_vis_hulls == "1" and _coacd_pv)
+                             or (_vis_match and _phys_mode == "box" and _vis_hulls != "0"))
+        _skip_mesh_visual = bool(_skip_mesh_visual)
+        if render_ok and not _skip_mesh_visual:
+            _base_col = avg_color
+            if _vis_hi and _is_target:
+                _base_col = [1.0, 0.0, 0.85, 1.0]        # 亮品红 (与场景其他物体区分 ✓)
+                logger.info(f"    [load_glb] {real_name}: **目标物体高亮** (亮品红 ✓ "
+                            f"_VIS_TARGET_HIGHLIGHT=1) ⇒ 便于在 cam 视角中定位 ✓")
+            if _base_col is not None:
                 material = sapien.render.RenderMaterial(
-                    base_color=avg_color, metallic=0.0, roughness=0.7, specular=0.3
+                    base_color=_base_col, metallic=0.0, roughness=0.7, specular=0.3
                 )
                 builder.add_visual_from_file(filename=temp_ply, material=material)
             else:
                 builder.add_visual_from_file(filename=temp_ply)
+        elif render_ok and _vis_hulls == "1" and _coacd_pv:
+            logger.info(f"    [load_glb] {real_name}: 视觉 = **CoACD 凸包** (原网格已跳过, "
+                        f"_VIS_COACD_HULLS=1)")
+        if render_ok and _vis_match and _phys_mode == "box" and _vis_hulls != "0":
+            # ★ 物理是 box ⇒ 视觉也画**同尺寸 box** ✓ (用户: "其他渲染是 bbox 就用 bbox 展示" ✓)
+            try:
+                _bmat = None
+                try:
+                    _bmat = sapien.render.RenderMaterial(
+                        base_color=(avg_color if avg_color is not None else [0.6, 0.6, 0.6, 1.0]),
+                        metallic=0.0, roughness=0.7, specular=0.3)
+                except Exception:  # noqa: BLE001
+                    _bmat = None
+                builder.add_box_visual(
+                    pose=sapien.Pose(), half_size=(bbox_size / 2.0).tolist(),
+                    material=_bmat)
+                logger.info(f"    [load_glb] {real_name}: 视觉 = **box** (半尺寸 "
+                            f"{np.round(bbox_size / 2.0, 4).tolist()} ✓ = 物理碰撞盒 ✓)")
+            except Exception as _ebv:  # noqa: BLE001
+                logger.warning(f"    [load_glb] {real_name}: box 视觉添加失败 ({_ebv}), "
+                               f"回退原网格")
+                if render_ok:
+                    try:
+                        builder.add_visual_from_file(filename=temp_ply)
+                    except Exception:  # noqa: BLE001
+                        pass
 
         # 碰撞体: dynamic 物体用盒形碰撞 (平整接触面), kinematic 用凸包 (精确形状)
         # 修复: 凸包的斜面导致 pad 挤压时产生侧向力, 把物体推出夹爪 (lift=0)
@@ -483,11 +659,38 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             if _parts:
                 _hulls = _coacd_export_fn(
                     _parts, "/tmp", f"grasp_glb_coacd_{os.getpid()}_{geom_idx}")
+                # ★ 2026-09-20 视觉也跟着凸包走 (`_VIS_COACD_HULLS` ✓ 见上文说明 ✓)
+                _hmat = None
+                if render_ok and _vis_hulls != "0":
+                    try:
+                        # ★ 2026-09-21 高亮也要生效在**凸包分支** ✓
+                        #   实测 ✓: `_VIS_COACD_HULLS` 默认 **1** ⇒ 目标物体走**凸包视觉** ✓
+                        #     ⇒ 之前只在高亮"原网格"分支 ⇒ **看不到效果** ✗ (日志计数 0 ✗)
+                        #     而绿色凸包本身就说明"那个绿物体 = glb_4" ✓ (已据此定位 ✓)
+                        _hm_col = ([0.15, 0.80, 0.25, 1.0] if _vis_hulls == "1"
+                                   else [0.15, 0.80, 0.25, 0.30])
+                        if _vis_hi and _is_target:
+                            _hm_col = [1.0, 0.0, 0.85, 1.0]      # 亮品红 ✓ (目标物体)
+                            logger.info(f"    [load_glb] {real_name}: **目标物体高亮** "
+                                        f"(亮品红凸包 ✓) ⇒ 便于在 cam 视角中定位 ✓")
+                        _hmat = sapien.render.RenderMaterial(
+                            base_color=_hm_col,
+                            metallic=0.0, roughness=0.5, specular=0.2)
+                    except Exception as _em:  # noqa: BLE001
+                        _hmat = None
+                        logger.warning(f"    [load_glb] {real_name}: 凸包可视材质创建失败 ({_em})")
                 for _hp in _hulls:
                     temp_files.append(_hp)
                     builder.add_convex_collision_from_file(
                         filename=_hp, material=phys_material)
-                logger.info(f"    [load_glb] {real_name}: CoACD 碰撞体 = {len(_hulls)} 个凸包")
+                    if _hmat is not None:
+                        try:
+                            builder.add_visual_from_file(filename=_hp, material=_hmat)
+                        except Exception as _ev:  # noqa: BLE001
+                            logger.warning(f"    [load_glb] {real_name}: 凸包可视添加失败 ({_ev})")
+                            _hmat = None
+                logger.info(f"    [load_glb] {real_name}: CoACD 碰撞体 = {len(_hulls)} 个凸包"
+                            + (" + 凸包可视" if _hmat is not None else ""))
                 # 记录凸包局部最低点, 供落地循环按【碰撞体】而非网格对齐地面 (见下方 obj_hull_min_z_local)
                 try:
                     obj_hull_min_z_local[f"glb_{geom_idx}"] = min(
@@ -552,13 +755,200 @@ def load_glb_with_physics(glb_path, transform_params_path, scene, fast_collision
             try:
                 for comp in actor.components:
                     if isinstance(comp, sapien.pysapien.physx.PhysxRigidDynamicComponent):
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★★★★ 2026-09-23 【铁律级修正】改质量**必须同步改惯量** ✗ ★★★★
+                        #   复审/用户原话 ✓: "`data_loader.py:717` **只修改 `comp.mass`, 没有同步
+                        #     处理惯量** … 实测: 改前 `mass=0.192, inertia=[1.60e-4,1.28e-4,8.32e-5]`;
+                        #     质量×2 后 `mass=0.384, inertia 完全不变` ✗ ⇒
+                        #     现在'加重物体'的实验**不等于**把同一物体按相同质量分布加重 ✗
+                        #     它改变了**平移**响应, 却没有相应改变**转动**响应" ✓
+                        #   本改 ✓: **固定形状、均匀调质量** ⇒ 惯量按**同一比例**缩放 ✓
+                        #     (取原始 mass/inertia 作基准 ⇒ 与 `_OBJ_DENSITY` 的倍数无关 ✓ 可重复 ✓)
+                        #   ⚠ 形状变化(缩放/CoACD 重建)时不能这么缩放 ✗ ⇒ 那时应重算 ✓
+                        #     (本处是"同一 mesh, 只改密度倍数" ⇒ 等比缩放正确 ✓)
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        try:
+                            _m0 = float(comp.mass)
+                            _I0 = np.asarray(comp.inertia, dtype=np.float64).copy()
+                        except Exception:  # noqa: BLE001
+                            _m0, _I0 = None, None
                         comp.mass = obj_mass
-                        # angular_damping 防扁平物体被碰翻 (用户: "碰一下把盘子弄翻")
-                        # 5.0 不足以抑制 kinematic 根高速冲击的翻转力矩, 提到 50.0
-                        # linear_damping 抑制物体被甩飞后的飞行距离 (第五轮: glb_5 xy_drift=224cm 飞太远)
-                        # 之前 1.0 导致 lift=-26cm; 用 0.5 (影响减半) + 摩擦2.0 + angular50 应能保持提升
-                        comp.angular_damping = 50.0
-                        comp.linear_damping = 0.5
+                        if _m0 and _m0 > 0.0 and _I0 is not None and _I0.size == 3:
+                            _scale = float(obj_mass) / float(_m0)
+                            try:
+                                comp.inertia = (_I0 * _scale).tolist()
+                                logger.info(
+                                    "    [质量-惯量] %s: mass %.4f→%.4f kg (×%.3f), "
+                                    "inertia ×%.3f = %s ✓ (同形状等比 ⇒ 平移/转动一致 ✓)",
+                                    real_name, _m0, float(obj_mass), _scale, _scale,
+                                    np.round(_I0 * _scale, 9).tolist())
+                            except Exception as _ei:  # noqa: BLE001
+                                logger.warning("    [质量-惯量] %s: 惯量设置失败: %s",
+                                               real_name, _ei)
+                        else:
+                            logger.warning("    [质量-惯量] %s: 读不到原始 mass/inertia ⇒ "
+                                           "惯量**未同步** ⚠ (质量-惯量不自洽 ✗)", real_name)
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★★★★ 2026-09-23 【方案 P0-1 实施】恢复系数必须写到**真实 shape 材质** ✓ ★★★★
+                        #   方案原话 ✓ (§1.2 表 + §10 测试): \"`data_loader.py:753` 写
+                        #     `comp.restitution=0`, **异常被吞掉** ✗ ⇒ 实测: 给
+                        #     `PhysxRigidDynamicComponent` 写 restitution ⇒ **AttributeError** ✗;
+                        #     **实际恢复系数在 `shape.physical_material` 上, 本测试读到 0.6**\" ✗✗
+                        #   ⇒ 后果 ✓: `_RESTITUTION_ZERO=1` **一直没生效** ✗ ⇒ 物体带着 **0.6**
+                        #     的弹性撞桌面/夹爪 ⇒ **被弹飞** ✗ (与我的\"飞出去\"现象一致 ✓)
+                        #   方案要求 ✓: \"写入实际 collision shape 的 material, **逐 shape 读回**;
+                        #     **未知/写失败不得宣称零反弹**\" ✓
+                        #   ⇒ 本改 ✓ (三个必须):
+                        #     ① 对**每个 collision shape** 的 `physical_material` 写 restitution ✓
+                        #     ② **逐 shape 读回**并核对 ✓
+                        #     ③ 读回失败/不一致 ⇒ **ERROR 级**明确记录 ✓ (不再静默 ✗)
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        if str(os.environ.get("_RESTITUTION_ZERO", "1")) == "1":
+                            _n_ok_r, _n_sh_r, _bad_r = 0, 0, []
+                            try:
+                                for _c_r in actor.components:
+                                    # ★ W1 ✓ (方案 §8.2-4): 只枚举**真正的物理刚体组件** ✗
+                                    #   实测 ✓: 直接对所有组件调 `get_collision_shapes()` ⇒
+                                    #     `AttributeError` ⇒ 日志报 `成功 0/0` ✗ (假"失败" ✗)
+                                    #   ⇒ 无该接口的组件**跳过** ✓ ⇒ shape 计数才是真的 ✓
+                                    if not hasattr(_c_r, "get_collision_shapes"):
+                                        continue
+                                    try:
+                                        _shs_r = list(_c_r.get_collision_shapes())
+                                    except Exception:  # noqa: BLE001
+                                        continue
+                                    for _sh_r in _shs_r:
+                                        _n_sh_r += 1
+                                        try:
+                                            _pm_r = _sh_r.physical_material
+                                            if _pm_r is None:
+                                                _bad_r.append("no_material")
+                                                continue
+                                            _pm_r.restitution = 0.0          # ★ 写真实材质 ✓
+                                            _rb = float(getattr(_pm_r, "restitution", -1.0))
+                                            if abs(_rb) <= 1e-9:
+                                                _n_ok_r += 1
+                                            else:
+                                                _bad_r.append(f"readback={_rb:.4f}")
+                                        except Exception as _er1:  # noqa: BLE001
+                                            _bad_r.append(type(_er1).__name__)
+                            except Exception as _er2:  # noqa: BLE001
+                                _bad_r.append(f"iter:{type(_er2).__name__}")
+                            if _n_ok_r > 0 and not _bad_r:
+                                logger.info("    [恢复系数] %s: **逐 shape 读回 = 0.0** ✓ "
+                                            "(%d/%d shapes ✓ 不再走组件属性 ✗)",
+                                            real_name, _n_ok_r, _n_sh_r)
+                            else:
+                                logger.error("    [恢复系数] %s: ✗ **未能确认零反弹** "
+                                             "(成功 %d/%d, 问题=%s) ⇒ 该物体**仍可能弹飞** ✗ "
+                                             "方案 §1.2: 未知/写失败**不得宣称零反弹** ✗",
+                                             real_name, _n_ok_r, _n_sh_r, _bad_r[:4])
+                                # ★ W1 ✓ (方案 §8.2-4): 同上 ⇒ **写失败即中止**, 不带着未知弹性跑 ✗
+                                if str(os.environ.get("_PROFILE_STRICT", "1")) == "1":
+                                    raise RuntimeError(
+                                        f"[profile 无效] {real_name}: 恢复系数读回失败 "
+                                        f"(成功 {_n_ok_r}/{_n_sh_r}, 问题={_bad_r[:4]}) "
+                                        f"⇒ 按方案 §8.2-4 中止本轮 ✗")
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★★★★ 2026-09-23 【方案 P1 实施】角阻尼 50 ⇒ **1.0** ✓ ★★★★
+                        #   方案原话 ✓ (§2.1): \"目标阻尼: linear=0.5 s⁻¹、**angular=1.0 s⁻¹** ⇒
+                        #     保留现有平移阻尼, **移除 angular=50 这种强消旋补偿**\" ✗
+                        #     (50 会把\"物体被挤出/翻转\"这种真实失败**掩盖成静止** ✗ ⇒ 掩盖证据 ✗)
+                        #   ⇒ 仍可用 `_OBJ_ANG_DAMPING` 覆盖 ✓ (默认按方案 = 1.0 ✓)
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★★★★ 2026-09-23 【方案 §11.2 反例 B 修正】接口**可用**, 是我上次查错层级 ✗ ★★★★
+                        #   复审 ✓: \"同一 3.0.0b0, 独立 CPU 场景**实际写入并读回**
+                        #     `shape.contact_offset=0.001` / `rest_offset=0` /
+                        #     `component.solver_position_iterations=16 / velocity=1`\" ✓
+                        #   我本轮复现 ✓ (直接调用, 不再用 dir 判断): `✓ set_contact_offset`,
+                        #     `✓ set_rest_offset`, 读回 0.001 / 0.0 ✓ ⇒ 复审正确, 我上次结论错 ✗
+                        #   本改 ✓ (§3.2/§3.1): 每个 **shape** 设 offset + 每个 **dynamic
+                        #     component** 设求解迭代 + **逐对象读回** ✓; 失败 ⇒ ERROR 阻止验收 ✓
+                        #     (§11.6-A: \"物理参数写失败**明确阻止该 profile 验收**\" ✓)
+                        #   ⚠ §11.2 语义 ✓: 有接触记录 **≠** 真实受力/穿透 ⇒ 仍须分别记录
+                        #     几何间隙、法向冲量、跟踪残差 (本处只负责参数 ✓)
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        # ★ W1 ✓: 旧写法 `float(x or 1.0)` 会把**合法值 0.0** 静默改成 1.0 ✗
+                        #   (同属"静默兜底"✗ ⇒ 无法注入失败、也无法表达"设为 0" ✓)
+                        #   ⇒ 显式解析: 空 ⇒ 默认; 非法 ⇒ **报错并用默认**(日志可见 ✗ 不再静默 ✓)
+                        def _env_f_mm(_k, _d):
+                            _v = os.environ.get(_k, None)
+                            if _v is None or str(_v).strip() == "":
+                                return float(_d)
+                            try:
+                                return float(str(_v).strip())
+                            except Exception as _ep:  # noqa: BLE001
+                                logger.error("    [接触参数] 环境变量 %s=%r 非法 ⇒ 用默认 %.3f ✗",
+                                             _k, _v, float(_d))
+                                return float(_d)
+                        _co_mm = _env_f_mm("_CONTACT_OFFSET_MM", 1.0)
+                        _ro_mm = _env_f_mm("_REST_OFFSET_MM", 0.0)
+                        _pos_it = int(float(os.environ.get("_SOLVER_POS_ITER", "16") or 16))
+                        _vel_it = int(float(os.environ.get("_SOLVER_VEL_ITER", "1") or 1))
+                        _n_ok_o, _n_sh_o, _bad_o = 0, 0, []
+                        try:
+                            for _c_o in actor.components:
+                                # ★ W1 ✓ (方案 §8.2-4): 同上的组件枚举修正 ✓
+                                #   (旧写法对非物理组件调用 ⇒ `AttributeError` ⇒ `0/0` 假报 ✗)
+                                if not hasattr(_c_o, "get_collision_shapes"):
+                                    continue
+                                try:
+                                    _shs_o = list(_c_o.get_collision_shapes())
+                                except Exception:  # noqa: BLE001
+                                    continue
+                                for _sh_o in _shs_o:
+                                    _n_sh_o += 1
+                                    try:
+                                        _sh_o.set_contact_offset(_co_mm / 1000.0)
+                                        _sh_o.set_rest_offset(_ro_mm / 1000.0)
+                                        _rco = float(_sh_o.get_contact_offset())
+                                        _rro = float(_sh_o.get_rest_offset())
+                                        if (abs(_rco - _co_mm / 1000.0) <= 1e-6
+                                                and abs(_rro - _ro_mm / 1000.0) <= 1e-6):
+                                            _n_ok_o += 1
+                                        else:
+                                            _bad_o.append(
+                                                f"co={_rco * 1000:.3f}mm,ro={_rro * 1000:.3f}mm")
+                                    except Exception as _eo1:  # noqa: BLE001
+                                        _bad_o.append(type(_eo1).__name__)
+                                try:
+                                    if isinstance(
+                                            _c_o,
+                                            sapien.pysapien.physx.PhysxRigidDynamicComponent):
+                                        _c_o.solver_position_iterations = _pos_it
+                                        _c_o.solver_velocity_iterations = _vel_it
+                                except Exception as _eo2:  # noqa: BLE001
+                                    _bad_o.append(f"iter:{type(_eo2).__name__}")
+                        except Exception as _eo3:  # noqa: BLE001
+                            _bad_o.append(f"all:{type(_eo3).__name__}")
+                        if _n_ok_o > 0 and not _bad_o:
+                            logger.info("    [接触参数] %s: contact_offset=%.3fmm / "
+                                        "rest_offset=%.3fmm ✓ (%d/%d shapes 读回一致 ✓) | "
+                                        "solver iter=%d/%d ✓", real_name, _co_mm, _ro_mm,
+                                        _n_ok_o, _n_sh_o, _pos_it, _vel_it)
+                        else:
+                            logger.error("    [接触参数] %s: ✗ **未全部生效** (成功 %d/%d, 问题=%s)"
+                                         " ⇒ 方案 §11.6-A: **该 profile 不得验收** ✗",
+                                         real_name, _n_ok_o, _n_sh_o, _bad_o[:4])
+                            # ★ W1 ✓ (方案 §8.2-4 / §8.1) **物理参数只报错不阻断 = 无效 profile** ✗
+                            #   方案原话 ✓: "启动时恢复系数和 offset 均报成功 0/0、AttributeError,
+                            #     **却继续搜索** ⇒ **日志写了 ERROR 不等于程序已阻断**" ✗
+                            #   ⇒ 本改 ✓: 读回不齐/失败 ⇒ **直接中止** ✓ (不再带着未知 profile 跑 ✗)
+                            #     开关 `_PROFILE_STRICT=1`(默认开 ✓; 0 可临时降级为仅告警 ✓)
+                            if str(os.environ.get("_PROFILE_STRICT", "1")) == "1":
+                                raise RuntimeError(
+                                    f"[profile 无效] {real_name}: 接触参数读回失败 "
+                                    f"(成功 {_n_ok_o}/{_n_sh_o}, 问题={_bad_o[:4]}) "
+                                    f"⇒ 按方案 §8.2-4 中止本轮 ✗")
+
+                        comp.angular_damping = float(
+                            os.environ.get("_OBJ_ANG_DAMPING", "1.0") or 1.0)
+                        comp.linear_damping = float(
+                            os.environ.get("_OBJ_LIN_DAMPING", "0.5") or 0.5)
+                        logger.info("    [阻尼] %s: linear=%.2f / angular=%.2f ✓ "
+                                    "(方案 P1: 移除 angular=50 的强消旋补偿 ✗)",
+                                    real_name, comp.linear_damping, comp.angular_damping)
                         break
             except Exception:
                 pass
@@ -637,7 +1027,8 @@ def compute_mano_joints(mano_layer, pred_rot, pred_hand_pose, pred_trans):
     return _compute(mano_layer, pred_rot, pred_hand_pose, pred_trans)
 
 
-def compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, prefix="right"):
+def compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, prefix="right",
+                                    horizontalize=None):
     """从 MANO 3 个特征点计算夹爪 gripper_link 位姿和手指关节值
 
     完全对齐 04_physics_simulation.py 的 _compute_analytical_gripper_pose (L313-362):
@@ -699,7 +1090,10 @@ def compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, pref
     #   方向 (世界 -Z) 而非手掌平面法向. 必须在 root_pos 之前做 —
     #   root_pos = finger_mid - R @ finger_mid_in_gripper, R 翻转后 base 自动落到
     #   指尖中点**上方** (手指朝下伸出的正确几何, 也是抓取桌面物体的唯一合理姿态).
-    root_R = align_gripper_approach_to_gravity(root_R)
+    # 2026-09-20: horizontalize=None → 行为与改动前逐位一致 (读环境变量);
+    #   传 False 时只定分支不水平化 —— 供"先分支 DP、再水平化"的分层链路使用
+    #   (水平化是绕 X 转 θ≈-120°, 与分支翻转 F=绕 Y 转 180° 不可交换, 必须先定分支).
+    root_R = align_gripper_approach_to_gravity(root_R, horizontalize=horizontalize)
 
     # 3. 匹配指尖中点确定 gripper_link 位置
     finger1_in_gripper = _FINGER1_ORIGIN + _FINGER1_AXIS * joint1
@@ -714,7 +1108,7 @@ def compute_analytical_gripper_pose(mano_wrist, mano_finger1, mano_finger2, pref
 # 6b. MANO 解析夹爪位姿 (SVD 手掌平面 + Gram-Schmidt)
 # ============================================================
 def compute_mano_based_gripper_pose(joints_sapien, prefix="right",
-                                    finger_origin_x=0.03689):
+                                    finger_origin_x=0.03689, horizontalize=None):
     """从 MANO 5 个关节点解算夹爪位姿 (SVD 拟合手掌平面 + Gram-Schmidt).
 
     移植自 View/viz_mano_retargeting_web.py 的同名函数:
@@ -778,7 +1172,8 @@ def compute_mano_based_gripper_pose(joints_sapien, prefix="right",
     # v6.9 (2026-09-01): 重力对齐 — approach 轴 (gripper X = 手指伸出方向) 朝下.
     # 与 compute_analytical_gripper_pose 同一约定: 绕开合轴 (gripper Y) 翻转 180°,
     # 判据沿重力方向 (世界 -Z). 实测修正前 X.z = +0.452, 朝下占比 0.0%.
-    R = align_gripper_approach_to_gravity(R)
+    # 2026-09-20: horizontalize=None → 行为逐位不变; False = 只定分支 (供分层链路).
+    R = align_gripper_approach_to_gravity(R, horizontalize=horizontalize)
 
     root_pos = anchor  # 无偏移, 对齐 viz_web
 
@@ -787,6 +1182,24 @@ def compute_mano_based_gripper_pose(joints_sapien, prefix="right",
     joint = max(0.0, min(0.05, finger_dist / 2))
 
     return root_pos, R, joint, joint
+
+
+def gripper_pos_for_branch(method, joints_sapien, R, j1, j2):
+    """给定姿态 R, 反解与之几何一致的 gripper base 位置 (分支翻转后重算 pos 用)。
+
+    为什么需要: 分支 DP 会把部分帧的 R 改成 R@F, 而 **`analytical` 的 root_pos 依赖 R**
+    (`finger_mid - R @ finger_mid_in_gripper`), 直接翻 R 会让 pos 与姿态不自洽 (最多 2×3.7cm)。
+    `svd_palm` 的 root_pos = 手掌锚点, 与 R 无关, 此处照旧返回锚点。
+
+    注: "闭合轴水平化"是绕 base 的自身 X 轴旋转, 不改变 base 位置, 因此只处理分支翻转即可。
+    """
+    j = np.asarray(joints_sapien, dtype=np.float64)
+    if method == "svd_palm":
+        return (j[3, :3] + j[5, :3]) / 2.0
+    f1 = _FINGER1_ORIGIN + _FINGER1_AXIS * float(j1)
+    f2 = _FINGER2_ORIGIN + _FINGER2_AXIS * float(j2)
+    finger_mid = (j[4, :3] + j[8, :3]) / 2.0
+    return finger_mid - np.asarray(R, dtype=np.float64) @ ((f1 + f2) / 2.0)
 
 
 # ============================================================

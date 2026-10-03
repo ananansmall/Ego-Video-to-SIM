@@ -1,0 +1,56 @@
+{
+  "where": "setup_physics_scene",
+  "before": {
+    "enable_tgs": true,
+    "enable_pcm": true,
+    "enable_ccd": false,
+    "enable_friction_every_iteration": true,
+    "enable_enhanced_determinism": false
+  },
+  "after": {
+    "enable_tgs": true,
+    "enable_pcm": true,
+    "enable_ccd": false,
+    "enable_friction_every_iteration": true,
+    "enable_enhanced_determinism": true
+  },
+  "tri_state": [
+    {
+      "field": "enable_tgs",
+      "env": "_ENGINE_TGS",
+      "requested": true,
+      "effective": true,
+      "state": "EFFECTIVE"
+    },
+    {
+      "field": "enable_pcm",
+      "env": "_ENGINE_PCM",
+      "requested": true,
+      "effective": true,
+      "state": "EFFECTIVE"
+    },
+    {
+      "field": "enable_ccd",
+      "env": "_ENGINE_CCD",
+      "requested": false,
+      "effective": false,
+      "state": "EFFECTIVE"
+    },
+    {
+      "field": "enable_friction_every_iteration",
+      "env": "_ENGINE_FRICTION_EVERY_ITER",
+      "requested": true,
+      "effective": true,
+      "state": "EFFECTIVE"
+    },
+    {
+      "field": "enable_enhanced_determinism",
+      "env": "_ENGINE_ENHANCED_DET",
+      "requested": true,
+      "effective": true,
+      "state": "EFFECTIVE"
+    }
+  ],
+  "invalid": false,
+  "note": "请求/生效/不支持三态; 未证明生效 ⇒ INVALID, 不得作物理对照结论 (f2)"
+}

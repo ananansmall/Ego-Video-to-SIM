@@ -1,0 +1,994 @@
+# Dex-Retargeting 手部→机器人映射管线
+
+## 管线总览
+
+```
+视频输入 (7.mp4)
+    │
+    ├──[RAS]──→ final_scene.glb (3D场景: 桌子、物体)
+    │              │
+    │              │ 01_align_scene.py
+    │              │ (相机轨迹→旋转/平移/缩放参数)
+    │              ▼
+    │           transform_params.npz (s_inv, R_inv, t_inv)
+    │
+    └──[HaWoR]→ hawor_results_0_113.npz (手部重建)
+                   │
+                   │ 02_render_scene.py
+                   │
+                   ▼
+              ┌──────────────────────────────────────┐
+              │  每帧处理流程:                         │
+              │                                      │
+              │  1. MANO参数 → 手部3D网格              │
+              │  2. 手部关节 → 夹爪位姿 (retargeting)  │
+              │  3. 夹爪位姿 → 臂关节角 (IK)           │
+              │  4. 平滑处理                           │
+              │  5. 设置机器人 + 渲染                   │
+              └──────────────────────────────────────┘
+                   │
+                   ▼
+              输出视频 + qpos文件
+```
+
+## 一键命令
+
+所有命令都需要先进入工作目录：
+
+```bash
+cd /home/an/robot_world_ws/src/dex-retargeting/example/combination
+```
+
+### 默认渲染（不平滑）
+
+```bash
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result
+```
+
+### 交互式 Viewer
+
+```bash
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --viewer
+```
+
+### 在线EMA平滑
+
+```bash
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --smooth 1
+```
+
+### 后处理双向滤波（最平滑）
+
+```bash
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --smooth 2
+```
+
+### 含物理仿真
+
+```bash
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --steps 1,2,3,4,5,6
+```
+
+### 命令速查表
+
+| 目的            | 命令                                                        | 说明                                                                    |
+| ------------- | --------------------------------------------------------- | --------------------------------------------------------------------- |
+| **默认渲染**      | `python 00_run_pipeline.py --hawor-dir ... --ras-dir ...` | 对齐 + 渲染 5 段视频 (默认不平滑)                                                 |
+| **在线EMA平滑**   | 加 `--smooth 1`                                            | 响应快，抖动少                                                               |
+| **后处理平滑**     | 加 `--smooth 2`                                            | 最平滑，适合最终输出                                                            |
+| **交互式Viewer** | 加 `--viewer`                                              | 对齐 → 启动 SAPIEN 交互式渲染，关闭后退出                                            |
+| **含物理仿真**     | 加 `--steps 1,2,3,4,5,6`                                   | 含碰撞+抓取                                                                |
+| **跳过对齐**      | 加 `--skip-align`                                          | 使用已有 transform\_params.npz                                            |
+| **只跑部分步骤**    | 加 `--steps 1,3`                                           | 1=对齐 2=hand\_only 3=robot\_only 4=robot\_tracking 5=topdown 6=physics |
+| **指定视频质量**    | 加 `--crf 14`                                              | 0=无损, 14=高质量(默认), 28=低质量                                              |
+
+## 各阶段详细说明
+
+### Step 0: 00\_run\_pipeline.py — 一键管线入口
+
+**功能**: 串联所有步骤，处理参数传递和错误汇总。
+
+**流程**:
+
+1. 自动查找 `hawor_dir/reconstruction/hawor_results_*.npz`
+2. 按 `--session` 参数或自动生成会话名
+3. `--viewer` 模式只运行 viewer 后退出
+4. `--smooth` 和 `--crf` 参数传递给所有子脚本
+5. 汇总所有步骤的成功/失败状态
+
+### Step 1: 01\_align\_scene.py — 坐标系对齐
+
+**目标**: 计算 RAS GLB 场景到 HaWoR 坐标系的变换参数。
+
+**核心算法**: Umeyama 尺度校正 + 第一帧相机锚定
+
+```
+s_inv = sigma_hawor / sigma_ras    # 尺度因子
+R_inv = R_hawor @ R_ras_opengl.T   # 旋转矩阵
+t_inv = t_hawor - R_inv @ (s_inv * t_ras)  # 平移向量
+```
+
+**输出**: `transform_params.npz` (s\_inv, R\_inv, t\_inv)
+
+### Step 2: 02\_render\_scene.py — 场景渲染
+
+三种模式:
+
+- `hand_only`: MANO手 + GLB物体 (验证对齐)
+- `robot_only`: R1机器人 + GLB物体 (机器人替代人手)
+- `robot_tracking`: MANO手 + R1机器人 + GLB物体 (对比)
+
+#### 2.1 数据加载
+
+**HaWoR 手部数据** (`load_hawor_data()`):
+
+- `pred_trans` (N, 3): 手腕世界坐标平移
+- `pred_rot` (N, 3): 手腕世界坐标轴角旋转
+- `pred_hand_pose` (N, 45): 15个手指关节的轴角旋转
+- `pred_betas` (N, 10): MANO 形状参数
+- `pred_valid` (N,): 有效帧标记
+- `img_focal`: 焦距 (用于计算相机 FOV)
+
+**手部自动检测** (`_detect_hand_idx()`): 扫描 `cam_space/` 子目录自动选择
+
+#### 2.2 MANO 手部网格生成
+
+每帧从 HaWoR 参数生成 MANO 手部网格，然后从 Render World (Y-UP) 转到 SAPIEN (Z-UP)。
+
+#### 2.3 GLB 场景加载
+
+`load_glb_transformed()` 将 RAS GLB 场景变换到 SAPIEN 坐标系:
+
+```
+p_hawor  = s_inv * R_inv @ p_glb + t_inv    # GLB → HaWoR
+p_sapien = RXWORLD_TO_SAPIEN @ p_hawor       # HaWoR → SAPIEN
+```
+
+#### 2.4 相机设置
+
+有 HaWoR 相机轨迹时使用第一人称视角，否则固定第三人称视角。
+
+#### 2.5 机器人映射链（核心！）
+
+```
+人手关节 → Dex Retargeting → 夹爪位姿 → RelaxedIK → 臂关节角
+```
+
+**第1步: Dex Retargeting** — 3个约束点 (拇指尖\[4]、食指尖\[8]、手腕\[0]) 位置重定向
+
+**第2步: Warm Start** — 用手腕朝向初始化 retargeting 优化器
+
+**第3步: FK 提取夹爪位姿** — 从 retargeting 输出提取精确位姿
+
+**第4步: RelaxedIK** — 夹爪位姿→臂关节角，每帧迭代20次
+
+**Warmup 阶段**: 前30帧 smoothstep 插值从初始姿态过渡到第一帧IK解
+
+**平滑模式**:
+
+| 模式           | 方法                      | 效果            |
+| ------------ | ----------------------- | ------------- |
+| `--smooth 0` | 无平滑                     | 最忠实原始数据，但可能抖动 |
+| `--smooth 1` | EMA(α=0.6) + LPF(α=0.5) | 响应快，抖动少       |
+| `--smooth 2` | 后处理双向滤波                 | 最平滑，有额外计算开销   |
+
+#### 2.6 底座位置确定与跟踪
+
+底座位置根据手腕轨迹质心确定:
+
+```
+base_pos = centroid + [0, 0, 0.35]    # 质心正上方0.35m
+base_quat = quaternion_from_axis_angle([0, 0, 1, π])  # 绕Z轴180°
+```
+
+每帧底座±4cm微调跟踪手腕位置。
+
+#### 2.7 渲染流程
+
+1. 预计算所有帧的 qpos 序列 (含 warmup)
+2. 逐帧渲染
+3. 可选后处理平滑 (smooth=2)
+4. ffmpeg 重编码为 H.264 (CRF=14, 60fps)
+
+#### 2.8 模块架构总览
+
+整个脚本的核心是一个 `HandObjectRenderer` 类，它封装了所有渲染逻辑。下面从**数据流**的角度逐模块讲解：
+
+```
+输入文件
+  ├── hawor_dir/reconstruction/hawor_results_*.npz  ← HaWoR手部重建
+  ├── ras_dir/final_scene.glb                        ← RAS场景重建
+  └── transform_params.npz                           ← 01对齐结果
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│  HandObjectRenderer.__init__()                      │
+│  解析参数，设置日志，确定会话路径                      │
+└──────────────────────┬──────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  run_hand_only  run_robot_only  run_robot_tracking
+   (模式1)        (模式2)         (模式3)
+        │              │              │
+        └──────────────┴──────────────┘
+                       │
+                       ▼
+              共享核心流程 (5步)
+```
+
+**三种模式的区别**：
+
+| 模式               | MANO手 | R1机器人 | GLB物体 | 用途      |
+| ---------------- | ----- | ----- | ----- | ------- |
+| `hand_only`      | ✅     | ❌     | ✅     | 验证手-物对齐 |
+| `robot_only`     | ❌     | ✅     | ✅     | 机器人替代人手 |
+| `robot_tracking` | ✅     | ✅     | ✅     | 手+机器人对比 |
+
+**共享核心流程** (5步)：
+
+```
+[1/5] 加载数据
+  │  ├── load_hawor_data()     → 手部MANO参数 + 相机轨迹
+  │  ├── load_hawor_c2w()      → camera-to-world矩阵
+  │  └── _detect_hand_idx()    → 自动检测左/右手
+  │
+  ▼
+[2/5] 创建SAPIEN场景 + 加载GLB
+  │  ├── setup_scene()         → 灯光、环境贴图
+  │  ├── load_glb_transformed()→ GLB物体变换到SAPIEN坐标系
+  │  └── (robot_only/tracking) → 加载R1机器人URDF
+  │
+  ▼
+[3/5] (仅robot模式) 初始化映射链
+  │  ├── 初始化DexRetargeting  → 手部→夹爪重定向
+  │  ├── warm_start()          → 用手腕朝向初始化retargeting
+  │  ├── 初始化RelaxedIK       → 夹爪位姿→臂关节角
+  │  ├── _compute_optimal_fixed_base() → 计算底座最优位置
+  │  └── 初始化平滑器          → EmaTargetSmoother / LPFilter
+  │
+  ▼
+[4/5] 逐帧渲染循环
+  │  ├── 计算MANO手部网格       → mano_layer(pose, trans)
+  │  ├── (robot模式) 映射链求解  → retargeting → FK → IK
+  │  ├── (robot模式) 底座跟踪   → _compute_tracking_base_pos()
+  │  ├── (robot模式) 平滑处理   → EMA / LPFilter
+  │  ├── 设置相机位姿           → FPV / topdown / third_person
+  │  ├── 更新SAPIEN场景         → set_qpos / set_pose
+  │  └── 渲染 + 写入视频        → take_picture + ffmpeg
+  │
+  ▼
+[5/5] 后处理
+     ├── (smooth=2) 后处理平滑   → TrajectorySmoother
+     ├── ffmpeg重编码            → H.264 CRF=14
+     └── 保存qpos               → .npy文件
+```
+
+**关键类和函数索引**:
+
+| 名称                                     | 作用                   |
+| -------------------------------------- | -------------------- |
+| `HandObjectRenderer`                   | 封装所有渲染逻辑             |
+| `load_hawor_data()`                    | 加载HaWoR手部重建数据        |
+| `load_hawor_c2w()`                     | 加载camera-to-world轨迹  |
+| `setup_scene()`                        | 创建SAPIEN场景+灯光        |
+| `load_glb_transformed()`               | GLB场景加载+坐标变换         |
+| `_detect_hand_idx()`                   | 自动检测左/右手             |
+| `_compute_optimal_fixed_base()`        | 根据手腕质心计算底座位置         |
+| `_compute_tracking_base_pos()`         | 每帧底座±4cm跟踪           |
+| `_get_gripper_pose_from_retargeting()` | 从retargeting输出提取夹爪位姿 |
+| `EmaTargetSmoother`                    | IK目标位置/朝向EMA平滑       |
+| `LPFilter`                             | 关节角低通滤波              |
+| `TrajectorySmoother`                   | 后处理双向滤波+限幅           |
+
+**数据流详解：从视频到机器人动作**：
+
+```
+原始视频 (7.mp4)
+    │
+    ├──[RAS]──→ final_scene.glb (3D场景: 桌子、物体)
+    │              │
+    │              │ 01_align_scene.py
+    │              │ (相机轨迹→旋转/平移/缩放参数)
+    │              ▼
+    │           transform_params.npz (s_inv, R_inv, t_inv)
+    │
+    └──[HaWoR]→ hawor_results_0_113.npz (手部重建)
+                   │
+                   │ 02_render_scene.py
+                   │
+                   ▼
+              ┌──────────────────────────────────────┐
+              │  每帧处理流程:                         │
+              │                                      │
+              │  1. MANO参数 → 手部3D网格              │
+              │     pred_rot + pred_hand_pose + pred_trans
+              │          ↓                            │
+              │     mano_layer() → vertices (778,3)   │
+              │          ↓                            │
+              │     RXWORLD_TO_SAPIEN → SAPIEN坐标    │
+              │                                      │
+              │  2. 手部关节 → 夹爪位姿 (retargeting)  │
+              │     joints[0,4,8] (手腕/拇指/食指)     │
+              │          ↓                            │
+              │     SeqRetargeting.retarget()          │
+              │          ↓                            │
+              │     retarget_qpos (8维: 6dummy+1grip) │
+              │          ↓                            │
+              │     FK → gripper_pos, gripper_quat    │
+              │                                      │
+              │  3. 夹爪位姿 → 臂关节角 (IK)           │
+              │     base_link坐标系变换                 │
+              │          ↓                            │
+              │     RelaxedIK.solve() × 20次          │
+              │          ↓                            │
+              │     arm_joints (6维)                  │
+              │                                      │
+              │  4. 平滑处理                           │
+              │     smooth=0: 直通                     │
+              │     smooth=1: EMA(α=0.6) + LPF(α=0.5)│
+              │     smooth=2: 后处理双向滤波            │
+              │                                      │
+              │  5. 设置机器人 + 渲染                   │
+              │     robot.set_qpos(arm+gripper)       │
+              │     camera.take_picture()             │
+              └──────────────────────────────────────┘
+                   │
+                   ▼
+              输出视频 (hand_object_robot_only.mp4)
+              + qpos文件 (hand_object_robot_only.npy)
+```
+
+**坐标系变换链**:
+
+```
+RAS坐标系          HaWoR坐标系         SAPIEN坐标系        base_link坐标系
+(GLB场景)          (手部重建)          (渲染)              (IK求解)
+  X=右              X=右               X=右                X=臂前方
+  Y=上              Y=上               Y=前                Y=臂侧方
+  Z=后              Z=后(OpenGL)       Z=上                Z=臂上方
+                    (或Y=下,SLAM)
+
+变换1: RAS → HaWoR
+  p_hawor = s_inv * R_inv @ p_glb + t_inv
+  (用01_align_scene.py算出的参数)
+
+变换2: HaWoR → SAPIEN
+  p_sapien = RXWORLD_TO_SAPIEN @ p_hawor
+  RXWORLD_TO_SAPIEN = [[1,0,0],[0,0,1],[0,-1,0]] @ [[1,0,0],[0,-1,0],[0,0,-1]]
+
+变换3: SAPIEN → base_link
+  p_base = base_R.T @ (p_sapien - base_pos)
+  (底座位置和朝向每帧可能微调)
+```
+
+**重要常量**:
+
+| 常量                       | 值                               | 含义               |
+| ------------------------ | ------------------------------- | ---------------- |
+| `RIGHT_ARM_STARTING`     | \[0, -1.57, 1.57, 0, 1.57, 0]   | 臂初始关节角（向下伸展姿态）   |
+| `WARMUP_FRAMES`          | 30                              | 热身过渡帧数           |
+| `IK_SOLVE_PER_FRAME`     | 20                              | 每帧IK迭代次数         |
+| `ARM_MAX_REACH`          | 0.713m                          | 臂展最大距离           |
+| `COMFORTABLE_REACH`      | 0.35m                           | 舒适工作距离           |
+| `COMFORT_TARGET_IN_BASE` | \[0.30, 0.0, -0.30]             | base\_link下舒适目标点 |
+| `BASE_TRACKING_RANGE`    | 0.04m                           | 底座跟踪范围           |
+| `SAFETY_DISTANCE`        | 0.05m                           | 安全距离（未使用）        |
+| `RXWORLD_TO_SAPIEN`      | 3×3矩阵                           | HaWoR→SAPIEN坐标变换 |
+| `OPENCV_TO_OPENGL`       | \[\[1,0,0],\[0,-1,0],\[0,0,-1]] | 相机约定变换           |
+
+## 深入理解：数据结构与核心概念
+
+### HaWoR 输出数据详解
+
+```
+hawor_dir/
+├── reconstruction/
+│   └── hawor_results_0_113.npz    ← 核心！管线唯一必需的文件
+├── cam_space/
+│   └── 0/
+│       └── 0_112.json              ← 相机空间下的手部数据（管线未使用）
+├── world_space_res.pth             ← 旧格式（管线未使用）
+├── est_focal.txt                   ← 估计焦距（备用）
+├── SLAM/                           ← SLAM 中间结果
+└── vis_*/                          ← 各种可视化
+```
+
+#### hawor\_results\_0\_113.npz（核心文件）
+
+| 字段                      | 形状         | 含义                                       |
+| ----------------------- | ---------- | ---------------------------------------- |
+| `pred_trans`            | (2, N, 3)  | 两只手的世界坐标平移（SLAM World, Y-down）           |
+| `pred_rot`              | (2, N, 3)  | 两只手的世界坐标轴角旋转                             |
+| `pred_hand_pose`        | (2, N, 45) | 15个手指关节的轴角旋转 (15×3=45)                   |
+| `pred_betas`            | (2, N, 10) | MANO 形状参数                                |
+| `pred_valid`            | (2, N)     | 有效帧标记（手不在画面中时为False）                     |
+| `R_c2w`                 | (N, 3, 3)  | camera-to-world 旋转矩阵（Render World, Y-UP） |
+| `t_c2w`                 | (N, 3)     | camera-to-world 平移向量                     |
+| `img_focal`             | 标量         | 相机焦距（像素）                                 |
+| `start_idx` / `end_idx` | 标量         | 有效帧范围                                    |
+
+**第一维=2 的含义**：索引0=左手，索引1=右手。`hand_idx` 参数选择用哪只手。
+
+#### cam\_space（相机空间数据）
+
+`cam_space/0/0_112.json` 包含手部在**相机坐标系**下的3D数据（关节、顶点、相机平移等）。这是 HaWoR 的中间输出，用于可视化验证。
+
+**管线不使用 cam\_space**，因为 `reconstruction/hawor_results_*.npz` 已经包含了世界坐标系下的数据，比相机空间数据更直接。
+
+#### world\_space\_res.pth（旧格式）
+
+这是 HaWoR 早期版本的输出格式。管线代码有兼容逻辑，但**不推荐使用**，因为：
+
+1. 旧格式不含相机轨迹（`R_c2w` / `t_c2w`），无法做第一人称渲染
+2. 旧格式不含焦距（`img_focal`），无法精确计算 FOV
+3. 加载方式（`joblib.load`）比 `np.load` 更慢且不安全
+
+**优先级**：`reconstruction/hawor_results_*.npz` > `world_space_res.pth`
+
+#### 为什么 laptop 数据不能用？
+
+laptop 目录的 `hawor_results_0_600.npz` 中 `pred_trans` 有 46.6% 是 NaN：
+
+```
+pred_trans: shape=(2, 600, 3), NaN=1677/3600 (46.6%)
+pred_betas: shape=(2, 600, 10), NaN=5590/12000 (46.6%)
+```
+
+**NaN 的原因**：HaWoR 在手不在画面中时（`pred_valid=False`），对应帧的 `pred_trans` 和 `pred_betas` 设为 NaN。laptop 视频中手经常不在画面中，导致大量 NaN。
+
+**为什么 7 的数据能用**：`pred_valid[0].sum() = 113/113`，左手全程在画面中，没有 NaN。
+
+### 焦距有什么用？
+
+`img_focal` 是相机焦距（单位：像素），它决定了**渲染视角的宽窄**：
+
+```
+焦距大 (如 1056px) → FOV 小 → 画面窄（望远镜效果）
+焦距小 (如 400px)  → FOV 大 → 画面宽（广角效果）
+
+FOV = 2 × arctan(图像高度/2 / 焦距)
+```
+
+**在管线中的用途**：
+
+1. **计算渲染 FOV**：让 SAPIEN 虚拟相机的视角和真实拍摄视频时一致
+2. **2D 重投影验证**：把 3D 手部关节投影回 2D 图像，验证对齐精度
+
+**如果焦距缺失**：代码会从 `est_focal.txt` 读取备用值，或使用默认值 600px。
+
+### RAS 的相机外参 vs 相机轨迹
+
+**RAS 只输出离散帧的相机外参，不是完整的相机轨迹。**
+
+| 维度  | RAS 外参                | HaWoR 相机轨迹            |
+| --- | --------------------- | --------------------- |
+| 帧数  | 20帧（关键帧）              | 全部帧（113帧）             |
+| 格式  | world-to-camera (4×4) | camera-to-world (R+t) |
+| 坐标系 | OpenCV (Z=forward)    | OpenGL (Z=backward)   |
+| 尺度  | 相对尺度（无米制）             | 米制尺度（SLAM）            |
+
+**RAS 外参在管线中的用途**：`01_align_scene.py` 读取 RAS 的第一帧外参，和 HaWoR 的第一帧相机位姿对齐，计算坐标系变换参数。
+
+**为什么 RAS 不需要完整轨迹？** RAS 用 VGGT 做3D重建，只需要少量关键帧的外参来建立场景坐标系。
+
+### 尺度校正 s\_inv = sigma\_hawor / sigma\_ras 到底在干什么？
+
+**问题**：RAS 和 HaWoR 用的"尺子"不一样长。
+
+```
+同一个物理桌子:
+  RAS 说: 桌子宽 1.5 (RAS单位)
+  HaWoR 说: 桌子宽 0.5 米
+
+  → RAS的1个单位 ≠ 1米
+  → 需要知道 RAS单位 和 米 之间的换算比例
+```
+
+**怎么算换算比例？** 用相机轨迹的"运动范围"来估算：
+
+```
+同一个相机移动了同样的物理距离:
+  RAS 测量: 相机移动了 sigma_ras = 0.15 (RAS单位的标准差)
+  HaWoR 测量: 相机移动了 sigma_hawor = 0.05 米
+
+  → RAS的1单位 = sigma_hawor / sigma_ras 米 = 0.05/0.15 ≈ 0.33 米
+  → s_inv = 0.33 (RAS→HaWoR的缩放因子)
+```
+
+**为什么用标准差而不是最大距离？** 标准差对异常值更鲁棒。相机轨迹中可能有几帧漂移很远的点，用最大距离会被这些异常值影响，用标准差更稳定。
+
+**对齐公式**：
+
+```
+p_hawor = s_inv × R_inv × p_glb + t_inv
+```
+
+如果不做缩放（`s_inv=1`），桌子可能大三倍或小两倍，手和物体就对不上。
+
+### Dex Retargeting 对正反手的处理
+
+**当前实现的问题**：代码中**无论检测到左手还是右手，retargeting 都使用** **`HandType.right`**（右手配置）：
+
+```python
+config_path = get_default_config_path(RobotName.r1_full, RetargetingType.position, HandType.right)
+```
+
+**为什么？** R1 机器人只有右臂，所以无论人用哪只手操作，都映射到机器人的右臂。
+
+**但 MANO 层是区分左右的**：
+
+```python
+mano_side = "left" if self.hand_idx == 0 else "right"
+mano_layer = MANOLayer(mano_side, betas_mean)
+```
+
+**正反手问题**：当人用左手操作时，MANO 输出的手部关节是左手坐标系，但 retargeting 期望右手坐标系。左手和右手的关节定义是镜像的（比如拇指方向不同），直接映射可能导致：
+
+- 夹爪朝向翻转（反手）
+- 手指弯曲方向错误
+
+**warm\_start 的改进**：代码用 `warm_start()` 函数解析计算初始朝向，传入 `hand_type=HandType.right` 和 `is_mano_convention=True`，让优化器知道输入是 MANO 约定的关节。这在一定程度上缓解了正反手问题，但没有从根本上解决左手→右臂的镜像映射。
+
+**可能的改进方向**：
+
+- 检测到左手时，对手腕旋转做镜像变换
+- 或使用左手 URDF 配置做 retargeting，再映射到右臂
+
+### 底座位置确定：质心+0.35m 的问题和改进方向
+
+#### 当前方法
+
+```
+base_pos = centroid + [0, 0, 0.35]
+base_quat = quaternion_from_axis_angle([0, 0, 1, π])  # 绕Z轴旋转180°
+```
+
+**为什么是质心正上方0.35m？** R1 机器人是倒挂安装的（底座在天花板上，臂向下伸展）。0.35m 约等于臂展（0.713m）的一半，是最舒适的抓取距离。
+
+**为什么绕Z轴180°？** R1 的 URDF 中，base\_link 的 X 轴指向臂的"背后"。绕 Z 轴旋转 180° 让 X 轴翻转，臂就面朝操作区域。
+
+#### 当前方法的问题
+
+1. **质心不代表最优位置**：手腕轨迹可能偏一侧，质心在轨迹中间，但最远的手腕位置可能超出臂的可达范围。
+2. **0.35m 是固定值**：不同操作场景的最优高度不同。比如桌面操作需要臂低一些（0.25m），高处操作需要臂高一些（0.45m）。
+3. **没有用 IK 验证**：底座位置确定后，只检查了"最远手腕距离 < 臂展×0.9"，但没有实际运行 IK 验证每个手腕位置是否都能到达。有些位置虽然距离在臂展内，但因为关节限位或奇异点，IK 可能无解。
+
+#### 改进方向
+
+**方法1：IK 可达性验证**
+
+```python
+# 伪代码
+for candidate_base_pos in search_grid:
+    ik_success_count = 0
+    for wrist_pos in wrist_positions:
+        ik_target = base_R.T @ (wrist_pos - candidate_base_pos)
+        ik_solution = relaxed_ik.solve(ik_target, ee_quat)
+        if ik_solution is not None:
+            ik_success_count += 1
+    if ik_success_count == len(wrist_positions):
+        return candidate_base_pos  # 所有手腕位置都可达
+```
+
+**优点**：确保每个手腕位置都有 IK 解
+**缺点**：计算量大
+
+**方法2：基于 COMFORT\_TARGET 的优化**
+
+让手腕质心恰好落在 COMFORT\_TARGET\_IN\_BASE：
+
+```python
+# centroid = base_pos + base_R @ COMFORT_TARGET_IN_BASE
+# 所以: base_pos = centroid - base_R @ COMFORT_TARGET_IN_BASE
+```
+
+**方法3：底座朝向优化**
+
+计算手腕轨迹的主方向，让臂的X轴对准主方向：
+
+```python
+wrist_pca = PCA(n_components=1).fit(wrist_positions)
+main_direction = wrist_pca.components_[0]
+base_yaw = atan2(main_direction[1], main_direction[0])
+base_quat = quaternion_from_axis_angle([0, 0, 1, base_yaw + π])
+```
+
+#### COMFORT\_TARGET 对底座的影响
+
+`COMFORT_TARGET_IN_BASE` 不直接影响底座位置的计算，但影响**底座跟踪**：
+
+```
+底座跟踪逻辑:
+  1. 计算手腕在 base_link 坐标系中的位置
+  2. 与 COMFORT_TARGET_IN_BASE 的偏移
+  3. 限制偏移范围 ±4cm
+  4. 底座沿偏移方向微调
+
+COMFORT_TARGET = [0.30, 0.0, -0.30] 的含义:
+  → 臂最舒服时，手腕在底座前方30cm、正中、下方30cm
+  → 如果手腕偏离了这个位置，底座就微调让手腕回到舒适区域
+```
+
+#### 底座需要旋转吗？
+
+是的，**必须旋转180°**。原因：
+
+1. R1 URDF 中 base\_link 的 X 轴指向臂的"背后"（远离操作区域）
+2. 不旋转的话，臂会背对操作区域
+3. 绕 Z 轴旋转 180° 后，X 轴翻转，臂面朝操作区域
+
+## 渲染模式
+
+| 模式                              | 内容                       | 用途        |
+| ------------------------------- | ------------------------ | --------- |
+| `hand_only`                     | MANO 手 + GLB 物体          | 验证手-物对齐   |
+| `robot_only`                    | R1 机械臂 + GLB 物体          | 机器人替代人手操作 |
+| `robot_tracking`                | MANO 手 + R1 机械臂 + GLB 物体 | 对比手部与机器人  |
+| `robot_only` + `--view topdown` | R1 机械臂 + GLB 物体 (顶部俯瞰)   | 观察整体运动轨迹  |
+| `physics_tracking`              | 物理仿真 + GLB 物体            | 真实碰撞和抓取   |
+| `--viewer`                      | 交互式: 手 + GLB + 机器人       | 实时调试      |
+
+## 关键参数
+
+| 参数            | 默认值   | 说明                              |
+| ------------- | ----- | ------------------------------- |
+| `--hawor-dir` | 必需    | HaWoR 重建目录                      |
+| `--ras-dir`   | 必需    | RAS 重建目录                        |
+| `--fps`       | 60    | 视频帧率                            |
+| `--smooth`    | 0     | 平滑模式 (0=不平滑, 1=在线EMA, 2=后处理)    |
+| `--crf`       | 14    | 视频质量 (0=无损, 14=高质量, 28=低质量)     |
+| `--view`      | fpv   | 相机视角 (fpv/topdown/behind/front) |
+| `--hand-idx`  | -1    | 手索引 (0=左手, 1=右手, -1=自动检测)       |
+| `--viewer`    | False | 交互式 Viewer                      |
+
+## 已知问题
+
+### 1. 尺度校正不精确
+
+Umeyama 方法假设两个系统的相机轨迹形状相似、只有尺度不同。但 DROID-SLAM 和 VGGT 的轨迹估计存在漂移和噪声，导致尺度比不精确。
+
+**缓解**: `--force-scale` 参数可手动指定尺度因子
+
+### 2. 旋转矩阵变换方式不一致 (⚠️ 导致反手问题)
+
+代码中手腕旋转从 HaWoR 到 SAPIEN 的变换存在两种方式：
+
+- **相似变换** `M @ R @ M.T` — 正确的坐标系旋转变换
+- **简单左乘** `M @ R` — 仅变换方向向量列，不是合法的旋转变换
+
+简单左乘会导致 retargeting 优化器的初始手腕朝向错误，产生**反手**现象。
+
+### 3. 夹爪开合受限 (⚠️ 待修复)
+
+**现象**: 夹爪关节值范围极小 (0\~0.037)，视觉上几乎不可见张开/闭合
+
+**原因**:
+
+1. URDF 关节限位 `[0, 0.05]`，但 warmup 设 `gripper_idx2=-0.04` 被自动 clamp
+2. Retargeting 只用 3 个约束点，对夹爪驱动信号弱
+3. 两个手指应该对称运动（一正一负），但 retargeting 输出两个都是正值
+
+**涉及文件**: `02_render_scene.py`, `04_physics_simulation.py`, URDF
+
+### 4. 帧率不匹配
+
+HaWoR 输出的帧数可能和 RAS 不同。HaWoR 处理全部帧，RAS 只处理关键帧。管线以 HaWoR 的帧数为基准。
+
+### 5. GLB 场景图变换重复应用 (已修复)
+
+之前代码中 `load_glb_transformed()` 尝试应用 GLB 场景图变换，但 `trimesh.load()` 已经自动烘焙了这些变换，导致重复应用。已删除 `geom_to_nodes` 相关代码。
+
+### 6. 底座位置仅用质心+固定偏移
+
+当前 `base_pos = centroid + [0, 0, 0.35]` 是启发式方法，没有用 IK 验证可达性。可能导致某些手腕位置 IK 无解。详见"底座位置确定"章节。
+
+### 7. laptop 数据 NaN 问题
+
+laptop 目录的 HaWoR 结果中 `pred_trans` 有 46.6% NaN（手经常不在画面中）。需要确保有效帧足够多且连续才能使用。
+
+## 输出目录结构
+
+```
+output/{session}/
+├── alignment/
+│   └── transform_params.npz          ← 对齐参数
+├── tracking/
+│   ├── hand_object_hand_only.npy     ← hand_only qpos
+│   ├── hand_object_robot_only.npy    ← robot_only qpos
+│   └── hand_object_robot_tracking.npy
+├── videos/
+│   ├── hand_object_hand_only.mp4
+│   ├── hand_object_robot_only.mp4
+│   ├── hand_object_robot_tracking.mp4
+│   └── hand_object_robot_only_topdown.mp4
+└── pipeline.log                       ← 管线运行日志
+```
+
+***
+
+### Step 3: 03\_track\_robot.py — 独立机器人跟踪
+
+**功能**: 仅使用 HaWoR 手部数据驱动 R1 机器人，不需要 RAS 场景重建，适合快速验证手部→机器人映射。
+
+**为什么需要这个脚本**:
+
+- `02_render_scene.py` 的三种模式都需要 RAS GLB 场景和第一人称相机轨迹，运行前必须先完成 `01_align_scene.py` 对齐
+- 当只需要验证"手部动作能否正确映射到机器人"时，加载 GLB 场景和对齐是多余的开销
+- `03_track_robot.py` 只需 HaWoR 数据即可独立运行，省去了场景加载和对齐步骤
+
+**模块依赖**: 脚本通过 `sys.path` 动态添加 `position_retargeting` 目录来导入 `RobotHandDatasetSAPIENViewer` 和 `MANOLayer`：
+
+```python
+POSITION_RETARGETING_DIR = Path(__file__).resolve().parent.parent / "position_retargeting"
+sys.path.insert(0, str(POSITION_RETARGETING_DIR))
+from hand_robot_viewer import RobotHandDatasetSAPIENViewer
+from mano_layer import MANOLayer
+```
+
+**与 02\_render\_scene.py --mode robot\_only 的区别**:
+
+| 对比项                 | 02 --mode robot\_only | 03\_track\_robot.py         |
+| ------------------- | --------------------- | --------------------------- |
+| RAS GLB 场景          | 需要                    | **不需要**                     |
+| 01\_align\_scene.py | 需要先运行                 | **不需要**                     |
+| 第一人称相机轨迹            | 需要 (HaWoR c2w)        | **不需要** (固定第三人称视角)          |
+| 观察视角                | 第一人称 (跟随视频视角)         | 第三人称 (behind/front/topdown) |
+| 场景物体                | 有 GLB 物体              | 无 (只有机器人)                   |
+| 用途                  | 完整渲染管线的一环             | **快速验证映射正确性**               |
+
+**数据流**:
+
+```
+HaWoR 手部重建 (.npz)
+    → MANOLayer (MANO 参数 → 21 关节点)
+    → Dex Retargeting (手部关节 → 夹爪关节角)
+    → Retargeting 内部 FK (获取 gripper 位置/朝向)
+    → mapping_offset (映射到臂舒适工作空间)
+    → RelaxedIK (臂逆运动学) → qpos
+    → TrajectorySmoother (双向低通 + 速度/加速度/jerk 钳制)
+    → SAPIEN 渲染 → 视频
+```
+
+**关键特性**:
+
+1. **自动坐标检测**: 通过分析手部坐标的 Z 轴范围和绝对值，自动判断是相机坐标系 (Z=深度) 还是 Z-UP 坐标系，选择合适的变换矩阵
+2. **浮动臂加载**: 使用 `prepare_arm_urdf` + `loader.load` 加载浮动臂 URDF (只有单臂, 无机器人身体)，与 02_render_scene.py 一致
+3. **基座跟踪**: 使用 `_compute_optimal_fixed_base` 计算基座位置，`_compute_tracking_base_pos` 让基座小范围跟踪夹爪 (±4cm)
+4. **热身过渡**: 30帧 smoothstep 插值从初始关节角过渡到第一帧 IK 目标
+5. **多种视角**: `--view behind/front/topdown` 切换观察角度
+
+**使用**:
+
+```bash
+# 基本用法 (第三人称后方视角)
+conda run -n dex python 03_track_robot.py \
+    --hawor_dir /home/an/data/hawor/7
+
+# 顶部俯瞰视角
+conda run -n dex python 03_track_robot.py \
+    --hawor_dir /home/an/data/hawor/7 \
+    --view topdown
+
+# 交互式 Viewer
+conda run -n dex python 03_track_robot.py \
+    --hawor_dir /home/an/data/hawor/7 \
+    --viewer
+```
+
+***
+
+### Step 4: 04\_physics\_simulation.py — 物理仿真
+
+**功能**: 在 SAPIEN 物理引擎中模拟 R1 机器人的抓取操作，考虑碰撞、摩擦和重力。
+
+**与 02 的核心区别**:
+
+| 对比项  | 02\_render\_scene.py | 04\_physics\_simulation.py |
+| ---- | -------------------- | -------------------------- |
+| 运动方式 | **运动学** (直接设置 qpos)  | **动力学** (PD 控制器驱动)         |
+| 碰撞   | 无 (物体穿透)             | 有 (SAPIEN 物理引擎)            |
+| 抓取   | 无 (夹爪视觉闭合)           | 有 (摩擦力抓取)                  |
+| 重力   | 无 (物体悬浮)             | 有 (物体下落)                   |
+| 实时性  | 预计算 qpos → 渲染        | 每步仿真 → 检测碰撞 → 更新           |
+
+**物理仿真流程**:
+
+```
+1. 加载场景 (与02相同的GLB+对齐流程)
+2. 为GLB物体添加碰撞体 (简化mesh或box)
+3. 初始化PD控制器参数
+4. 逐帧仿真:
+   a. 从02的qpos文件读取目标关节角
+   b. PD控制器计算关节力矩: τ = Kp × (q_target - q_current) - Kd × q_dot
+   c. 物理引擎步进: 考虑重力、碰撞、摩擦
+   d. 检测夹爪-物体接触力
+   e. 渲染当前状态
+5. 输出物理仿真视频
+```
+
+**PD 控制器参数**:
+
+| 参数        | 值   | 含义      |
+| --------- | --- | ------- |
+| `Kp` (臂)  | 200 | 臂关节比例增益 |
+| `Kd` (臂)  | 20  | 臂关节微分增益 |
+| `Kp` (夹爪) | 50  | 夹爪比例增益  |
+| `Kd` (夹爪) | 5   | 夹爪微分增益  |
+
+**碰撞体简化** (`--fast-collision`):
+
+- 默认: 用原始 GLB mesh 作为碰撞体（精确但慢）
+- `--fast-collision`: 用 AABB 包围盒作为碰撞体（快速但粗糙）
+
+**使用**:
+
+```bash
+# 物理仿真 (需要先运行02生成qpos文件)
+conda run -n dex python 04_physics_simulation.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --transform-params output/7_my_7mp4_result/alignment/transform_params.npz \
+    --fast-collision
+
+# 通过00_run_pipeline.py运行
+conda run -n dex python 00_run_pipeline.py \
+    --hawor-dir /home/an/data/hawor/7 \
+    --ras-dir /home/an/data/ras/my_7mp4_result \
+    --steps 1,2,3,4,5,6
+```
+
+***
+
+## Viewer 中显示内容
+
+| 模式               | MANO 手部网格 | MANO 骨架 | 关键点 | R1 机器人 | GLB 物体 |
+| ---------------- | --------- | ------- | --- | ------ | ------ |
+| `hand_only`      | ✅         | ✅       | ✅   | ❌      | ✅      |
+| `robot_only`     | ❌         | ❌       | ❌   | ✅      | ✅      |
+| `robot_tracking` | ✅         | ✅       | ✅   | ✅      | ✅      |
+| `--viewer`       | ✅         | ✅       | ✅   | ✅      | ✅      |
+
+**手部显示**:
+
+- **MANO 网格**: 778个顶点的手部表面，皮肤色材质 (0.96, 0.75, 0.69)
+- **MANO 骨架**: 21个关节点的线段连接，红色
+- **关键点**: 拇指尖\[4]、食指尖\[8]、手腕\[0] 的球体标记，绿色
+
+**机器人显示**:
+
+- R1 右臂 (6 DOF + 2 夹爪关节)
+- 夹爪初始状态: 打开 (0.04, -0.04)
+
+***
+
+## 坐标系统合并存在的问题
+
+### 问题1: SLAM World vs Render World
+
+HaWoR 内部使用两个坐标系：
+
+| 坐标系          | Y轴     | 用途      | 数据字段                     |
+| ------------ | ------ | ------- | ------------------------ |
+| SLAM World   | Y-down | 手部位置/旋转 | `pred_trans`, `pred_rot` |
+| Render World | Y-up   | 相机轨迹    | `R_c2w`, `t_c2w`         |
+
+**变换关系**: `R_x = diag(1, -1, -1)` — SLAM World 绕 X 轴旋转 180° 得到 Render World
+
+代码中的 `RXWORLD_TO_SAPIEN` 实际上是两步变换的复合：
+
+```python
+R_AXIS = np.array([[1,0,0],[0,0,1],[0,-1,0]])  # Y-up → Z-up
+R_x    = np.array([[1,0,0],[0,-1,0],[0,0,-1]])  # SLAM ↔ Render
+RXWORLD_TO_SAPIEN = R_AXIS @ R_x
+```
+
+### 问题2: 旋转矩阵变换方式不一致
+
+手腕旋转从 HaWoR 到 SAPIEN 有两种变换方式，代码中混用了：
+
+| 方式     | 公式            | 适用场景           | 当前使用   |
+| ------ | ------------- | -------------- | ------ |
+| 相似变换   | `M @ R @ M.T` | 旋转操作在坐标系间的等价变换 | ❌ 不应使用 |
+| 方向向量变换 | `M @ R`       | 朝向矩阵的坐标系转换     | ✅ 当前使用 |
+
+**为什么不能混用？**
+
+相似变换 `M @ R @ M.T` 适用于"同一个旋转操作在不同坐标系中的表示"。例如，绕 Y 轴旋转 90° 在 Y-up 和 Z-up 坐标系中的矩阵不同，用相似变换可以转换。
+
+但手腕旋转矩阵 `R` 描述的是"手腕朝向"，不是"旋转操作"。`R` 的列向量是手腕坐标系的三个轴在世界坐标系中的方向。要把这些方向向量从 HaWoR 坐标系转到 SAPIEN 坐标系，只需要左乘 `M`，不需要相似变换。
+
+**错误使用相似变换的后果**:
+
+```
+正确: M @ R → 手腕朝向正确
+错误: M @ R @ M.T → 手腕朝向偏差，导致:
+  - warm_start 初始化错误
+  - retargeting 优化器收敛到错误的局部最优
+  - 夹爪反手（朝向翻转180°）
+  - 错误通过 last_qpos 传播到所有后续帧
+```
+
+### 问题3: OpenCV vs OpenGL 相机约定
+
+| 约定     | X轴 | Y轴 | Z轴 | 使用者           |
+| ------ | -- | -- | -- | ------------- |
+| OpenCV | 右  | 下  | 前  | RAS, 大部分CV库   |
+| OpenGL | 右  | 上  | 后  | HaWoR, SAPIEN |
+
+变换矩阵: `OPENCV_TO_OPENGL = diag(1, -1, -1)`
+
+`01_align_scene.py` 中需要先把 RAS 的相机外参从 OpenCV 约定转到 OpenGL 约定，才能和 HaWoR 的相机轨迹对齐。
+
+### 问题4: MANO 左右手坐标系差异
+
+MANO 左手和右手的关节定义是镜像的：
+
+```
+右手: 拇指在 X 正方向
+左手: 拇指在 X 负方向
+```
+
+当检测到左手 (hand\_idx=0) 时，MANOLayer 使用左手模型，但 retargeting 仍然使用右手配置（因为 R1 只有右臂）。这导致：
+
+- 手指弯曲方向可能错误
+- 夹爪朝向可能翻转
+
+**当前缓解**: `warm_start()` 传入 `is_mano_convention=True` 让优化器知道输入是 MANO 约定
+
+***
+
+## 评估指标
+
+| 指标        | 计算方式             | 目标值     | 实现脚本                    |
+| --------- | ---------------- | ------- | ----------------------- |
+| 尺度误差      | 对齐后手-物距离 vs GT   | < 2 cm  | 01\_align\_scene.py     |
+| 位置重投影误差   | 3D→2D 投影 vs 像素GT | < 10 px | 02\_render\_scene.py    |
+| IK 可达率    | 有解帧数 / 总帧数       | > 95%   | 02\_render\_scene.py    |
+| 平滑度 (速度)  | 关节角速度标准差         | 越小越平滑   | TrajectorySmoother      |
+| 平滑度 (加速度) | 关节角加速度标准差        | 越小越平滑   | TrajectorySmoother      |
+| 2D 重投影误差  | 手部关节投影到2D vs GT  | < 5 px  | 05\_video\_alignment.py |
+
+#### 8. 夹爪开合受限 (⚠️ 待修复)
+
+**问题**: 机械臂夹爪的开合范围非常小，几乎看不出张开/闭合动作。
+
+**现象**:
+
+- 夹爪关节值范围: `gripper_idx1` ∈ \[-0.001, 0.037], `gripper_idx2` ∈ \[-0.001, 0.034]
+- 实际张开量仅约 3.7mm，视觉上几乎不可见
+- 大量帧被 clamp 到 -0.001（下限）
+
+**原因分析**:
+
+1. **URDF 关节限位**: 原始 URDF 中夹爪关节类型为 `fixed`（不可动），代码动态改为 `prismatic`，但限位仍为 `[0, 0.05]`（5cm）。然而 `gripper_idx2` 的 warmup 初始值设为 `-0.04`，超出 URDF 下限 `0`，被 SAPIEN 自动 clamp。
+2. **Retargeting 输出值小**: `dex_retargeting` 的 `SeqRetargeting` 只用 3 个约束点（拇指尖、食指尖、手腕）做位置重定向，对夹爪的驱动信号本身就很弱。retargeting 输出的夹爪 qpos 值很小（0\~0.04 rad），对应实际张开量约 0\~3.7mm。
+3. **夹爪关节方向不一致**: `gripper_finger_joint1` 轴为 `(0,-1,0)`，`gripper_finger_joint2` 轴为 `(0,1,0)`，两个手指应该对称运动（一个正值一个负值），但 retargeting 输出两个都是正值，导致两手指同向运动而非对称开合。
+4. **warmup 初始值**: warmup 阶段设置 `gripper_idx1=0.04, gripper_idx2=-0.04`，但 URDF 限位 `[0, 0.05]`，`gripper_idx2=-0.04` 被自动 clamp 到 0。
+
+**可能的修复方向**:
+
+- 修改 URDF 中夹爪关节限位为 `[-0.05, 0.05]`，允许双向运动
+- 或修改 retargeting 输出的夹爪映射，使两个手指对称开合
+- 或增加 retargeting 约束点数量，改善夹爪驱动信号
+
+**涉及文件**:
+
+- `02_render_scene.py`: 夹爪 qpos 设置
+- `04_physics_simulation.py`: 同上
+- `/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/configs/urdfs/r1_v2_1_0_floating_right.urdf`: URDF 关节定义
+

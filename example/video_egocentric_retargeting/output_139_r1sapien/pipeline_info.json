@@ -1,0 +1,230 @@
+{
+  "pipeline_config": {
+    "video_path": "/home/an/data/MP4/egodex_small/test/basic_pick_place/139.mp4",
+    "output_dir": "output_139_r1sapien",
+    "fps": 30,
+    "start_frame": 0,
+    "num_frames": -1,
+    "selfie": true,
+    "hand_type": "Right",
+    "arm_side": "right",
+    "view": "egocentric",
+    "grasp_threshold": 0.04,
+    "release_threshold": 0.06,
+    "r1_urdf_path": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/robot_glb.urdf",
+    "r1_right_settings": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/configs/settings_right.yaml",
+    "r1_left_settings": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/configs/settings_left.yaml",
+    "lp_alpha_ee": 0.85,
+    "lp_alpha_joint": 0.5,
+    "arm_base_offset_local": [
+      -0.03207,
+      -0.09724,
+      1.40347
+    ],
+    "arm_max_reach": 0.713,
+    "comfort_target_in_base": [
+      0.3,
+      0.0,
+      -0.25
+    ],
+    "safety_distance": 0.075,
+    "warmup_frames": 30,
+    "gripper_limits": {
+      "right_gripper_finger_joint1": [
+        0.0,
+        0.05
+      ],
+      "right_gripper_finger_joint2": [
+        -0.05,
+        0.0
+      ],
+      "left_gripper_finger_joint1": [
+        0.0,
+        0.05
+      ],
+      "left_gripper_finger_joint2": [
+        -0.05,
+        0.0
+      ]
+    },
+    "timestamp": "2026-05-18T22:09:02.991765",
+    "steps": [
+      "detect",
+      "ik",
+      "render"
+    ]
+  },
+  "video_info": {
+    "total_frames": 62,
+    "video_fps": 30.0,
+    "resolution": "1920x1080",
+    "frame_skip": 1
+  },
+  "retargeting_config": {
+    "robot_name": "r1",
+    "retargeting_type": "position",
+    "n_dof": 25,
+    "fixed_joints": 18,
+    "target_joints": 7,
+    "ref_indices": [
+      4,
+      8
+    ],
+    "robot_joint_names": [
+      "dummy_x_translation_joint",
+      "dummy_y_translation_joint",
+      "dummy_z_translation_joint",
+      "dummy_x_rotation_joint",
+      "dummy_y_rotation_joint",
+      "dummy_z_rotation_joint",
+      "torso_joint1",
+      "torso_joint2",
+      "torso_joint3",
+      "left_arm_joint1",
+      "left_arm_joint2",
+      "left_arm_joint3",
+      "left_arm_joint4",
+      "left_arm_joint5",
+      "left_arm_joint6",
+      "left_gripper_finger_joint1",
+      "left_gripper_finger_joint2",
+      "right_arm_joint1",
+      "right_arm_joint2",
+      "right_arm_joint3",
+      "right_arm_joint4",
+      "right_arm_joint5",
+      "right_arm_joint6",
+      "right_gripper_finger_joint1",
+      "right_gripper_finger_joint2"
+    ]
+  },
+  "detection": {
+    "total_frames": 62,
+    "detected_frames": 62,
+    "detection_rate": "100.0%",
+    "gap_filled_frames": 0,
+    "grasp_frames": 52,
+    "open_frames": 10,
+    "finger_distance_mean": 0.04699733689549139,
+    "finger_distance_std": 0.011227210421132505,
+    "finger_distance_min": 0.028445282919143677,
+    "finger_distance_max": 0.08090020163144637,
+    "grasp_threshold_used": 0.04,
+    "release_threshold_used": 0.06,
+    "wrist_stats": {
+      "centroid": [
+        0.44670212491159095,
+        -0.08645511185777234,
+        -0.08248220071643704
+      ],
+      "range": [
+        0.3781185768101871,
+        0.10960196169230256,
+        0.1356362650245318
+      ],
+      "std": [
+        0.1028007692731205,
+        0.02419058751539605,
+        0.04453443504447033
+      ],
+      "min": [
+        0.24718837761055112,
+        -0.14811085595679405,
+        -0.1457358115759871
+      ],
+      "max": [
+        0.6253069544207382,
+        -0.038508894264491486,
+        -0.010099546551455325
+      ]
+    }
+  },
+  "pre_render_setup": {
+    "used_actual_fk": true,
+    "base_link_p": [
+      0.03206728398799896,
+      0.09723484516143799,
+      1.403300166130066
+    ]
+  },
+  "ik_config": {
+    "avg_wrist_pos": [
+      0.44670212491159095,
+      -0.08645511185777234,
+      -0.08248220071643704
+    ],
+    "wrist_range": [
+      0.3781185768101871,
+      0.10960196169230256,
+      0.1356362650245318
+    ],
+    "wrist_std": [
+      0.1028007692731205,
+      0.02419058751539605,
+      0.04453443504447033
+    ],
+    "right_settings": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/configs/settings_right.yaml",
+    "left_settings": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/configs/settings_left.yaml",
+    "hand_type": "right",
+    "arm_base_offset_local": [
+      -0.03207,
+      -0.09724,
+      1.40347
+    ],
+    "arm_max_reach": 0.713,
+    "comfort_target_in_base": [
+      0.3,
+      0.0,
+      -0.25
+    ],
+    "safety_distance": 0.075,
+    "lp_alpha_ee": 0.85,
+    "lp_alpha_joint": 0.5
+  },
+  "ik_result_extra": {
+    "mapping_offset_base": [
+      -0.14670212491159096,
+      0.08645511185777234,
+      -0.16751779928356297
+    ],
+    "safety_offset_base": [
+      -0.05761659596980319,
+      -0.0,
+      0.04801382997483599
+    ],
+    "out_of_reach": 0,
+    "ik_errors": 0,
+    "first_ik_joints": [
+      -1.1211555752503612,
+      2.1052873916930466,
+      -0.7866165560327074,
+      -0.4700482444632107,
+      0.34583676054831913,
+      0.17793531171903268
+    ],
+    "base_link_p": [
+      0.03206728398799896,
+      0.09723484516143799,
+      1.403300166130066
+    ]
+  },
+  "ik_result": {
+    "total_frames": 62,
+    "solved_frames": 62,
+    "solve_rate": "100.0%"
+  },
+  "render": {
+    "view": "egocentric",
+    "views": [
+      "egocentric"
+    ],
+    "fps": 30,
+    "resolution": "1920x1080",
+    "sapien_ok": false,
+    "r1_urdf": "/home/an/robot_world_ws/src/GalaxeaManipSim/galaxea_sim/assets/r1/robot_glb.urdf",
+    "output_videos": [
+      "output_139_r1sapien/r1_sapien_sim_egocentric.mp4"
+    ],
+    "output_video": "output_139_r1sapien/r1_sapien_sim_egocentric.mp4"
+  }
+}

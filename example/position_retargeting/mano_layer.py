@@ -4,6 +4,29 @@
 
 """Wrapper layer for manopth ManoLayer."""
 
+from pathlib import Path
+import numpy as np
+
+# NumPy compatibility patch for chumpy
+# chumpy tries to import deprecated numpy types
+if not hasattr(np, 'bool'):
+    np.bool = bool
+if not hasattr(np, 'int'):
+    np.int = int
+if not hasattr(np, 'float'):
+    np.float = float
+if not hasattr(np, 'complex'):
+    np.complex = complex
+if not hasattr(np, 'object'):
+    np.object = object
+if not hasattr(np, 'str'):
+    np.str = str
+if not hasattr(np, 'unicode'):
+    try:
+        np.unicode = np.unicode_
+    except AttributeError:
+        np.unicode = np.str_
+
 import torch
 
 from torch.nn import Module
@@ -23,11 +46,18 @@ class MANOLayer(Module):
 
         self._side = side
         self._betas = betas
+        
+        # 设置 MANO 模型根目录（使用绝对路径）
+        mano_root = Path(__file__).parent / "manopth" / "mano_v1_2" / "models"
+        if not mano_root.exists():
+            # 备用路径
+            mano_root = Path("manopth/mano/models")
+        
         self._mano_layer = ManoLayer(
             flat_hand_mean=False,
             ncomps=45,
             side=self._side,
-            mano_root="manopth/mano/models",
+            mano_root=str(mano_root),
             use_pca=True,
         )
 

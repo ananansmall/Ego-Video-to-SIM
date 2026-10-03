@@ -1,0 +1,834 @@
+{
+  "revision": "R00",
+  "generated_at": "2026-09-28 10:18:33",
+  "read_only": true,
+  "code": {
+    "git_head": "92c2f6e",
+    "git_head_date": "2026-09-18",
+    "git_head_subject": "CoACD 线: 缓存key修复(压平/分解参数) + 闭合段16帧 + 闭合下限 + 位姿CoACD代价探针",
+    "worktree_dirty_files": 121
+  },
+  "inputs": {
+    "glb": "/home/an/data/ras/7_vggt_omega/final_scene.glb",
+    "glb_sha1": "367cfc16143e81f0",
+    "glb_size": 102959196,
+    "hawor_dir": "/home/an/data/hawor/7a",
+    "hawor_exists": true,
+    "hawor_entries": [
+      "SLAM",
+      "alignment_report.txt",
+      "cam_space",
+      "est_focal.txt",
+      "reconstruction",
+      "tracks_0_113",
+      "transform_params.npz",
+      "vis_verify",
+      "world_space_res.pth"
+    ]
+  },
+  "stage1_certificate_scope": {
+    "statement": "证书仅覆盖: **当前物体 (glb_4 / toy_0) + 当前初始位姿 + 当前判据 (旧实际判据)** 的 3/3 复现 ✓; **不扩大**为\"任意轨迹/任意物体都能抓\" ✗",
+    "object": "glb_4 (toy_0)",
+    "n_pass": 3,
+    "n_repeat": 3,
+    "passed_episodes": [
+      "s1ep-000128",
+      "s1ep-000129",
+      "s1ep-000130"
+    ]
+  },
+  "f65_provenance": {
+    "scan_window": "F35–F65 (31 帧, 见 s31 日志 [Stage1][多帧扫描])",
+    "task_grasp_frame": 50,
+    "note": [
+      "任务抓取帧 = recipe.task_grasp_frame (s31: 50)",
+      "close 相位 = phase_boundaries.close (s31: [0,130])",
+      "⇒ F65 是**扫描窗口右端**, 不是任务终点; 两者含义不同, 不可互相替代 ✓"
+    ]
+  },
+  "runs": {
+    "s31": {
+      "desc": "成功基线 (Stage1 3/3)",
+      "dir_exists": true,
+      "recipe": {
+        "exists": true,
+        "sha1": "e41daf81647fcd3c",
+        "target_object": "glb_4",
+        "q_sequence_source": "actual_executed",
+        "task_grasp_frame": 50,
+        "export_valid": true,
+        "lengths": {
+          "T_W_G_cmd": 350,
+          "actual_base_commands": 350,
+          "actual_control_times": 350,
+          "actual_q_commands": 350,
+          "close_ctrl_q": 350,
+          "close_ctrl_t": 16,
+          "observations": null,
+          "optimized_T_W_G": 4,
+          "phase": 350,
+          "q_cmd": 350
+        },
+        "phase_boundaries": {
+          "close": [
+            [
+              0,
+              130
+            ]
+          ],
+          "lift": [
+            [
+              140,
+              350
+            ]
+          ],
+          "n": 350,
+          "settle": [
+            [
+              130,
+              140
+            ]
+          ]
+        },
+        "phase_counts": {
+          "close": 130,
+          "settle": 15,
+          "travel": 0
+        },
+        "hashes": {
+          "physics_hash": "9ad57488f9fd56c83971b2f3",
+          "controller_hash": "89c4aff1e7380163faff223f",
+          "criteria_hash": "783e2d6e4d6c9a89a7226669",
+          "canonical_state_hash": "49d39cb1610b5313f2275cda",
+          "initial_state_hash": "35e7e08b090941804b33866a"
+        },
+        "verification": {
+          "criteria": {
+            "drift_mm": 20.0,
+            "gnd_mm": 0.0,
+            "lift_cm": 3.0,
+            "tg_min": 0.5
+          },
+          "n_pass": 3,
+          "n_repeat": 3,
+          "failure_reason": null,
+          "selected_episode": "s1ep-000124",
+          "passed_episodes": [
+            "s1ep-000128",
+            "s1ep-000129",
+            "s1ep-000130"
+          ],
+          "runs_brief": [
+            {
+              "episode_id": "s1ep-000128",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            },
+            {
+              "episode_id": "s1ep-000129",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            },
+            {
+              "episode_id": "s1ep-000130",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            }
+          ]
+        },
+        "env_echo": {
+          "obj_scale_target_env": null,
+          "coacd_target_env": null,
+          "criteria_revision": "criteria_v2"
+        }
+      },
+      "best_grasp": {
+        "exists": true,
+        "sha1": "2d0fcf7e06cadae2",
+        "size": 753008,
+        "keys": [
+          "R",
+          "close_controls",
+          "enclose_z",
+          "euler",
+          "force_limit",
+          "gripper_qpos",
+          "locked_gripper_qpos",
+          "obj_lift",
+          "obj_xy_drift",
+          "peak_grip_force",
+          "pos",
+          "q_open",
+          "ref_base_R",
+          "reward",
+          "scene_digest_hash",
+          "settle_controls",
+          "stage1_recipe_json",
+          "strategy",
+          "target_object",
+          "verification"
+        ],
+        "target_object": "glb_4",
+        "strategy": "pd_then_lock",
+        "reward": 129.88433000879013,
+        "obj_lift": 0.032287709414958954,
+        "obj_xy_drift": 5.5521853937534615e-05,
+        "q_open": 0.05,
+        "verification": {
+          "lifts_final_cm": [
+            19.9,
+            19.9,
+            19.9
+          ],
+          "n_pass": 3,
+          "n_repeat": 3,
+          "gate": "lift_final>=3cm, >=2/3",
+          "criteria": {
+            "lift_cm": 3.0,
+            "gnd_mm": 0.0,
+            "tg_min": 0.5,
+            "drift_mm": 20.0
+          },
+          "runs": [
+            {
+              "run_index": 0,
+              "episode_id": "s1ep-000128",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            },
+            {
+              "run_index": 1,
+              "episode_id": "s1ep-000129",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            },
+            {
+              "run_index": 2,
+              "episode_id": "s1ep-000130",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            }
+          ],
+          "selected_episode": null,
+          "data_validity": [
+            true,
+            true,
+            true
+          ]
+        }
+      },
+      "run_metadata": {
+        "tag": "stage2",
+        "timestamp": "2026-09-27T19:52:58",
+        "sapien_version": "3.0.0b0",
+        "env_overrides": {
+          "_OBJ_SCALE": "0.5",
+          "_OBJ_SCALE_TARGET": "glb_4",
+          "_OBJ_SHAPE": "box",
+          "_OBJ_SHAPE_TARGET": "",
+          "_COACD_TARGET": "glb_4",
+          "_RESET_SETTLE_STEPS": null,
+          "_NO_GRIPPER_GROUND": "0",
+          "_GRIP_FRICTION": "4.0",
+          "_SMOOTH_MINT": "1",
+          "_Q_OPEN": "0.030",
+          "_VIRTUAL_PD_K": "50000",
+          "_VIRTUAL_PD_D": "600"
+        },
+        "physics": {
+          "PHYSICS_TIMESTEP": 0.0020833333333333333,
+          "CONTROL_FREQ": 30,
+          "DECIMATION": 16,
+          "VIRTUAL_PD_STIFFNESS": 50000.0,
+          "VIRTUAL_PD_DAMPING": 600.0,
+          "FINGER_PD_STIFFNESS": 1000.0,
+          "FINGER_PD_DAMPING": 200.0,
+          "FINGER_PD_FORCE_LIMIT": 100.0,
+          "GRIPPER_STIFFNESS": 1000.0,
+          "GRIPPER_DAMPING": 200.0,
+          "GRIPPER_FORCE": 100.0,
+          "GRIPPER_MAX_OPEN": 0.05,
+          "GRIPPER_INIT_OPEN": 0.04,
+          "FINGER_EFFECTIVE_HALF_SPACING": 0.0152,
+          "GRIPPER_FRICTION": 4.0,
+          "OBJECT_DENSITY": 1000.0,
+          "OBJECT_MIN_MASS": 0.05
+        },
+        "objects": {
+          "glb_1": {
+            "bbox_center": [
+              -0.24940680712461472,
+              -0.26707351207733154,
+              0.01055554300546646
+            ],
+            "bbox_size": [
+              0.08196057379245758,
+              0.08749616146087646,
+              0.021111086010932926
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_2": {
+            "bbox_center": [
+              -0.6402934193611145,
+              -0.3662686049938202,
+              0.025104520842432976
+            ],
+            "bbox_size": [
+              0.09310472011566162,
+              0.07698935270309448,
+              0.05020904168486595
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_3": {
+            "bbox_center": [
+              -0.6415446400642395,
+              -0.20520437508821487,
+              0.017488904297351837
+            ],
+            "bbox_size": [
+              0.06744813919067383,
+              0.06796903908252716,
+              0.034977808594703674
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_4": {
+            "bbox_center": [
+              -0.3021809607744217,
+              -0.49446041882038116,
+              0.01964546926319598
+            ],
+            "bbox_size": [
+              0.04489888250827789,
+              0.05587814748287201,
+              0.03929093852639198
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_5": {
+            "bbox_center": [
+              -0.4329283535480499,
+              -0.4467712789773941,
+              0.04173275828361511
+            ],
+            "bbox_size": [
+              0.0687670111656189,
+              0.09879818558692932,
+              0.08346551656723022
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_6": {
+            "bbox_center": [
+              -0.42558564245700836,
+              -0.20393455028533936,
+              0.02685907855629921
+            ],
+            "bbox_size": [
+              0.08349338173866272,
+              0.12053954601287842,
+              0.05371815711259842
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_7": {
+            "bbox_center": [
+              -0.3855333477258682,
+              -0.6348288655281067,
+              0.01821289397776126
+            ],
+            "bbox_size": [
+              0.017962902784347534,
+              0.036867499351501465,
+              0.03642578795552255
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_8": {
+            "bbox_center": [
+              -0.11821984872221947,
+              -0.08658076636493206,
+              0.012658698484301567
+            ],
+            "bbox_size": [
+              0.25044576078653336,
+              0.2513309456408024,
+              0.025317396968603134
+            ],
+            "body_type": "dynamic"
+          }
+        },
+        "ground_z": -1.0408340855860843e-17,
+        "stage2_config": {
+          "approach_mode": "axial",
+          "approach_start_distance_m": 0.16,
+          "axial_transfer_frac": 0.35,
+          "axial_clearance_m": 0.006,
+          "f_start": 22,
+          "F50_IDX": 50,
+          "f_end": 62,
+          "axial": {
+            "mode": "axial",
+            "retreat_m": 0.10270486963117763,
+            "finger_x_max": 0.07739,
+            "finger_inner_y": 0.0452,
+            "object_aabb_in_anchor": [
+              [
+                -0.019314869631177622,
+                -0.03430713270069116,
+                -0.03460189721149535
+              ],
+              [
+                0.06084454693311217,
+                0.036738227404314025,
+                0.025037827311835913
+              ]
+            ],
+            "object_y_extent": 0.036738227404314025,
+            "object_y_margin_m": 0.008461772595685972,
+            "transfer_frac": 0.35
+          }
+        }
+      },
+      "stage2_trace_exists": false,
+      "stage3_videos": [
+        "cam_view_stage3_gripper_only_left.mp4",
+        "god_view_stage3_gripper_only_left.mp4",
+        "right_view_stage3_gripper_only_left.mp4"
+      ]
+    },
+    "s44": {
+      "desc": "失败现场 (Stage2 CARRY 0/3 ⇒ Stage3 未运行)",
+      "dir_exists": true,
+      "recipe": {
+        "exists": true,
+        "sha1": "e41daf81647fcd3c",
+        "target_object": "glb_4",
+        "q_sequence_source": "actual_executed",
+        "task_grasp_frame": 50,
+        "export_valid": true,
+        "lengths": {
+          "T_W_G_cmd": 350,
+          "actual_base_commands": 350,
+          "actual_control_times": 350,
+          "actual_q_commands": 350,
+          "close_ctrl_q": 350,
+          "close_ctrl_t": 16,
+          "observations": null,
+          "optimized_T_W_G": 4,
+          "phase": 350,
+          "q_cmd": 350
+        },
+        "phase_boundaries": {
+          "close": [
+            [
+              0,
+              130
+            ]
+          ],
+          "lift": [
+            [
+              140,
+              350
+            ]
+          ],
+          "n": 350,
+          "settle": [
+            [
+              130,
+              140
+            ]
+          ]
+        },
+        "phase_counts": {
+          "close": 130,
+          "settle": 15,
+          "travel": 0
+        },
+        "hashes": {
+          "physics_hash": "9ad57488f9fd56c83971b2f3",
+          "controller_hash": "89c4aff1e7380163faff223f",
+          "criteria_hash": "783e2d6e4d6c9a89a7226669",
+          "canonical_state_hash": "49d39cb1610b5313f2275cda",
+          "initial_state_hash": "35e7e08b090941804b33866a"
+        },
+        "verification": {
+          "criteria": {
+            "drift_mm": 20.0,
+            "gnd_mm": 0.0,
+            "lift_cm": 3.0,
+            "tg_min": 0.5
+          },
+          "n_pass": 3,
+          "n_repeat": 3,
+          "failure_reason": null,
+          "selected_episode": "s1ep-000124",
+          "passed_episodes": [
+            "s1ep-000128",
+            "s1ep-000129",
+            "s1ep-000130"
+          ],
+          "runs_brief": [
+            {
+              "episode_id": "s1ep-000128",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            },
+            {
+              "episode_id": "s1ep-000129",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            },
+            {
+              "episode_id": "s1ep-000130",
+              "passed": true,
+              "lift_final_cm": 19.9,
+              "drift_mm": 0.06,
+              "true_grasp_ratio": 1.0,
+              "finger_ground_mm": 1.5
+            }
+          ]
+        },
+        "env_echo": {
+          "obj_scale_target_env": null,
+          "coacd_target_env": null,
+          "criteria_revision": "criteria_v2"
+        }
+      },
+      "best_grasp": {
+        "exists": true,
+        "sha1": "2d0fcf7e06cadae2",
+        "size": 753008,
+        "keys": [
+          "R",
+          "close_controls",
+          "enclose_z",
+          "euler",
+          "force_limit",
+          "gripper_qpos",
+          "locked_gripper_qpos",
+          "obj_lift",
+          "obj_xy_drift",
+          "peak_grip_force",
+          "pos",
+          "q_open",
+          "ref_base_R",
+          "reward",
+          "scene_digest_hash",
+          "settle_controls",
+          "stage1_recipe_json",
+          "strategy",
+          "target_object",
+          "verification"
+        ],
+        "target_object": "glb_4",
+        "strategy": "pd_then_lock",
+        "reward": 129.88433000879013,
+        "obj_lift": 0.032287709414958954,
+        "obj_xy_drift": 5.5521853937534615e-05,
+        "q_open": 0.05,
+        "verification": {
+          "lifts_final_cm": [
+            19.9,
+            19.9,
+            19.9
+          ],
+          "n_pass": 3,
+          "n_repeat": 3,
+          "gate": "lift_final>=3cm, >=2/3",
+          "criteria": {
+            "lift_cm": 3.0,
+            "gnd_mm": 0.0,
+            "tg_min": 0.5,
+            "drift_mm": 20.0
+          },
+          "runs": [
+            {
+              "run_index": 0,
+              "episode_id": "s1ep-000128",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            },
+            {
+              "run_index": 1,
+              "episode_id": "s1ep-000129",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            },
+            {
+              "run_index": 2,
+              "episode_id": "s1ep-000130",
+              "lift_final_cm": 19.9,
+              "finger_ground_mm": 1.5,
+              "dmin_mm": 0.0,
+              "true_grasp_ratio": 1.0,
+              "drift_mm": 0.06,
+              "obj_supported": false,
+              "gripper_ground_class": "pre_contact",
+              "passed": true,
+              "reasons": []
+            }
+          ],
+          "selected_episode": null,
+          "data_validity": [
+            true,
+            true,
+            true
+          ]
+        }
+      },
+      "run_metadata": {
+        "tag": "stage2",
+        "timestamp": "2026-09-27T22:53:37",
+        "sapien_version": "3.0.0b0",
+        "env_overrides": {
+          "_OBJ_SCALE": "0.5",
+          "_OBJ_SCALE_TARGET": "glb_4",
+          "_OBJ_SHAPE": "box",
+          "_OBJ_SHAPE_TARGET": "",
+          "_COACD_TARGET": "glb_4",
+          "_RESET_SETTLE_STEPS": null,
+          "_NO_GRIPPER_GROUND": "0",
+          "_GRIP_FRICTION": "4.0",
+          "_SMOOTH_MINT": "1",
+          "_Q_OPEN": "0.030",
+          "_VIRTUAL_PD_K": "50000",
+          "_VIRTUAL_PD_D": "600"
+        },
+        "physics": {
+          "PHYSICS_TIMESTEP": 0.0020833333333333333,
+          "CONTROL_FREQ": 30,
+          "DECIMATION": 16,
+          "VIRTUAL_PD_STIFFNESS": 50000.0,
+          "VIRTUAL_PD_DAMPING": 600.0,
+          "FINGER_PD_STIFFNESS": 1000.0,
+          "FINGER_PD_DAMPING": 200.0,
+          "FINGER_PD_FORCE_LIMIT": 100.0,
+          "GRIPPER_STIFFNESS": 1000.0,
+          "GRIPPER_DAMPING": 200.0,
+          "GRIPPER_FORCE": 100.0,
+          "GRIPPER_MAX_OPEN": 0.05,
+          "GRIPPER_INIT_OPEN": 0.04,
+          "FINGER_EFFECTIVE_HALF_SPACING": 0.0152,
+          "GRIPPER_FRICTION": 4.0,
+          "OBJECT_DENSITY": 1000.0,
+          "OBJECT_MIN_MASS": 0.05
+        },
+        "objects": {
+          "glb_1": {
+            "bbox_center": [
+              -0.24940680712461472,
+              -0.26707351207733154,
+              0.01055554300546646
+            ],
+            "bbox_size": [
+              0.08196057379245758,
+              0.08749616146087646,
+              0.021111086010932926
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_2": {
+            "bbox_center": [
+              -0.6402934193611145,
+              -0.3662686049938202,
+              0.025104520842432976
+            ],
+            "bbox_size": [
+              0.09310472011566162,
+              0.07698935270309448,
+              0.05020904168486595
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_3": {
+            "bbox_center": [
+              -0.6415446400642395,
+              -0.20520437508821487,
+              0.017488904297351837
+            ],
+            "bbox_size": [
+              0.06744813919067383,
+              0.06796903908252716,
+              0.034977808594703674
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_4": {
+            "bbox_center": [
+              -0.3021809607744217,
+              -0.49446041882038116,
+              0.01964546926319598
+            ],
+            "bbox_size": [
+              0.04489888250827789,
+              0.05587814748287201,
+              0.03929093852639198
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_5": {
+            "bbox_center": [
+              -0.4329283535480499,
+              -0.4467712789773941,
+              0.04173275828361511
+            ],
+            "bbox_size": [
+              0.0687670111656189,
+              0.09879818558692932,
+              0.08346551656723022
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_6": {
+            "bbox_center": [
+              -0.42558564245700836,
+              -0.20393455028533936,
+              0.02685907855629921
+            ],
+            "bbox_size": [
+              0.08349338173866272,
+              0.12053954601287842,
+              0.05371815711259842
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_7": {
+            "bbox_center": [
+              -0.3855333477258682,
+              -0.6348288655281067,
+              0.01821289397776126
+            ],
+            "bbox_size": [
+              0.017962902784347534,
+              0.036867499351501465,
+              0.03642578795552255
+            ],
+            "body_type": "dynamic"
+          },
+          "glb_8": {
+            "bbox_center": [
+              -0.11821984872221947,
+              -0.08658076636493206,
+              0.012658698484301567
+            ],
+            "bbox_size": [
+              0.25044576078653336,
+              0.2513309456408024,
+              0.025317396968603134
+            ],
+            "body_type": "dynamic"
+          }
+        },
+        "ground_z": -1.0408340855860843e-17,
+        "stage2_config": {
+          "approach_mode": "axial",
+          "approach_start_distance_m": 0.16,
+          "axial_transfer_frac": 0.35,
+          "axial_clearance_m": 0.006,
+          "f_start": 22,
+          "F50_IDX": 50,
+          "f_end": 62,
+          "axial": {
+            "mode": "axial",
+            "retreat_m": 0.10270486963117763,
+            "finger_x_max": 0.07739,
+            "finger_inner_y": 0.0452,
+            "object_aabb_in_anchor": [
+              [
+                -0.019314869631177622,
+                -0.03430713270069116,
+                -0.03460189721149535
+              ],
+              [
+                0.06084454693311217,
+                0.036738227404314025,
+                0.025037827311835913
+              ]
+            ],
+            "object_y_extent": 0.036738227404314025,
+            "object_y_margin_m": 0.008461772595685972,
+            "transfer_frac": 0.35
+          }
+        }
+      },
+      "stage2_trace_exists": true,
+      "stage3_videos": [
+        "cam_view_stage3_gripper_only_left.mp4",
+        "god_view_stage3_gripper_only_left.mp4",
+        "right_view_stage3_gripper_only_left.mp4"
+      ]
+    }
+  },
+  "s44_stage2_failure": {
+    "log": "/tmp/s44.log",
+    "found": [
+      "2026-09-27 22:53:42,632 [grasp_hawor] INFO: [Stage2 gate] FAIL(CARRY) bundle=2a3962ea4b9a controls=192 tracking=0.41/2.68mm",
+      "2026-09-27 22:53:48,275 [grasp_hawor] INFO: [Stage2 gate] FAIL(CARRY) bundle=2a3962ea4b9a controls=192 tracking=0.41/2.68mm",
+      "2026-09-27 22:53:53,964 [grasp_hawor] INFO: [Stage2 gate] FAIL(CARRY) bundle=2a3962ea4b9a controls=192 tracking=0.41/2.68mm",
+      "2026-09-27 22:53:53,964 [grasp_hawor] ERROR: [test-stage3] Stage2 repeat gate FAIL: 0/3 failures=['CARRY', 'CARRY', 'CARRY']; Stage3 不运行"
+    ]
+  },
+  "todo_after_r00": [
+    "R01 时间线截断/数组完整性 (P0, 零物理) —— 禁止 q-only 尾裁剪删 CARRY",
+    "R02 闭合→稳定→搬运命令真实复用 (P0, 先离线)",
+    "R03 成功 record 与入口门绑定 (从真实通过 run 恢复, 不伪造)",
+    "R04 场景/初态真实核对 (API 自检先行, 不再持续放行 UNKNOWN)",
+    "R05 用完整矩阵证据定位 33.37° 与起步失稳 (P1, 最多一次诊断)",
+    "R06 完整搬运 + 反馈鲁棒性 + 重放",
+    "R07 Stage1 最小自洽性修复 (不重找抓取姿态)",
+    "R08 Stage3 入口/后缀/最终重放自洽"
+  ]
+}
