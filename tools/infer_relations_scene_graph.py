@@ -205,6 +205,7 @@ def infer_relations_from_labeled_image(
     processor,
     image_path: str,
     instance_names: List[str],
+    query_instances: Optional[List[str]] = None,
 ) -> str:
     """
     使用 SimRecon 风格的 VLM prompt 推断物体间关系
@@ -214,7 +215,12 @@ def infer_relations_from_labeled_image(
         model: VLM模型
         processor: VLM处理器
         image_path: 标注图路径
-        instance_names: 实例名列表 (如 ["duck_0", "plate_0", "toy_0"])
+        instance_names: 场景中全部实例名 (如 ["duck_0", "plate_0", "toy_0"])
+        query_instances: 本次实际需要结果的实例名; None 表示全都要。
+            非 None 时 prompt 只要求输出这些实例 —— 调用方通常只取其中一条,
+            让模型生成全场景 JSON 是 O(N^2) 的浪费 (25 实例 x 3 帧, 每次生成
+            25 条记录, 其中 24 条立即被丢弃)。非 None 时仍完整列出
+            instance_names 作为名称参考, 保证 parent 能写成 "table_0" 之类。
     返回:
         VLM 原始输出文本
     """
@@ -222,6 +228,11 @@ def infer_relations_from_labeled_image(
     num_objects = len(instance_names)
     instance_names_str = ", ".join(instance_names)
     id_name_hints = "\n".join([f"- {name}" for name in instance_names])
+
+    # 只查询部分实例时裁剪输出规模 (方案2: 消除 O(N^2) 的生成浪费)
+    query = list(query_instances) if query_instances else list(instance_names)
+    num_query = len(query)
+    query_str = ", ".join(query)
 
     prompt = f'''You are analyzing a room scene image with labeled objects.
 
@@ -235,11 +246,11 @@ def infer_relations_from_labeled_image(
 {id_name_hints}
 
 ## PHYSICAL COMMON SENSE RULES (use internally, do NOT repeat in output):
-1. Cabinets, wardrobes, bookshelves, tables, desks, chairs, beds → supported by floor.
+1. Cabinets, wardrobes, bookshelves, tables, desks, chairs, beds -> supported by floor.
 2. Wall-attached is RARE, only for: pictures, mirrors, clocks, posters, wall-mounted TVs, curtains, windows, doors.
-3. Objects resting on furniture → parent is that furniture's instance name.
-4. Small items on a desk (lamp, monitor, keyboard, cup) → supported by that desk.
-5. Objects held by hand or floating → assign their NATURAL support (where they belong when not held); never use relation="held".
+3. Objects resting on furniture -> parent is that furniture's instance name.
+4. Small items on a desk (lamp, monitor, keyboard, cup) -> supported by that desk.
+5. Objects held by hand or floating -> assign their NATURAL support (where they belong when not held); never use relation="held".
 
 ## OUTPUT FORMAT:
 ```json
@@ -257,19 +268,21 @@ Where parent is one of:
 
 ## CRITICAL REQUIREMENTS:
 - Output ONLY the JSON code block above. No explanations, no reasoning, no text outside the JSON.
-- You MUST output exactly {num_objects} objects (one for each: {instance_names_str}). Do NOT skip any object.
-- Do NOT use relation="held" — every object must have a physical support relation.
+- You MUST output exactly {num_query} objects (one for each: {query_str}). Do NOT skip any object.
+- Do NOT output any object outside the query list [{query_str}].
+- Do NOT use relation="held" - every object must have a physical support relation.
 - If you are unsure of the exact supporter but the object is on/with another object, use parent="other_objects". Do NOT default to "floor" unless it clearly stands on the ground.
 
-Now output the complete JSON with all {num_objects} objects.
+Now output the complete JSON with all {num_query} objects.
 '''
 
     caller = "stage5_scene_graph"
-    # Qwen3.5-VL processor 对字符串只按 URL/base64 解析，不认本地文件路径，需先转 PIL Image
+    # Qwen3.5-VL processor 对字符串只按 URL/base64 解析, 不认本地文件路径, 需先转 PIL Image
     image = Image.open(image_path).convert("RGB")
-    # prompt 已要求"只输出 JSON、不写推理"，纯 JSON (22 物体≈1800 token) 足够，
-    # 降到 4096 以规避被 max_new_tokens 截断导致解析失败的风险
-    return vlm_inference(image, model, processor, prompt, max_new_tokens=4096, caller=caller)
+    # prompt 已要求"只输出 JSON、不写推理"。全场景 (25 物体≈1800 token) 用 4096
+    # 规避截断; 按实例裁剪后仅数条记录, 256 足够且生成时间随 token 数线性下降。
+    max_new_tokens = 4096 if num_query > 4 else 256
+    return vlm_inference(image, model, processor, prompt, max_new_tokens=max_new_tokens, caller=caller)
 
 
 def parse_scene_graph_output(output_text: str) -> Dict[str, Any]:
@@ -398,6 +411,15 @@ def vote_relations(votes: List[Tuple[str, int]]) -> str:
 
     if not weighted_votes:
         # 返回 None 表示"无法判断"，调用方需根据原始关系决定保留还是降级
+        return None
+
+    # 平票且无明确多数时返回 None, 而非让 max() 按插入序随意挑一个。
+    # 实测 egodex_33 toy_0: 票为 {'supported by bed': 2, 'supported by lego_0': 2},
+    # 'bed' 是不存在的幻觉支撑物被 Step 2.5 剔除后, 剩下的 lego_0 恰好与它
+    # 同为 2 票 —— max() 会返回其中一个, 使"支撑物是否存在"退化成随机选择。
+    # 这里显式把平票判为"无法判断", 由调用方回退到Stage1 原关系 (真实关系)。
+    top_count = max(weighted_votes.values())
+    if sum(1 for c in weighted_votes.values() if c == top_count) > 1:
         return None
 
     return max(weighted_votes, key=weighted_votes.get)
@@ -639,40 +661,21 @@ def infer_relations_scene_graph(
                 inst_name = f"{category}_{inst_idx}"
                 optimal_frame_map[inst_name] = frame_id
 
-    # 对每个实例进行投票
-    for inst_name in instance_names:
-        votes = list(preview_votes[inst_name].items())  # 先加入全场景预览投票
+    # ── 方案1: 按帧分组, 每帧只调用一次 VLM ──
+    # 原代码对每个实例单独推理, 但同一帧的标注图 + prompt 完全相同 (只是
+    # 事后从全场景 JSON 里挑出自己那一行, 其余全部丢弃) —— 25 实例时是
+    # O(N^2) 的重复生成。先把每个实例需要的帧收集起来, 按帧去重, 每帧一次
+    # 调用 + query_instances 只问该帧真正要用的实例 (配合方案2 裁剪输出)。
+    print(f"   📷 Step 2: 按帧分组投票...", flush=True)
 
-        # 图1: optimal_frames 对应的帧
+    # 收集每个实例的投票来源: {frame_id: [(inst_name, weight, kind), ...]}
+    frame_queries = defaultdict(list)
+    for inst_name in instance_names:
+        # 图1: optimal_frames 对应的帧 (权重 2)
         if inst_name in optimal_frame_map:
             frame_id = optimal_frame_map[inst_name]
             if frame_id < len(colors):
-                frame_image = colors[frame_id]
-                visible_in_frame = keyframe_visibility.get(frame_id, [inst_name])
-                labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, frame_id)
-                labeled_path = os.path.join(output_dir, "labeled_images", f"label_{inst_name}_optimal.png")
-                cv2.imwrite(labeled_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
-
-                raw_out = infer_relations_from_labeled_image(model, processor, labeled_path, instance_names)
-                parsed = parse_scene_graph_output(raw_out)
-                for obj in parsed.get("objects", []):
-                    if obj.get("instance") == inst_name:
-                        relation = obj.get("relation", "support")
-                        # 无法判断具体支撑物时默认 "other_objects" (保留原 stage1 的
-                        # "与其他物体有交互" 语义)，绝不默认 floor
-                        parent = obj.get("parent", "other_objects")
-                        if parent == "other_objects":
-                            rel_str = "supported by other objects"
-                        elif relation == "support" and parent == "floor":
-                            rel_str = "supported by floor"
-                        elif relation == "support":
-                            rel_str = f"supported by {parent}"
-                        elif relation == "attached":
-                            rel_str = f"attached to {parent}"
-                        else:
-                            rel_str = "supported by other objects"
-                        votes.append((rel_str, 2))
-                        break
+                frame_queries[frame_id].append((inst_name, 2, "optimal"))
 
         # 图2~3: 从 keyframes 中找该实例可见的其他帧
         keyframe_candidates = []
@@ -680,51 +683,72 @@ def infer_relations_scene_graph(
             if inst_name in visible or any(inst_name.split('_')[0] in str(v) for v in [visible]):
                 keyframe_candidates.append(vid_idx)
 
-        # 动态物体: 锁定 trajectory 记录的首次出现帧作为主导帧 (权重 10)，
-        # 其余 keyframes 仅作辅助 (权重 1)
+        # 动态物体: 锁定 trajectory 记录的首次出现帧作为主导帧 (权重 10)
         is_dynamic = inst_name in dynamic_first_frame_map
         if is_dynamic:
             first_dynamic_frame = dynamic_first_frame_map[inst_name]
-            # 把首次出现帧放到候选最前，并去重
             ordered = [first_dynamic_frame] + [f for f in keyframe_candidates if f != first_dynamic_frame]
             keyframe_candidates = ordered
         else:
             keyframe_candidates.sort()
-        vote_weights = []  # 为每帧分配权重
-        for kf_idx, kf_frame_id in enumerate(keyframe_candidates):
-            if is_dynamic and kf_idx == 0:
-                vote_weights.append(10)  # 首次出现帧最高权重
-            else:
-                vote_weights.append(1)
 
-        for local_idx, kf_frame_id in enumerate(keyframe_candidates[:2]):
+        # 关键帧投票上限 1 帧 (每帧 VLM 调用 ~40s)
+        for kf_idx, kf_frame_id in enumerate(keyframe_candidates[:1]):
             if kf_frame_id == optimal_frame_map.get(inst_name):
                 continue
             if kf_frame_id >= len(colors):
                 continue
+            weight = 10 if (is_dynamic and kf_idx == 0) else 1
+            frame_queries[kf_frame_id].append((inst_name, weight, "keyframe"))
 
-            frame_image = colors[kf_frame_id]
-            visible_in_frame = keyframe_visibility.get(kf_frame_id, [inst_name])
-            labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, kf_frame_id)
-            labeled_path = os.path.join(output_dir, "labeled_images", f"label_{inst_name}_kf{kf_frame_id}.png")
-            cv2.imwrite(labeled_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
+    # 每帧渲染一次标注图 + 调用一次 VLM, 结果缓存到 frame_results
+    frame_results = {}   # (frame_id, inst_name) -> rel_str
+    n_frames = len(frame_queries)
+    print(f"   ⚡ {len(instance_names)} 个实例聚合为 {n_frames} 帧 (去重前约 "
+          f"{len(instance_names) * 2} 次调用)", flush=True)
 
-            raw_out = infer_relations_from_labeled_image(model, processor, labeled_path, instance_names)
-            parsed = parse_scene_graph_output(raw_out)
-            for obj in parsed.get("objects", []):
-                if obj.get("instance") == inst_name:
-                    relation = obj.get("relation", "support")
-                    parent = obj.get("parent", "floor")
-                    if relation == "support" and parent == "floor":
-                        rel_str = "supported by floor"
-                    elif relation == "support":
-                        rel_str = f"supported by {parent}"
-                    elif relation == "attached":
-                        rel_str = f"attached to {parent}"
-                    else:
-                        rel_str = "supported by floor"
-                    votes.append((rel_str, vote_weights[local_idx]))
-                    break
+    for frame_id, queries in sorted(frame_queries.items()):
+        query_instances = [inst for inst, _, _ in queries]
+        frame_image = colors[frame_id]
+        visible_in_frame = keyframe_visibility.get(frame_id, query_instances)
+        labeled_image = create_labeled_frame_image(frame_image, visible_in_frame, instance_masks, frame_id)
+        labeled_path = os.path.join(output_dir, "labeled_images", f"label_frame{frame_id}.png")
+        cv2.imwrite(labeled_path, cv2.cvtColor(labeled_image, cv2.COLOR_RGB2BGR))
+
+        # 只问该帧真正需要的实例 (方案2: 输出规模从 N 降到 len(query_instances))
+        raw_out = infer_relations_from_labeled_image(
+            model, processor, labeled_path, instance_names,
+            query_instances=query_instances)
+        parsed = parse_scene_graph_output(raw_out)
+        for obj in parsed.get("objects", []):
+            inst = obj.get("instance", "")
+            if inst not in query_instances:
+                continue
+            relation = obj.get("relation", "support")
+            parent = obj.get("parent", "other_objects")
+            if parent == "other_objects":
+                rel_str = "supported by other objects"
+            elif relation == "support" and parent == "floor":
+                rel_str = "supported by floor"
+            elif relation == "support":
+                rel_str = f"supported by {parent}"
+            elif relation == "attached":
+                rel_str = f"attached to {parent}"
+            else:
+                rel_str = "supported by other objects"
+            frame_results[(frame_id, inst)] = rel_str
+
+    # 汇总每个实例的加权票 (含全场景预览票)
+    for inst_name in instance_names:
+        votes = list(preview_votes[inst_name].items())  # 先加入全场景预览投票
+
+        for frame_id, queries in frame_queries.items():
+            for inst, weight, kind in queries:
+                if inst != inst_name:
+                    continue
+                rel_str = frame_results.get((frame_id, inst_name))
+                if rel_str:
+                    votes.append((rel_str, weight))
 
         # 投票决定关系
         # 注意: categories_and_relations 的 key 可能是类别级 ("bottle") 或实例级
@@ -776,6 +800,43 @@ def infer_relations_scene_graph(
         for v, w in votes:
             vote_counts[v] += w
         print(f"   ✅ {inst_name}: {final_relation} ({len(votes)} 票: {dict(vote_counts)})", flush=True)
+
+    # ── Step 2.5: 支撑物存在性校验 (剔除幻觉支撑物) ──
+    # VLM 可能给出场景里根本不存在的支撑物 (实测 egodex_1: 检测类别里没有 table,
+    # 却推断出 "supported by table_0")。下游遇到不存在的支撑物只会 "跳过",
+    # 该物体的位置精修被静默丢掉。必须在关系落盘前拦掉。
+    valid_supporters = set(instance_names) | {"floor", "wall", "other_objects"}
+
+    def _parent_of(rel):
+        return rel.split("supported by ", 1)[1].strip() if "supported by " in rel else None
+
+    fixed_relations = {}
+    n_halluc = 0
+    for inst_name, rel in refined_relations.items():
+        parent = _parent_of(rel)
+        if parent is not None and parent not in valid_supporters:
+            n_halluc += 1
+            print(f"   ⚠️ {inst_name}: 支撑物 '{parent}' 不存在于场景, 剔除该票", flush=True)
+            # 用该实例的其他有效票重新决策
+            all_votes = inference_details.get(inst_name, {}).get("votes", {})
+            alt = [(v, w) for v, w in all_votes.items()
+                   if not (v.startswith("supported by ") and
+                           v.split("supported by ", 1)[1].strip() not in valid_supporters)]
+            new_rel = vote_relations(alt) if alt else None
+            if new_rel is None:
+                # 无可用票: 回退 Stage1 原关系 (至少是真实关系)
+                orig = _get_original_relation(categories_and_relations, inst_name)
+                new_rel = orig if orig != "supported by other objects" else "supported by floor"
+                print(f"      无其他有效票, 回退原关系 '{new_rel}'", flush=True)
+            else:
+                print(f"      改用其他有效票 -> '{new_rel}'", flush=True)
+            fixed_relations[inst_name] = new_rel
+            continue
+        fixed_relations[inst_name] = rel
+
+    if n_halluc:
+        print(f"   🔍 共剔除 {n_halluc} 个幻觉支撑物", flush=True)
+    refined_relations = fixed_relations
 
     # ── Step 3: 物理常识后处理 ──
     print(f"   🔧 Step 3: 物理常识后处理...", flush=True)

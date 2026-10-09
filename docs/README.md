@@ -12,8 +12,9 @@
 
 | 文档 | 说明 |
 |------|------|
-| [stage6_design.md](design/stage6_design.md) | Stage 6 材质感知物理标注设计（已实现: tools/material_annotator.py） |
-| [stage61_urdf_plan.md](design/stage61_urdf_plan.md) | Stage 6.1 URDF 生成 + SAPIEN 仿真（已实现: src/stage61_urdf_generator.py） |
+| [stage6_physics_sim.md](design/stage6_physics_sim.md) | **Stage 6 权威文档**: URDF 生成 → SAPIEN 物理仿真 → pyrender 渲染 GIF。含材质标注（附录 A）、URDF 生成要点（附录 B）、10 个数据集验证表 |
+| [stage6_design.md](design/stage6_design.md) | ~~Stage 6 材质标注设计~~ 已合并至 `stage6_physics_sim.md` 附录 A（存根，[原文归档](design/archive/stage6_design_v1.md)） |
+| [stage61_urdf_plan.md](design/stage61_urdf_plan.md) | ~~Stage 6.1 URDF 生成方案~~ 已合并至 `stage6_physics_sim.md` 附录 B（存根，[原文归档](design/archive/stage61_urdf_plan_v1.md)） |
 | [MERGE_ARCHITECTURE.md](design/MERGE_ARCHITECTURE.md) | HaWoR + ReplicateAnyScene 合并架构方案 |
 | [coordinate_and_alignment.md](design/coordinate_and_alignment.md) | GLB → HaWoR 坐标系对齐操作指南 |
 

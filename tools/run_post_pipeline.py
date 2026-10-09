@@ -493,6 +493,32 @@ def run_refine_relations(scene_dir, stage1_json, files, vlm_checkpoint):
     scene_id = files['scene_id']
     refined_json = os.path.join(scene_dir, f"{scene_id}_refined.json")
 
+    # 优先复用主管线 (mainv3 Stage 5.1) 已推断的场景图关系 (实例级, 如 bottle_0→table_0)
+    # post_pipeline 无法复现该推断 (需要内存中的 dedup masks/colors), 丢失会导致 5.2 全 floor 跳过
+    scene_graph_json = os.path.join(scene_dir, "relations_scene_graph.json")
+    if os.path.isfile(scene_graph_json):
+        try:
+            with open(scene_graph_json, 'r') as f:
+                sg_data = json.load(f)
+            sg_relations = sg_data.get("refined_relations", {})
+            if sg_relations:
+                # 类别级关系作底, 实例级场景图关系覆盖
+                with open(files['stage1_json'], 'r') as f:
+                    stage1_rel = json.load(f)
+                merged = dict(stage1_rel)
+                merged.update(sg_relations)
+                with open(refined_json, 'w') as f:
+                    json.dump(merged, f, indent=2, ensure_ascii=False)
+                print(f"   ✅ 复用场景图关系: {scene_graph_json} ({len(sg_relations)} 条实例级)", flush=True)
+                print(f"   关系: {json.dumps(merged, ensure_ascii=False)}", flush=True)
+                final_rel = os.path.join(scene_dir, "final_relations.json")
+                with open(final_rel, 'w') as f:
+                    json.dump(merged, f, indent=2, ensure_ascii=False)
+                print(f"✅ Stage 5.1 完成 → {refined_json}", flush=True)
+                return merged
+        except Exception as e:
+            print(f"   ⚠️ 场景图关系加载失败, 回退到 refine 流程: {e}", flush=True)
+
     from tools.refine_other_objects_relations import refine_other_objects_relations
     refined_relations = refine_other_objects_relations(
         stage1_json_path=stage1_json,

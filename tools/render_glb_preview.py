@@ -232,6 +232,32 @@ def render_camview_auto(glb_path, cap=6):
     return out
 
 
+def render_preview_png(glb_path, views=("front", "side", "top", "iso"), size=640):
+    """渲染 GLB 多视角合成预览图 (默认四视图 front/side/top/iso)
+
+    保存为 <glb 同目录>/<stem>_preview.png, 返回输出路径; 失败返回 None。
+    供管线在 Stage5 保存最终 GLB 后自动调用。
+    """
+    try:
+        import cv2
+        scene, n_meshes = build_pyrender_scene(glb_path)
+        if n_meshes == 0:
+            print(f"⚠️ {glb_path}: 没有 mesh 几何, 跳过预览", flush=True)
+            return None
+        bounds = scene.bounds
+        tiles = render_views(scene, bounds, list(views), size)
+        grid = grid2x2(tiles) if len(tiles) > 1 else tiles[0]
+        out = os.path.join(
+            os.path.dirname(os.path.abspath(glb_path)),
+            f"{os.path.splitext(os.path.basename(glb_path))[0]}_preview.png")
+        cv2.imwrite(out, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+        print(f"   🖼️ 四视图预览已生成: {out}", flush=True)
+        return out
+    except Exception as e:
+        print(f"   ⚠️ 四视图预览渲染失败: {e}", flush=True)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="GLB → 多视角预览 PNG (无头 EGL 渲染)")
     parser.add_argument("glb", nargs="+", help="GLB 文件路径 (可多个)")

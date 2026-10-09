@@ -308,8 +308,17 @@ def run_stage6(
         materials_db = load_materials_db()
         return _fallback_default_materials(categories_and_relations, materials_db)
 
-    # 过滤掉背景类别
-    category_names = [cat for cat in categories_and_relations.keys() if cat.lower() not in FILTER_CATEGORIES]
+    # 过滤掉背景类别。
+    # 注意: mainv3 传入的是 Stage5 之后的 refined_relations, key 已是**实例级**
+    # (如 "banana_0"), 而 optimal_frames 的文件名里类别段是**类别级**
+    # ("banana_inst0_frame33.jpg" -> "banana")。直接拿实例级 key 过滤会让所有
+    # 裁剪图都匹配不上 (实测 egodex_13/14/15 全部"未找到任何裁剪图",
+    # Stage6 退化为默认物理参数, 耗时 0.0s)。故比对时统一剥离实例后缀。
+    category_names = set()
+    for _k in categories_and_relations.keys():
+        _cat = re.sub(r'_\d+$', '', str(_k)).strip()
+        if _cat.lower() not in FILTER_CATEGORIES:
+            category_names.add(_cat)
     
     # 从 optimal_frames 中找到所有实例的裁剪图
     # 格式: {instance_key: (crop_path, area)}  如 "bottle_inst0": ("/path/to/file.jpg", 69858)

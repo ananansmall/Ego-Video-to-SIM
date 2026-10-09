@@ -473,6 +473,15 @@ for instance_id, (optimal_frame_id, instance_info) in enumerate(zip(...)):
 | 基础精修 | Stage5内 (3种关系) | **独立为5.0**，始终执行 |
 | 5.1 关系细化 | 无 | **新增**: VLM投票细化 "supported by other objects" → "supported by {name}" |
 | 5.2 空间精修 | 无 | **新增**: 物体间支撑关系几何精修 (on_top/inside/against_side等) |
+| 5.25 落地补正 | 无 | **新增**: 关系为 floor 但悬空的实例压到 z=0 (必须在 5.2 之后, 穿模修复会推高悬空) |
+
+**5.0 与 5.25 的关系来源不同**: 5.0 基础精修读 Stage1 的**类别级**关系, 5.25 用 5.1 输出的
+**实例级** `refined_relations`。当 5.1 推翻 5.0 当时采用的关系 (如 cloth 从
+`attached to wall` 改判 `supported by floor`) 时, 5.0 已错过落地时机, 由 5.25 兜底。
+
+5.25 只修改 `T[2,3]` (纯 z 平移), 不动旋转/水平位置/尺寸 —— 与 5.0 的
+`refine_supported_by_floor_object` 不同, 后者会把物体 y 轴对齐重力方向 (为落地
+家具扶正设计), 对手持小物件会产生 109~119° 的意外旋转。
 
 ### GLB保存
 

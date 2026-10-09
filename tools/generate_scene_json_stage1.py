@@ -27,7 +27,7 @@ import time
 import subprocess
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -148,10 +148,12 @@ SYNONYM_MAP = {
 
 VLM_DETECT_PROMPT = """List all visible objects in this image. Output JSON only.
 
-{{"objects": [{{"name": "cup"}}, {{"name": "chair"}}]}}
+{{"objects": [{{"name": "<object1>"}}, {{"name": "<object2>"}}]}}
 
 Rules:
-- Simple singular names: "cup", "chair", "table"
+- Simple singular English nouns, lowercase, no articles (a/an/the)
+- Describe what you see; do not copy the placeholder names above
+- For thin tall cylinders, prefer "bottle" over "cup" (cup is short and wide)
 - Ignore: hands, body parts, walls, floors, ceilings
 - List each object type once per frame
 
@@ -1233,8 +1235,15 @@ def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRES
 
     unique_objects = []
     for std_name, instances in name_groups.items():
-        representative = instances[0].copy()
-        representative["name"] = std_name
+        # 跨帧多数投票: 按原始名称计数取最高, 而非 instances[0]
+        raw_counts = Counter(inst["name"].lower().strip() for inst in instances)
+        most_name, most_count = raw_counts.most_common(1)[0]
+        # 选中该名称对应实例作为代表, 保持原始大小写
+        representative = next(
+            inst for inst in instances
+            if inst["name"].lower().strip() == most_name
+        ).copy()
+        representative["name"] = representative["name"].lower().strip()
         representative["instance_count"] = len(instances)
 
         centroids = [inst["centroid"] for inst in instances if inst.get("centroid") is not None]
@@ -1382,6 +1391,10 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
     keyframe_floor_masks = sam_results.get('keyframe_floor_masks', {}) if sam_results else {}
     if keyframe_floor_masks:
         floor_3d_points = set()
+        # 原为静默 pass: 任一帧失败都无日志。若所有帧都失败, floor_3d_points
+        # 为空 → 走else 分支 → 地面点云剔除逻辑整体失效且完全无声。
+        _floor_fail = 0
+        _floor_first_err = None
         for frame_idx, floor_mask in keyframe_floor_masks.items():
             if frame_idx < T:
                 try:
@@ -1392,8 +1405,14 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
                     fp_ds = _voxel_downsample(fp, voxel_size=0.1)
                     for p in fp_ds:
                         floor_3d_points.add(tuple(np.floor(p / 0.1).astype(int)))
-                except:
-                    pass
+                except Exception as _e:
+                    _floor_fail += 1
+                    _floor_first_err = _floor_first_err or f"frame {frame_idx}: {type(_e).__name__}: {_e}"
+        if _floor_fail:
+            print(f"   ⚠️ [floor_3d_points] {len(keyframe_floor_masks)} 帧中 {_floor_fail} 帧提取失败"
+                  f" (首个: {_floor_first_err})", flush=True)
+        if not floor_3d_points and keyframe_floor_masks:
+            print(f"   ⚠️ [floor_3d_points] 全部帧均未提取到地面点 → 地面剔除将跳过", flush=True)
 
         if floor_3d_points:
             point_voxels = set(tuple(row) for row in np.floor(all_points / 0.1).astype(int))
@@ -1524,7 +1543,7 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
             )
             cropped = image.crop(crop_box)
 
-            output_text = _vlm_inference(cropped, model, processor, SUPPLEMENTARY_VLM_PROMPT, max_new_tokens=256)
+            output_text = vlm_inference(cropped, model, processor, SUPPLEMENTARY_VLM_PROMPT, max_new_tokens=256)
             json_str = _extract_json_from_text(output_text)
 
             if json_str is None:
@@ -1626,12 +1645,20 @@ def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
     if colors is None:
         print(f"   ⚠️  VGGT结果中无colors数据，尝试从帧图像构建", flush=True)
         images = []
+        _img_fail = 0
+        _img_first_err = None
         for vid_idx, frame_path in frame_paths_with_indices:
             try:
                 img = np.array(Image.open(frame_path).convert("RGB"))
                 images.append(img)
-            except:
-                pass
+            except Exception as _e:
+                # 原为静默 pass: 读图全失败时返回空 colors, Stage6 材质标注
+                # 拿不到颜色却不会报错, 表现为"材质标注结果异常但无原因"。
+                _img_fail += 1
+                _img_first_err = _img_first_err or f"{os.path.basename(str(frame_path))}: {type(_e).__name__}"
+        if _img_fail:
+            print(f"   ⚠️ [colors] {len(frame_paths_with_indices)} 帧中 {_img_fail} 帧读取失败"
+                  f" (首个: {_img_first_err})", flush=True)
         if not images:
             return {'has_floor': None, 'has_wall': None, 'floor_masks': [], 'wall_masks': [], 'keyframe_floor_masks': {}}
         colors = np.array(images)
@@ -2028,7 +2055,7 @@ def vlm_judge_relationships(unique_objects, sam_results, frame_paths_with_indice
             image = Image.open(frame_path).convert("RGB")
             start_time = time.time()
             frame_prompt = _build_relationship_prompt(frame_objects, has_floor, has_wall)
-            output_text = _vlm_inference(image, model, processor, frame_prompt, max_new_tokens=1024)
+            output_text = vlm_inference(image, model, processor, frame_prompt, max_new_tokens=1024)
             elapsed = time.time() - start_time
 
             json_str = _extract_json_from_text(output_text)
@@ -2233,7 +2260,12 @@ def main():
     parser.add_argument('--vlm_checkpoint_aux', type=str, default=None, help='辅助VLM模型路径 (高精度模型, 如32B, 用于主模型漏检物体补全, 可选)')
     parser.add_argument('--max_frames', type=int, default=12, help='贪心采样关键帧数 (默认12, 提高视角覆盖度)')
     parser.add_argument('--vggt_max_frames', type=int, default=120, help='VGGT 3D重建最大帧数 (默认120, 室内场景足够且提速25%)')
-    parser.add_argument('--temp_dir', type=str, default='./temp_frames_stage2', help='临时帧目录')
+    # 临时帧目录按 PID 隔离: 硬编码路径在多进程并发(如双卡并行跑不同场景)时会被
+    # 另一进程清理/覆盖, 实测报 FileNotFoundError: temp_frames_stage2/frame_000_vid1.jpg
+    # (丢帧, 异常虽被捕获但可能导致漏检)。加 PID 后各进程互不干扰。
+    parser.add_argument('--temp_dir', type=str,
+                        default=f'./temp_frames_stage2_{os.getpid()}',
+                        help='临时帧目录 (默认按 PID 隔离, 避免多进程并发时互相覆盖)')
     parser.add_argument('--centroid_dist_thre', type=float, default=0.15, help='3D去重质心距离阈值/米')
     parser.add_argument('--use_sam', type=str, default='auto', choices=['auto', 'yes', 'no'], help='SAM3 floor/wall分割')
     parser.add_argument('--supplementary_detect', action='store_true', default=True, help='启用点云补充检测（发现远端大物体）')

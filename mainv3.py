@@ -411,9 +411,13 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
     if np.allclose(R, np.eye(3), atol=1e-6):
         print("   Stage 2.5 (VLM辅助) 失败, 尝试 Stage3 (large_plane)...", flush=True)
         vlm_model, vlm_processor = _load_vlm_model(vlm_checkpoint)
+        # 形参是 large_plane_masks (大平面mask), 原先传floor_masks 导致
+        # geometry_utils.align_via_large_plane 内L469 `enhanced_masks` 非空,
+        # L471 的 VLM 大平面分割分支永不执行 —— stage3 退化成 stage2 的重复品。
+        # 传空列表以启用该分支 (floor 平面由该函数自行分割+拟合)。
         R, t, alignment_info = align_via_large_plane(
             vggt_prediction_results['world_points'],
-            floor_masks,
+            [],   # large_plane_masks: 留空以触发 VLM 大平面分割
             vggt_prediction_results['colors'],
             sam3_image_model,
             vlm_model,
@@ -430,7 +434,22 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
             vggt_prediction_results['world_points'],
             extrinsics=vggt_prediction_results['extrinsics'],
         )
-        alignment_stage = "stage4_geocalib"
+        # B: align_via_geocalib 失败时返回 (np.eye(3), zeros, {'reason': ...})。
+        # 原先无条件写 alignment_stage="stage4_geocalib", 于是 JSON 里同时出现
+        #   alignment_stage: stage4_geocalib
+        #   reason: geocalib_poor_alignment R[2,2]=0.3185
+        #   R = 单位阵
+        # 三者自相矛盾, 且下游把单位阵当成功用 (7a_vggt_omega 实测)。
+        # stage4 是最后一级, 失败后必须显式标记, 不能记账为成功。
+        _geocalib_failed = np.allclose(R, np.eye(3), atol=1e-6)
+        if _geocalib_failed:
+            alignment_stage = "stage4_geocalib_FAILED"
+            print(f"   ⚠️ Stage4 (GeoCalib) 也失败: "
+                  f"{alignment_info.get('reason', '未知原因')}", flush=True)
+            print("      → 坐标系未对齐 (R 为单位阵), 下游物体会保持 VGGT 原始坐标系",
+                  flush=True)
+        else:
+            alignment_stage = "stage4_geocalib"
 
     print(f"   坐标系对齐完成: {alignment_stage} (R[2,2]={R[2,2]:.4f})", flush=True)
 
@@ -1157,6 +1176,43 @@ def run_stage5(output_path, categories_and_relations, all_instances,
         print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
     _t52_time = time.time() - _t52
     print(f"   ⏱️ 5.2 耗时: {_t52_time:.1f}s", flush=True)
+
+    # ── 5.25: 摆放补正 (必须在 5.2 之后) ──
+    # 5.2 的穿模修复只做"分开"不做"定位": 关系为 floor 的会被推高, 关系为
+    # on_top 的会因零间隙接触被误判穿模而推离支撑物 (实测 104 个 on_top 关系
+    # 只有 3 个贴合)。这里按5.1 的实例级关系把两类摆正。
+    _t525 = time.time()
+    from src.sp_refinement import (ground_floating_objects, reseat_on_top_objects,
+                                   dump_placement_audit)
+    all_instances, n_grounded = ground_floating_objects(
+        all_instances, refined_relations, verbose=True)
+    print(f"   🔧 落地补正: {n_grounded} 个悬空实例已压到地面", flush=True)
+    # 5.2 落盘的每实例策略 (on_top/inside/...); 缺失时reseat 退化为只看关系,
+    # 此时无法区分 inside, 会在日志打印提示。
+    _strategy_path = os.path.join(output_path, "placement_strategies.json")
+    _strategies = None
+    if os.path.isfile(_strategy_path):
+        try:
+            import json as _json
+            with open(_strategy_path, encoding="utf-8") as _f:
+                _strategies = _json.load(_f)
+        except Exception as _e:
+            print(f"   ⚠️ 读取 placement_strategies.json 失败: {_e}", flush=True)
+    all_instances, n_reseated = reseat_on_top_objects(
+        all_instances, refined_relations, placement_strategies=_strategies, verbose=True)
+    if _strategies is None:
+        print("   ⚠️ 未找到 placement_strategies.json, on_top 重贴无法区分 inside, "
+              "可能把 inside 的物体错贴到支撑物顶面", flush=True)
+    print(f"   🔧 on_top 重贴: {n_reseated} 个实例已贴回支撑物顶面", flush=True)
+    # 落盘摆放审计 (每实例世界 AABB / gap / 水平重叠), 供离线验收与后续修复比对。
+    # 必须在两道补正之后 —— 记的是最终位姿。
+    try:
+        dump_placement_audit(all_instances, refined_relations,
+                             placement_strategies=_strategies,
+                             output_dir=output_path, verbose=True)
+    except Exception as _e:
+        print(f"   ⚠️ 摆放审计失败 (不影响主流水线): {_e}", flush=True)
+    print(f"   ⏱️ 摆放补正耗时: {time.time() - _t525:.1f}s", flush=True)
 
     print(f"✅ Stage 5 完成", flush=True)
     return all_instances, refined_relations

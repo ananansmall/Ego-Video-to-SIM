@@ -354,7 +354,8 @@ def _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_norma
 def align_via_objects(world_points, wall_masks, floor_masks,
                       wall_mean_distance_thres=0.05,
                       floor_mean_distance_thres=0.05,
-                      orthogonal_threshold_deg=80):
+                      orthogonal_threshold_deg=80,
+                      floor_area_min=0.5):
     '''
     阶段2: 放宽阈值 + 只用floor平面建立坐标系.
 
@@ -362,6 +363,14 @@ def align_via_objects(world_points, wall_masks, floor_masks,
       1. 放宽 mean_distance 阈值 (0.02 → 0.05)
       2. 放宽正交条件 (85° → 80°)
       3. 如果没有正交wall, 只用floor平面 + 点云PCA确定水平方向
+      4. 地板候选面积过小时放弃 (见下)
+
+    floor_area_min: 地板候选的最小面积 (m²)。
+      过小的地板mask 拟合出的法向不可靠, 会把整个场景转歪。
+      实测 151_C7_Plate 的 floor_area=0.319, 旋转后 13/29 个物体
+      深埋地下 (-0.12 ~ -1.51m); 而其余 floor+pca 成功的场景
+      (002/bottle/egodex_30) 面积都在 1.479 ~ 2.268。
+      0.5 取在两者之间, 远低于正常下限、远高于失败值。
 
     Returns:
       (R, t, info_dict): 成功
@@ -396,6 +405,20 @@ def align_via_objects(world_points, wall_masks, floor_masks,
     floor_plane_info = max(valid_floor_plane_infos, key=lambda x: x['area'])
     floor_normal = floor_plane_info['normal']
     floor_centroid = floor_plane_info['centroid']
+
+    # 地板 mask 面积过小时, 平面拟合的法向不可靠: 少量点无法约束法线,
+    # 拟合结果会偏向点云自身的噪声方向。此时整体旋转会把场景转歪,
+    # 表现为部分物体深埋地下、部分精确贴地。
+    # 直接放弃本级, 让mainv3 降级到 Stage3(large_plane) —— 那条路径用
+    # SAM3 大平面mask, 对"报纸铺满台面"这类场景反而更适配。
+    # 注意不能改成"跳过该候选取次大": 次大候选同源, 同样不可靠。
+    if floor_plane_info['area'] < floor_area_min:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'floor_area_too_small',
+            'floor_area': float(floor_plane_info['area']),
+            'floor_area_min': float(floor_area_min),
+            'n_floor_valid': len(floor_plane_infos),
+        }
 
     all_points = world_points.reshape(-1, 3)
     floor_normal = _orient_floor_normal(floor_normal, floor_centroid, all_points)

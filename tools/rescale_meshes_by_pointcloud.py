@@ -181,14 +181,27 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
                 # - 水平向 (x/y): 点云 min-max 比例 (桌面/椅面面积大, 分割可靠)
                 # - 垂直向 (z): 根据点云 z_min 是否接近地面决定
                 #   * 点云 z_min 接近地面 (如椅子, 椅背/座面大, 分割可靠): 用 min/max
-                #   * 点云 z_min 远离地面 (如桌子, 桌腿细, VGGT 深度不可靠): 用 z_max
-                #     (桌面面积大、分割可靠 → z_max 可信; 桌腿点云停在桌面底部而非地面)
-                ground_z = float(np.concatenate([wp[i].reshape(-1, 3) for i in range(len(wp))])[:, 2].min())
+                #   * 点云 z_min 远离地面 (如桌子, 桌腿细, VGGT 深度不可靠): 用顶面到地面的实际高度
+                #     z_range = z_max - ground_z (桌面面积大、分割可靠 → z_max 可信;
+                #     桌腿点云停在桌面底部而非地面, 必须减去 ground_z 才能恢复真实高度)
+                # ground_z 用 2% 分位 (不是 min): min 会被埋地的椅子污染
+                # (椅子埋地 z=-0.682, 拉低全场景 min; 2% 分位在地面附近, 更可靠)
+                _all_z = np.concatenate([wp[i].reshape(-1, 3) for i in range(len(wp))])[:, 2]
+                ground_z = float(np.percentile(_all_z, 2))
                 z_min_pc = float(np.array([s[3][2] for s in frame_stats(wp, pre_cat[best_idx])]).min())
+                z_range = float(z_max - ground_z)  # 地面到顶面的实际高度
                 k_xy = float(np.median(ext_pc[:2] / np.maximum(ext_mesh[:2], 1e-6)))
                 if z_min_pc - ground_z > 0.30:
-                    # 点云 z_min 远离地面 → 桌腿没测到, 用顶面 (z_max)
-                    k_z = float(z_max / max(ext_mesh[2], 1e-6))
+                    # 点云 z_min 远离地面, 分两种情况:
+                    if z_min_pc - ground_z >= 0.50:
+                        # 抬高物体 (放在家具上, 如桌上的瓶子):
+                        # z_max - ground_z 会把家具高度算进物体 → 严重放大
+                        # (HOI4D 实测: 0.25m 瓶子被算成 1.15m → k_z=2.5 → 1m 高瓶)
+                        # 此时点云自身 z 跨度 (z_max - z_min_pc) 就是物体真实高度
+                        k_z = float((z_max - z_min_pc) / max(ext_mesh[2], 1e-6))
+                    else:
+                        # 落地家具但腿被遮挡 (gap 略超阈值): 顶面到地面 = 真实高度
+                        k_z = float(z_range / max(ext_mesh[2], 1e-6))
                     is_hybrid = True
                 else:
                     # 点云 z_min 接近地面 → 底部可见, 用 min/max
@@ -216,19 +229,56 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
             vw2 = (T_new @ np.hstack([mesh.vertices,
                                       np.ones((len(mesh.vertices), 1))]).T).T[:, :3]
             if is_hybrid:
-                # 混合策略: z 用 (z_max_after - min_z_after) 与 z_max 比
+                # 混合策略: z 用校准后高度与「点云自身 z 跨度」比 (应≈1.0)。
+                # 必须与 k_z 的分子同源: k_z = pc_z_span/mesh_z, 所以校验也用
+                # pc_z_span。早先这里用 z_range (=z_max-ground_z) 做参照, 而
+                # ground_z 是全场景 2% 分位、会被埋地家具拉低 (HOI4D 实测 -0.757,
+                # 真实地面远高于此), z_range 被撑大约 0.76m → after_z 一律 0.2~0.3,
+                # 把测量本来正确的实例 (pc/mz≈1.0) 全判成垃圾而回退 k=1。
+                # 抬高分支 k_z 用点云自身跨度, 正好与此处同源。
+                pc_z_span = float(z_max - z_min_pc)   # k_z 的分子, 与之同源
+                if pc_z_span <= 1e-6:
+                    pc_z_span = float(ext_pc[2])
                 z_after = vw2[:, 2].max() - vw2[:, 2].min()
                 after_ratio = np.array([
                     (vw2[:, 0].max() - vw2[:, 0].min()) / max(ext_pc[0], 1e-6),
                     (vw2[:, 1].max() - vw2[:, 1].min()) / max(ext_pc[1], 1e-6),
-                    z_after / max(z_max, 1e-6),
+                    z_after / max(pc_z_span, 1e-6),
                 ])
             else:
                 after_ratio = (vw2.max(0) - vw2.min(0)) / np.maximum(ext_pc, 1e-6)
-            all_after_ratios.append(after_ratio)
-
             fmt = lambda r: "/".join(f"{x:.2f}" for x in r)
             tag = "混合" if is_hybrid else ("静止段" if moved else "全帧")
+
+            # ── sanity guard: 校准自校验, 垃圾测量回退 k=1 ──
+            # k 由点云测得, 校准后 mesh 应与点云吻合; 吻合不上说明测量本身
+            # 不可信 (薄/平/透明物体如窗帘/电视/透明瓶的深度噪声),
+            # 此时保留 SAM3D 原始尺寸 (k=1) 比套用垃圾缩放更安全。
+            # 实测依据 (3chair 23 实例): 好校准 after≈1.0±0.3 且各轴一致;
+            # 垃圾校准 after 出现 1.7~14.8 的偏离 (curtain_6 达 14.84)。
+            _K_MIN, _K_MAX = 0.5, 2.0             # 移动物体单轴缩放比合法范围
+            _AFTER_MIN, _AFTER_MAX = 0.70, 1.55   # 校准后各轴比值合法范围
+            if moved:
+                # 移动物体只信最长轴, after 在该轴恒=1 无信息量, 改查 k 本身
+                guard_ok = _K_MIN <= k_val <= _K_MAX
+                guard_why = f"移动分支 k={k_val:.2f} 超出 [{_K_MIN},{_K_MAX}]"
+            else:
+                _lo, _hi = float(after_ratio.min()), float(after_ratio.max())
+                guard_ok = (_lo >= _AFTER_MIN and _hi <= _AFTER_MAX)
+                guard_why = f"校准后比值 {fmt(after_ratio)} 超出 [{_AFTER_MIN},{_AFTER_MAX}]"
+            if is_hybrid:
+                # 混合分支 after_z ≡ 1.0 (k_z 由同一条公式构造), 自校验失明,
+                # 补查 k_z 本身: 抬高物体 z 公式出错时 k_z 会到 2.5+
+                _KZ_MIN, _KZ_MAX = 0.4, 2.0
+                if not (_KZ_MIN <= k_z <= _KZ_MAX):
+                    guard_ok = False
+                    guard_why = f"混合分支 k_z={k_z:.2f} 超出 [{_KZ_MIN},{_KZ_MAX}]"
+            if not guard_ok:
+                print(f"{cat}_{ii:<9}[guard] 测量不可信, 保留原始尺寸: {guard_why}")
+                rescaled[cat].append({**c, "T": T.copy()})
+                continue
+
+            all_after_ratios.append(after_ratio)
             print(f"{cat}_{ii:<9}{tag:<6}{n_used:>3}/{n_total:<3}"
                   f"{k_val:>7.3f}  {fmt(ext_mesh / np.maximum(ext_pc, 1e-6)):>20}"
                   f"{fmt(after_ratio):>20}")

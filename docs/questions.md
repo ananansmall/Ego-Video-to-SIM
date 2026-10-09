@@ -356,3 +356,477 @@ Stage5.2 的执行顺序（refine_inter_object_relations）：
 **结论**：stage5 确实有问题（该场景生成于 Q10 修复之前）。修复方式：用当前代码重跑 `tools/run_post_pipeline.py --scene_dir <场景> --stage5`，让修复后的 on_top 精修把瓶子放回桌面，同时地面对齐会重新处理椅子埋地问题。
 
 另外本次修了校准模块自身一个 bug：绕质心缩放使落地家具悬浮（table min_z 0→0.249），已改为**底面中心锚定**（水平位置不变、贴地物体仍贴地），k 值与校准效果不受影响。
+
+## Q15: xy 不是有相对的修复吗？Phase3 悬空该怎么修？ (2026-09-28)
+
+**问**: 现有代码不是有 xy 修复吗？接触比 0% 只修 z 的问题应该怎么修？
+
+**答**:
+1. 现有 "xy偏移" 逻辑 (refine_inter_object_placement.py L1467-1527) 是**反向跟随**:
+   支撑物在穿模解决中被移动时, 其上小物体跟随同样的 xy delta。
+   它不解决"物体不在支撑面上"的问题。
+2. 更底层的根因: **shapely 从未安装**, `_project_footprint` 静默返回 None,
+   所有历史日志的"接触比 0.0%"都是假值, Phase3 一直在盲目 z 对齐。
+   → 安装 shapely 2.1.2 修复。
+3. Phase3 新增 xy 拉回: 接触比 <5% 时, 把物体平移到支撑足迹内缩区最近点
+   (上限 0.6m), 再重算 z。实测 bag/bottle 拉回后接触比 89%/85%。
+
+## Q16: HOI4D 瓶子 1m 高 + 悬浮，supporter 分配有错吗？ (2026-10-01)
+
+**问**: 082_C5 场景瓶子全 1m 高、部分悬浮，是 5.1 场景图把家具分配错了吗？
+
+**答**: 分配本身没错（场景图区分了 table_0/table_1，bowl_2 正确分到 table_1）。
+真正根因有两个:
+1. 校准混合分支的 z 公式 k_z=(z_max-ground)/mesh_z 只对落地家具成立。桌上的瓶子
+   gap=0.9m 时把桌高算进瓶高 → k_z≈2.5 → 1m 高瓶。guard 因 after_z≡1.0 而失明。
+   → 修复: gap>=0.50 改用点云自身 z 跨度; guard 补查 k_z ∈ [0.4,2.0]。
+2. Phase2 悬空修复只修 z 不修 xy（与 bag 问题同源）。
+   → 修复: 抽取 _pull_xy_into_supporter() 公共函数，Phase2/Phase3 共用。
+
+## Q17: 为什么 Stage5 跑 2h43m 这么长？ (2026-10-01)
+
+**答**: 时间炸弹在 Stage5 的 VLM 调用数 = 实例数 × 投票帧数:
+- 5.1: 每实例 3 次调用 × ~40s (25 实例 → 54min)
+- 5.2: 23 对支撑 × ~11 帧投票 (帧映射修复后调用真实发生, ~25min)
+已实施投票帧数上限 (5.2 [:5], 5.1 关键帧 [:1]), 预期省 ~30min。
+遗留两大瓶颈: 5.1 单次调用延迟 (标注图全场景 JSON 可裁剪) 和
+穿模修复 O(N²) 相交检测 (~34min), 属独立优化任务。
+
+## Q18: `_vlm_inference is not defined` 是怎么回事？影响有多大？ (2026-10-02)
+
+**问**: Stage1 补充帧检测 10/10 报 `❌ 错误: name '_vlm_inference' is not defined`，这个 bug 修一下。
+
+**答**: `src/vlm_logger.py` 重构时把 `_vlm_inference` 改名为 `vlm_inference`（统一 VLM
+日志入口），但 3 处调用点没跟上，NameError 被 try/except 吞掉只打 ❌:
+1. generate_scene_json_stage1.py L1536（补充帧检测）
+2. generate_scene_json_stage1.py L2040（Stage1 7.3 关系跨帧投票）
+3. refine_inter_object_placement.py L504（Stage5.2 放置策略投票）
+
+其中 2 和 3 是**静默失效**——比报错更严重:
+- Stage1 关系投票从未生效 → stage1 关系恒为全 "supported by floor"（全靠 5.1 兜底）
+- 5.2 放置策略投票从未生效 → 恒 fallback "on_top"（inside/against_side 从未触发）
+
+已全部改为 `vlm_inference`，py_compile 通过。**行为变化提醒**: 修复后重跑，
+stage1 关系将首次按 VLM 多数投票输出，5.2 策略也会开始真正区分——结果分布会变，
+需对比确认合理性而非当作退化。
+
+## Q19: 为什么 23/25 实例的尺寸校准都被 guard 拦截了？ (2026-10-03)
+
+**问**: HOI4D 重跑后校准日志显示 23/25 实例"测量不可信, 保留原始尺寸",
+z 比值一致地落在 0.06~0.28，guard 形同把校准整个取消了。
+
+**答**: guard 的**校验参照物与实际缩放量不同源**。
+混合分支用 `k_z = (z_max - z_min_pc) / mesh_z` 缩放 z，却拿
+`z_range = z_max - ground_z` 做 after 校验；而 `ground_z` 是全场景 z 的 2% 分位，
+被埋地家具拉到 -0.757（真实地面远高于此），z_range 被撑大约 0.76m，
+于是 `after_z = z_after/z_range` 一律 0.2~0.3 —— 测量本来正确的实例
+（实测点云z/meshz = 0.80~1.17，高度吻合）被全判成垃圾。
+
+同一个错误有两面: 公式不等时被污染的 z_range **误杀好结果**；
+公式恰好相等时 after_z≡1.0 **自校验失明**（此前 scissor_1 就是这样漏过去的）。
+
+**诊断教训**: 前两轮推断都错了 — 先怀疑 moved 分支、再怀疑分支选择错，
+用真实数据复现后都被推翻（moved=False；换 mesh_min_z 判据 0/25 改变）。
+**真正定位靠的是直接打印 pc_z/mesh_z 这个"应该≈1"的量**，
+一眼看出点云测量本来是好的，问题在校验逻辑而不在测量。
+教训: 遇到"大量实例同时异常"时，先找一个"应该等于某个常数"的中间量验证，
+而不是在分支逻辑里推演。
+
+**→ 修复**: after_ratio[2] 参照物改为 `pc_z_span = z_max - z_min_pc`，
+与 k_z 分子同源。实测拦截数 22/25 → 2/25，剩余 2 个（贴地剪刀 mesh_z≈0.01m）
+属真实点云不可信，拦截正确。
+
+## Q20: 5.1 关系全对，为什么 21 个物体还是没被放到桌上？ (2026-10-03)
+
+**问**: HOI4D 082_C5 跑完，5.1 明确输出 23 个 `supported by table_0`，
+但物体底面全在 z≈0 而台面 z=0.971 —— 关系对了，位置却没动。
+
+**答**: `sp_refine_on_top` 开头有 `if refinement_degree == "correct": return`，
+而 `refinement_degree` 来自 `_judge_refinement_degree_with_vlm` —— 它**看照片**回答。
+视频里瓶子确实在桌上，视觉上就是 "correct"（实测 23/23 全答 correct），
+但 3D 坐标是错的。**用 2D 视觉判断否决了明确的几何事实**。
+
+**这是 Q18 那个 bug 修复后暴露的**: 修复前 `_vlm_inference` 静默失败被 except 兜底
+返回 "minor"，反而触发了 z 对齐，瓶子被正确放到桌上。修复后 VLM 真正工作，
+缺陷才显形。**静默失败曾意外充当了兜底** —— 修bug 时要留意这类"意外正确"，
+它会在 bug 被修好时变成新问题。
+
+**→ 修复**: 改为几何优先。`gap >= 0.15m` 说明几何上必定错位，不问 VLM 直接对齐；
+只有几何已贴合时才问 VLM（保留"避免无谓调整"的原意）。副作用是 VLM 调用
+23 次 → 0 次，再省约 20 分钟。
+
+## Q21: 5.2 每个物体投票 60 多次，不是上限 5 帧吗？ (2026-10-03)
+
+**问**: 代码里 `_MAX_VOTE_FRAMES = 5`, 但日志显示每个物体投票 60~65 次。
+
+**答**: 上限只在单次调用内生效, 管不住外层循环。外层遍历该类别下**每个实例**
+各调一次 (bottle 有 16 实例 → 16×5 = 80 次), 而要回答的问题"bottle 相对
+table_0 怎么放"与具体哪个实例无关; 最终又只取第一个实例的结果。
+
+全场景 1078 次调用 ≈ 38 分钟, 换回一句 `{"strategy": "on_top"}`。
+
+**→ 修复**: 按类别选代表实例 (帧最多者) 只投一次 → 20 次 (降 98%)。
+验证 4 个类别内部投票结果全部一致, 语义等价。
+
+**附带发现**: 该处 `vlm_inference` 漏传 `caller` 参数, 导致这 1078 次调用
+在 vlm_conversation.jsonl 里全归因为 `unknown` —— 日志归因缺失让这个问题
+一开始难以定位。补上 `caller="stage5_placement_strategy"`。
+
+## Q22: 穿模检测 FCL 5.5s/对，降密到 10% 能不能提速？ (2026-10-03)
+
+**问**: 25 实例穿模检测跑了 40 分钟。想按"粗筛+细筛"优化。
+
+**答**: 先测了真实瓶颈分布, 发现**粗筛（AABB）代码里已经有了**, 而且很便宜:
+300 对 → AABB 相交 44 对 (过滤 85%), 仅 0.56s。瓶颈在 FCL 细筛: 44 次 ×
+5.51s = 245s/轮。真正的原因是网格有 **594 万顶点**, FCL 每次碰撞都要建 BVH。
+
+验证了两个假设, **都被否证**:
+1. 复用 BVH (预构建 manager 复用查询): 摊销后 4.95s/对, 反而略慢。构建 2.6s/个,
+   查询 2.35s/对 —— 开销不只在构建, 查询本身也慢。
+2. 降密: 装了 `fast_simplification` 后, 降到 10% 面时**单轮检测判定完全一致**
+   (18 穿透, 0 漏报 0 误报, 深度误差中位 5mm), 单对 5.51s → 0.51s。
+
+**但最终没有采用降密** —— 因为完整验证推翻了结论:
+| | 预测 | 实测 |
+|---|---|---|
+| 提速 | 10.8x | **仅 2.4x** (1057s → 444s) |
+| 最终位置 | 一致 | **9 个实例差异, 最大 0.32m** (table_1 的 z) |
+
+**教训**: 我只验证了"单轮检测的穿透数量一致"就外推"多轮修复结果一致"。
+穿模修复是**迭代过程**, 初始 1~2cm 的深度误差在多轮累积后放大成 0.32m 位置偏差。
+**验证迭代算法必须比对最终输出, 不能只比对中间判据**。
+另外单对提速 10.8x 却没有换来整体 10.8x, 说明迭代轮次内AABB 命中集在变化,
+降密改变了哪些对被判为穿透, 反而增加了需要精确检测的配对数。
+
+**当前状态**: 穿模耗时未优化 (25 实例约 40min)。可行的方向改为:
+(a) 减少迭代轮数(需验证收敛性); (b) 按 AABB 重叠量排序优先处理大重叠对;
+(c) 接受现状 —— 该瓶颈只在 25 实例的拥挤场景出现, egodex 简单场景实例少不触发。
+
+## Q23: inside 策略精修报 unexpected keyword argument 'max_offset' (2026-10-04)
+
+**问**: egodex_0 重跑时 5.2 报 `sp_refine_inside() got an unexpected keyword
+argument 'max_offset'`，但 HOI4D 从未出现过。
+
+**答**: 调用点把 on_top/inside 放在同一个 else 分支，无条件传
+`max_offset/initial_offset/refinement_degree`，但只有 `sp_refine_on_top` 的签名
+支持这三个参数。`sp_refine_inside` / `sp_refine_hanging_below` /
+`sp_refine_leaning` 都只有两个参数。TypeError 被 except 吞掉 → 精修静默失效。
+`leaning` 同理：它与 `against_side` 同分支传 walls_info，但只接受 2 参。
+
+**为什么现在才暴露**: Q18 修复 `_vlm_inference` NameError 之前，VLM 策略判定
+静默失败恒fallback "on_top"，inside/leaning 分支**从未被执行过**。修复后 VLM
+真正工作返回 "inside"，才撞上这条从未运行的代码路径。
+
+**教训（与 Q20 同源，值得记住）**: 静默失败（try/except 吞异常）会让一整条代码
+路径长期不被执行，其中隐藏的错误要等上游 bug 修复后才暴露。**修 bug 时要预期
+会牵出"从未执行的分支"**，尤其当修复让某个条件第一次真正成立时。
+
+**→ 修复**: 按真实签名分派（on_top 传3 参；against_side 传 walls_info；
+leaning/inside/hanging_below 只传 2 参）。五策略实测 5/5 通过。
+
+## Q24: egodex_34 在 Stage3 报 RemoteDisconnected 崩溃？ (2026-10-04)
+
+**问**: egodex_0/1 都跑完了, egodex_34 在 Stage3 崩溃:
+`hydra...InstantiationException: ...dino.Dino: RemoteDisconnected('Remote end closed connection without response')`
+
+**答**: 不是模型或代码问题, 是 SAM3D 的 DINO backbone 依赖联网。
+`sam3d_objects/model/backbone/dit/embedder/dino.py` 用
+`torch.hub.load(repo_or_dir="facebookresearch/dinov2", source="github")`,
+torch.hub 每次会联网访问 GitHub 确认 repo commit。**代码缓存
+(`~/.cache/torch/hub/facebookresearch_dinov2_main`) 与权重
+(`.../checkpoints/dinovov2_vitl14_reg4_pretrain.pth`) 明明都在**,
+但联网那一步失败就让整个模型实例化崩溃。
+egodex_0/1 能跑完只是当时网络恰好可用 —— 这是偶发故障, 迟早会复现。
+
+**→ 修复**: 检测到本地 hub 缓存目录时, 把 repo_or_dir 指向该目录并用
+`source="local"` 完全离线; 无缓存才回退 github 方式。
+实测 `torch.hub.load(local, 'dinov2_vitl14_reg', source='local')` 正常
+(304.4M 参数)。
+
+## Q25: 更正: 关于"瓶身形状失真"的说法不可靠 (2026-10-04)
+
+**问**: 我先后说了两个关于瓶身比例的结论，哪个是对的?
+
+**答**: **两个都不成立，特此更正。**
+
+1. 第一次说"mesh 长宽比 2.4 vs 真实 3.5，形状失真" —— "3.5" 是我按常见饮料瓶规格
+   **估算**的，没有量过该视频里的瓶子。
+2. 第二次说"形状没失真，粗的是整体尺度 (mesh 直径是点云的 1.82 倍)" —— 用点云实测
+   得出，但**该数据本身不可信**。
+
+**不可信的原因 (实测确认)**: HOI4D 的 mask 只标注**可见面**。圆柱形瓶子的侧壁
+背面没有点云, 实测 xy 直径只有 0.037~0.106m (3.7~10.6cm), 明显小于真实直径 ——
+**系统性低估**。细长物体尤其严重 (侧面几乎完全不可见)。
+
+因此当前**无法判断**瓶身比例是否正确, 因为缺少可靠测量基准。
+HOI4D 提供 GT mesh, 但本地只下载了 N15/N46/N47 三个子集, **没有 082**。
+
+**各向异性残差 0.44~0.50 的正确解读**: 它不是 stage5 的问题, 而是校准环节的
+测量局限 (点云只见可见面, xy 方向尤甚)。该残差**早于本轮修复存在** —— 修复前
+22/25 实例被 guard 整体拦截, 残差不可见; 修复后 21/25 生效, 残差才显形。
+**修复让原本被掩盖的问题暴露出来, 不是修复引入的。**
+
+**教训**: 得出"某测量与另一测量不一致"的结论前, 必须先确认**两个测量都可信**。
+我这次连续两次把不可信的点云测量当成了基准。
+
+## Q26: 日志里 "跳过 'box_0': 支撑物 'table_0' 未找到" 是什么意思？ (2026-10-04)
+
+**问**: egodex_1 跑完后 5.2 出现 `跳过 'box_0': 支撑物 'table_0' 未找到`，
+box_0 的位置就没被修正，为什么？
+
+**答**: **VLM 幻觉出了场景里不存在的支撑物**。Stage1 检测到的类别是
+`[box, cube, marker, phone, plier, pop-it, rubik's cube, tool, toy]`,
+**没有 table**; 但场景图推断时 VLM 给 box_0 投了 2 票 `supported by table_0`
+成为最高票。
+
+下游 `refine_inter_object_placement` 遇到支撑物找不到时只 `continue` 打印"跳过",
+**不会修正关系** —— 于是 box_0 的位置精修被静默丢弃, 物体停在错误位置。
+
+**→ 修复**: 在 `infer_relations_scene_graph` 的 Step 3 之前加 **Step 2.5 支撑物
+存在性校验**: 支撑物必须属于场景实际存在的实例集合, 不存在则剔除该票并用其他
+有效票重新投票, 无其他有效票则回退 Stage1 原关系。绝不保留幻觉支撑物。
+实测 box_0 正确回退, 该物体不再丢失精修。
+
+**顺带发现 (未改)**: 三集里 "supported by other objects" 占比都偏高
+(7/ 6 / 2 个)。这些物体实际都在桌/箱子上, 说明 VLM 常常只能给出"某个物体"
+而给不出具体名字。这种关系下游视作合法支撑对但无法解析到具体实例, 精修同样
+不生效 —— 属独立议题(需要让 other objects 能被解析到具体支撑物)。
+
+## Q27: Stage6 材质标注一直显示"未找到任何裁剪图"，耗时 0.0s？ (2026-10-06)
+
+**问**: 批量跑 egodex 时发现 Stage6 每次都是
+`未找到任何裁剪图，使用默认物理参数` + `Stage 6 (材质物理标注) 0.0s (0.0%)`，
+但 `optimal_frames/` 目录里裁剪图明明存在。
+
+**答**: **key 层级不匹配**。
+- `mainv3` 传给 `run_stage6` 的是 `refined_relations`，而Stage5 之后它已经是
+  **实例级** 的 key (如 `banana_0`、`sheet_1`)
+- `material_annotator` 用这些 key 过滤 `optimal_frames` 文件名，而文件名里的
+  类别段是**类别级** 的 (`banana_inst0_frame33.jpg` → `banana`)
+- 实例级 key 与类别级文件名**交集恒为空** → 裁剪图全被过滤 → 走默认物理参数，
+  Stage6 等于没跑
+
+**注意**: 裁剪图存在却报"未找到"，因为过滤条件不匹配，不是文件缺失。
+
+**→ 修复**: 比对时把 key 的实例后缀 `_N` 剥掉再匹配。
+实测 egodex_15 匹配到 10 张、egodex_13 匹配到 7 张（修复前均为 0）。
+
+**诊断弯路**: 先怀疑正则 `(\w+)_inst(\d+)_frame\d+\.jpg` 不匹配含空格/连字符的
+类别名 (如 `rubik's cube`、`pop-it`)，实测这两个数据集的类别名都是纯字母数字,
+正则正常匹配 —— 假设被否证。**真正原因要靠"实际跑一遍匹配逻辑"定位, 不能靠读代码猜。**
+
+## Q28: 双卡并行跑 egodex 时报 temp_frames_stage2 文件不存在？ (2026-10-06)
+
+**问**: 双卡并行批量跑时出现
+`❌ 错误: [Errno 2] No such file or directory: '.../temp_frames_stage2/frame_000_vid1.jpg'`
+
+**答**: **临时目录没有进程隔离**。
+`generate_scene_json_stage1.py` 的 `--temp_dir` 默认值是硬编码的相对路径
+`./temp_frames_stage2`。两条管线 (GPU0/GPU1) 同时跑 Stage1 时, 一个进程清理/
+覆盖了另一个进程的帧文件, 于是 `shutil.copy2` 找不到源文件。
+
+影响: 异常被捕获, Stage1 仍能完成 (实测那次的 egodex_19 报出 4 个物体),
+**不致命但会丢帧** —— 多实例场景下可能漏检, 且属于随机性故障难复现。
+
+**→ 修复**: 默认临时目录按 PID 隔离 (`./temp_frames_stage2_{os.getpid()}`),
+多进程并发时各用各的目录。py_compile 通过, `os` 已在该文件导入。
+
+**注意**: 修复前的并发运行结果理论上可能有丢帧, 严格来说受影响的那几个场景
+需要重跑才能确保无漏检。
+
+---
+
+## 附: 双卡并行实测汇总 (2026-10-06)
+
+14 个 egodex 场景全部 rc=0 完成。Stage6 修复后的实测:
+- 裁剪图匹配: egodex_15 匹配到 10 张、egodex_13匹配到 7 张 (修复前均为 0)
+- 日志里 "未找到任何裁剪图" 计数降为 0
+
+---
+
+## Q29: 3 个场景 SAPIEN 渲染出来全是纯灰, 物理却是正常的, 为什么？ (2026-10-08)
+
+**问**: `7_vggt_omega`、`phone_vggt_omega`、`egodex_0_rescaled` 跑
+`tools/stage61_physics_sim.py` 时, 物理明明跑了 (物体 z 有真实位移)、actor 也
+装进去了 (含 RenderBodyComponent)、相机位姿读回正确、mesh 有效, 但 `get_picture`
+拿到的画面**恒为纯灰**, 连额外加的 probe 测试方块都看不见。换 CPU/GPU PhysX、
+换 mesh、换物体数量、整目录克隆到 /tmp 都一样。
+
+**答**: 这是 **SAPIEN 渲染引擎内部与实体位姿的同步脱钩**, 不是数据问题也不是硬件
+问题 (实测 GPU0/1 各有 38~47GB 空闲)。穷尽 6 组对照实验后确认与 mesh 内容、
+物体数量、坐标正负、URDF 结构均无关 —— 根因在渲染引擎内部, 继续挖成本过高。
+
+**→ 绕过方案 (方案 B)**: **物理与渲染解耦**。SAPIEN 只跑物理并逐帧记录位姿,
+pyrender 离线重建渲染:
+
+```bash
+# 单场景
+python tools/stage61_physics_sim.py --output_dir output_v2/<scene> --pyrender_render
+# 批量 (含全部 8 个场景)
+PYRENDER=1 bash tools/stage61_batch_run.sh 120
+```
+
+关键点:
+- 完全不创建 `SapienRenderer`, 也不加任何 visual 组件 → 从根上避开该缺陷
+  (物理本身不受影响, `sapien.Scene()` 默认后端实测就是 `PhysxCpuSystem`)。
+- 相机用真实 VGGT `w2c` 直接构造 (`c2w = [R.T | -R.T@t]`, 再乘
+  `diag(1,-1,-1,1)` 做 OpenCV→OpenGL 的 Y/Z 翻转), 保留了相机 roll,
+  比原来 "由 pos+fwd 反推 look-at" 更准。
+- 用**真实内参** (fx/fy/cx/cy) 构造离轴 OpenGL 投影, 分辨率取真实视频尺寸;
+  原先硬编码 fovy=50° + 640x480, 与真实相机无关。
+
+**实现中踩的两个坑** (都已在代码注释里标明):
+1. 投影矩阵 `P[1,1]` 必须取 `+2fy/h`。写成负号会让画面绕主点**上下翻转**,
+   表现为地面出现在画面上方、背景出现在下方 —— 容易被误判成 "相机位姿错了"。
+2. pyrender 0.1.45 的 `Scene.add_node()` **不返回 node** (只有 `Scene.add()` 返回),
+   写成 `node = scene.add_node(...)` 会得到 `None`, 随后 `set_pose` 报
+   `Node must already be in scene`。必须自己持有 `Node` 再 `add_node`。
+   (另: `set_pose` 逐帧改位姿是生效的, 早前 "改 node.matrix 不生效" 的记录
+   只针对直接赋 `node.matrix`, 不适用于 `Scene.set_pose`。)
+
+**顺带修掉一个老 bug**: MP4 里红蓝互换 —— `frames` 是 RGB 而 `VideoWriter`
+期望 BGR, 两条渲染路径都补了 `cvtColor(f, COLOR_RGB2BGR)`。
+
+**结果**: 8 个场景统一出 GIF, 3 个原失效场景的彩色像素占比中位分别为
+3.2% / 58.5% / 24.3% (判据为 >0.5%), 均通过自检。其中 `phone_vggt_omega` 有
+37 个 "空帧" (索引 83~119) **不是渲染失败**: 那段真实视频是手持手机特写
+(相机离被摄物极近), 而 sim 里手机已落地离场, 画面只剩地面 —— 已记入报告的
+`empty_frame_indices`。
+
+### ✅ Q30-1: 上述 "Stage 6 与 6.1 断链" 已解决 (2026-10-08)
+
+**根因最后一公里**: Stage 6 输出 key 是 `bowl_inst0`, Stage 6.1 的 URDF link 名
+是 `bowl_0` —— 两边命名约定不一致, 而全仓库没有任何地方做过这两个 mapping。
+
+**→ 修复** (`tools/stage61_physics_sim.py`):
+- `resolve_material()`: `bowl_0` → `bowl_inst0`。命中优先级: 精确 → 该类别材质
+  完全一致时按类别取值 → 放弃(宁可不用也不张冠李戴)。
+- `build_actors` 的 `PhysxMaterial` 改为读 Stage 6 的
+  `static_friction / dynamic_friction / restitution`, 不再写死 0.60/0.50/0.02。
+- 报告新增 `materials_stage6` 段记录覆盖率与逐物体取值。
+
+**关键设计决定 —— 质量不跟着换**: 直觉上应该把质量也换成 `密度×mesh体积`,
+**实测证明不能这么做**: `newspaper_1` 会算出 10.9kg、`table_0` 35kg。密度质量 /
+VLM 质量的中位数是 **5.03x**, 换成线性尺度就是 **≈1.71x** —— 与
+`docs/SAM3D_SCALE_DRIFT_REPORT.md` 里 "SAM3D ~1.5x 绝对尺度漂移" 量级吻合,
+说明是 mesh 整体偏大, 而不是密度不该用。所以:
+- **摩擦 / 恢复系数: 无条件采用 Stage 6** (不依赖绝对尺度, 纯增益)
+- **质量: 默认 `vlm`, `--mass_source density` 可选**, 并把两者比值做成
+  **尺度漂移诊断量** `implied_linear_scale_error` 写进报告。
+
+**验证 (受控 A/B)**: `151_C7_Plate_214deg_vggt_omega` (8 个目标场景里唯一有
+materials.json 的), 材质命中 **29/29 全精确**; 仅开关 `--no_materials`, 初始 z
+完全相同而最终位姿合计 |Δ| = 0.2545 m, 最大单物体 Δ = 5.9cm (`bottle_1`,
+玻璃 0.4/0.4 vs 硬编码 0.6/0.5 → 滑得更远)。**Stage 6 不再是摆设。**
+
+**剩余前提**: 另外 7 个场景当时没跑 Stage 6, 没有 materials.json, 会自动退回旧
+行为并打印 WARN; 补跑 `mainv3 --enable_stage6` 后**无需改代码**即自动生效。
+
+**遗留 (上游数据问题, 非本次引入)**: `151_C7_Plate` 物体在画面里偏小且靠边
+(彩色中位 12.4%)、`082` 相机贴得很近, 属 stage2 对齐 / stage4 重建精度问题;
+pyrender 路径只是把真实相机位姿如实呈现出来。
+
+---
+
+## Q30: 现在的 Stage 6 流程是什么？最终产出什么？有没有 HTML 渲染？ (2026-10-08)
+
+**问**: Stage 6 现在跑到哪一步了, 最终生成的东西是什么, 还有哪些问题,
+有没有 HTML 可视化。
+
+**答**: 要先分清两个同名不同体的东西 —— **Stage 6** 和 **Stage 6.1**。
+
+### 1. Stage 6 = 材质感知的物理参数标注 (`tools/material_annotator.py`)
+
+- 是 `mainv3.py` 管线的**最后一步**, 但**默认关闭**, 要 `--enable_stage6` 才跑
+  (`mainv3.py:31` 抬头说明, `:1585-1596` 唯一调用点, `:1749` argparse)。
+- 流程: 读 `optimal_frames/*.jpg` 裁剪图 → 每个类别问一次 VLM 判断材质 →
+  查 `materials_db.json` 映射成密度/静摩擦/动摩擦/恢复系数。
+- **最终产物**: `<scene>/materials.json` + `<scene>/materials_debug.json`
+  (`material_annotator.py:472-475` / `:486-489`)。
+- ⚠️ **任何一步失败都会静默走 `_fallback_default_materials()`** (`:309/344/361/
+  434/441`), 退化为全默认参数且不阻塞管线 —— 所以 "Stage 6 跑完了" 不等于
+  materials.json 里有真实逐物体材质。历史 bug Q27 就是裁剪图 key 层级不匹配导致
+  整段退化成 0 张匹配。
+
+### 2. Stage 6.1 = URDF 生成 + SAPIEN 物理仿真 (**完全手工**, 未接入 mainv3)
+
+| 步骤 | 脚本 | 产物 |
+|---|---|---|
+| GLB 拆解 → 逐物体 URDF → 合并 | `src/stage61_urdf_generator.py` | `urdf/scene.urdf`、`urdf/mesh/`、`urdf/<obj>/{xxx.urdf,mesh/,urdf_renders/}`、`urdf/stage61_report.json`、`urdf/stage61_validation.json`、`urdf_sim/scene_sim.urdf`+`urdf_sim/mesh/` |
+| 物理仿真 + GIF | `tools/stage61_physics_sim.py` | `stage61_physics.gif` / `.mp4` / `_frame0.png` / `_report.json` |
+
+- 输入是 **Stage 5 的 `final_scene_stage5.glb`** (`stage61_urdf_generator.py:740`
+  `--glb` 必填), **不读 Stage 6 的 materials.json**。
+- `mainv3.py` / `mainv2.py` 全文搜不到 `stage61` / `urdf`, `run_stage61()` 只被
+  自己的 `__main__` 调用 (`stage61_urdf_generator.py:750`)。`--enable_stage61`
+  至今只是旧计划文档 (`docs/design/stage61_urdf_plan.md`, 现已合并为存根) 里的计划, 没实现。
+- `tools/` 下 5 个早期脚本已被弃用: `stage61_sim_sapien.py` / `render_pyrender.py`
+  / `render_scene.py` / `fixed_camera.py` / `visualize_sapien.py`
+  (共同缺陷: 不读 mass/inertia、或干脆不 step 物理、或用彩色 box 占位)。
+  当前实际在用的只有 `stage61_urdf_generator.py` + `stage61_physics_sim.py` +
+  `stage61_batch_run.sh`。
+
+### 3. 还有的问题
+
+1. **Stage 6 与 6.1 断链** (最大问题): Stage 6 辛苦标注的 `materials.json`
+   **没有任何消费者**。URDF 里摩擦系数是 EmbodiedGen 硬编码占位
+   (`<mu1>0.60</mu1><mu2>0.50</mu2>`), 质量/惯量也是占位 (`ixx=iyy=izz=1.0`),
+   只能由 `stage61_physics_sim.py::recompute_inertia` 按 mesh 现算。
+2. **未接入主管线**: 每次都要手工两步跑, 换场景还要手改批量脚本里的场景列表。
+3. **SAPIEN 渲染确定性失效**: 3 个场景画面恒为纯灰 → 已用方案 B
+   (物理+渲染解耦, pyrender 离线渲染) 绕过, 见 Q29 / CHANGE_LOG 2026-10-08 23:00。
+4. **环境分裂**: 批量脚本用 `/mnt/data/lza/conda_envs/sapien` (sapien 3.0.0b1),
+   而旧文档 (`stage61_urdf_plan.md`, 已合并) 写的是 `ReplicateAnyScene` (sapien 3.0.3)。
+   现行口径见 `stage6_physics_sim.md` §6: ① URDF 用 `ReplicateAnyScene`, ②③ 物理+渲染用 `sapien`。
+5. **mesh 命名双前缀**: `urdf/mesh/block_0_block_0.obj` (类别+实例名重复拼接)。
+6. **上游对齐精度**: `151_C7_Plate` 物体在画面里偏小偏边、`082` 相机贴得过近,
+   属 stage2 对齐 / stage4 重建问题, 仿真脚本如实呈现但无法修正。
+
+### 4. HTML 渲染: **当前代码没有任何 HTML 产出**
+
+- 全仓库 96 个 .py 搜 `.html` / `plotly` / `viser` / `trimesh scene export` →
+  **0 命中** (仅在第三方 sam3/vggt 的 URL 注释里出现), 也没引入相关依赖。
+- 磁盘上确实残留 2 个 HTML 文件, 但**生成脚本已从仓库删除**, 属孤儿产物:
+  `output_v2/egodex_gallery.html`、
+  `output_v2/7_vggt_omega/trajectory_overlay/trajectory_gallery.html`
+  (后者由已删除的 `tools/analysis/make_trajectory_gallery.py` 产出,
+  见 CHANGE_LOG 2026-10-06 22:40)。
+- 所以准确说法是: **Stage 6/6.1 的产物全是给人看的 GIF/MP4/PNG 和给机器读的
+  JSON/URDF/OBJ, 没有 HTML 环节**; 想做的话建议补一个像古人轨迹画廊那样的
+  单文件汇总页 (8 个场景并排 GIF + 报告里的关键指标), 成本很低。
+
+## Q31: Stage6 之外（Stage1~5）还有哪些残留问题？ (2026-10-09)
+
+**问**: 批量生产跑了 28+ 个场景，除了 Stage6 的问题，其他阶段还有没有隐藏问题？
+
+**答**: 对 mainv3.py、geometry_utils.py、sp_refinement.py、infer_relations_scene_graph.py、generate_scene_json_stage1.py 做了静态审计，排除已修复项（on_top 重贴、落地补正、穿模发散、tie-break、FLOOR_Z_MAX）后，发现 10 项，前 3 项已逐行实证确认：
+
+### 高严重度（3 项，已确认）
+
+1. **动态轨迹 PLY 只剩最后一帧** — mainv3.py:791-816
+   ```python
+   ply_filename = f"{category}_inst{inst_idx}_dynamic.ply"
+   for fi, (fid, pts) in enumerate(zip(frame_ids, frame_pts)):
+       with open(ply_path, 'w') as f:   # 每帧覆盖, 固定文件名
+   ```
+   本意是红→蓝渐变表示时间顺序的完整轨迹，实际 `dynamic_pointclouds/*.ply` 只有最后一帧的 5000 点。影响：动态轨迹下游可视化/分析拿到的数据是错的，且无任何报错。
+
+2. **Stage3.5 验证删除实例后索引不同步** — mainv3.py:967 + asset_verifier.py:275
+   `verify_all_instances` 返回删除坏实例后的 `all_instances`，但 `all_optimal_frame_ids` / `deduplicated_all_masks` 保持原数量。下游 mainv3.py:1468 `zip(all_optimal_frame_ids[category], category_instances)` 错位：被删的若是实例 0，幸存实例会拿到别人的 optimal_frame_id（attached_to_wall 的 camera_pos 用错帧、rescale 取错 opt_f、5.1 为 ghost 实例推关系）。
+
+3. **Stage1 关键帧 timestamp 用错帧号基准** — generate_scene_json_stage1.py:312 + 2379
+   `timestamp = frame_idx / fps`，其中 frame_idx 来自 VGGT 采样网格（如 120 帧），fps 是原始视频帧率。视频 2379 帧时所有"关键帧"的 timestamp 落在片头 4.8 秒内；`frame_idx >= total_frames` 的钳制 (L309) 也因此永远不触发。VLM 看到的帧与标注的"实际视频时间"完全错位。
+
+### 中严重度（4 项）
+
+4. **5.1 投票用错帧网格** — infer_relations_scene_graph.py:531,676,699：Stage1 元数据的 vid_idx（120 帧网格）直接作 Stage2 colors（160 帧网格）下标取帧，VLM 看的帧与可见性标注错位，代码只防越界不防错位。
+5. **最优帧按文件名子串匹配** — refine_inter_object_placement.py:2298,2303："car" 命中 "toy_car_inst0"，同类别多实例恒取 inst0；匹配不到时回退取目录第一张（别的物体的帧）供 VLM 判"是否放对"。
+6. **实例名双向子串首中即断** — infer_relations_scene_graph.py:537-541,683："table" 误配 "tablecloth_0"。
+7. **同类别多实例校准串用点云** — rescale_meshes_by_pointcloud.py:151-157：按"opt_f 上 mask 最大"从 pre-dedup 片段猜实例来源，同类别多实例常选中同一片段，互相用对方点云校准尺寸。另 mainv3.py:790 `total_frames = len(frame_ids)` 遮蔽 657 行全视频帧数，visible_ratio 分母错（现仅污染日志）。
+
+### 低严重度（3 项）
+
+8. mainv3.py:1463 `refined_relations if 'refined_relations' in dir()` — 该变量 1529 行才定义，条件恒 False，死分支。
+9. mainv3.py:1316,1545 stage5 位姿记录按 category 查询却传入实例级 key，relation 恒 "unknown"。
+
+**已核实非问题**: 7a 日志 `stage1_strict (R[2,2]=-0.4286)` — stage1_strict 有内部质量门（平面拟合残差<0.02m、墙正交 5° 内），R[2,2] 只反映 VGGT 原始坐标系朝向，不表示对齐失败。

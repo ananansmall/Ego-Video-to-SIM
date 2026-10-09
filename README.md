@@ -66,8 +66,8 @@ python -m object_tracking.run_pipeline --glb_path ./outputs/scene/final_scene.gl
 ## Documentation
 
 - [Technical Documentation](TECHNICAL_DOCUMENTATION.md) - Deep technical analysis
-- [mainv2 Technical Doc](docs/mainv2_technical_doc.md) - mainv2 pipeline details
-- [Coordinate & Alignment](docs/coordinate_and_alignment.md) - Coordinate system alignment
+- [mainv2 Technical Doc](docs/pipeline/mainv2_technical_doc.md) - mainv2 pipeline details
+- [Coordinate & Alignment](docs/design/coordinate_and_alignment.md) - Coordinate system alignment
 - [Object Tracking Usage](object_tracking/USAGE.md) - Tracking pipeline guide
 
 ## Acknowledgement

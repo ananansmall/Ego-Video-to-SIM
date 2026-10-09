@@ -192,6 +192,11 @@ PLACEMENT_STRATEGIES = {
 }
 
 VALID_STRATEGIES = set(PLACEMENT_STRATEGIES.keys())
+# on_top 几何对齐阈值(m): 物体底面与支撑物顶面的 z 偏差小于此值才算
+# "几何上已贴合", 此时才咨询 VLM 是否已正确 (VLM 看的是照片, 不能推翻
+# 明确的几何事实 —— HOI4D 082_C5: 悬空 0.971m 却被 VLM 判为 correct,
+# 导致 21 个物体全部没被放到桌面上)。偏差大于此值时直接执行对齐。
+GEOM_ALIGNED_TOL = 0.15
 
 SP_REFINE_MAP: Dict[str, callable] = {}
 
@@ -359,7 +364,11 @@ def _load_optimal_frames_for_instances(optimal_frames_dir, target_names):
             instance_frames[inst_key].append((img, src))
             seen[inst_key].add(src)
             instance_count[cat] = max(instance_count[cat], inst_idx + 1)
-        except Exception:
+        except Exception as _e:
+            # 原为静默 continue: 读不到最优视角图会导致该物体没有投票帧,
+            # 策略恒回退 "on_top" 而日志无任何提示。
+            print(f"      ⚠️ [load_optimal_frame] 读取失败 {img_path}: "
+                  f"{type(_e).__name__}: {_e}", flush=True)
             continue
 
     return dict(instance_frames), dict(instance_count)
@@ -495,18 +504,38 @@ def vlm_lookup_placement_strategy(supported_name, supporter_name, all_pairs,
     """
     prompt = build_placement_prompt(supported_name, supporter_name, all_pairs)
 
+    # 投票帧数上限: 帧列表按 optimal 优先排序, 取前 5 足够统计意义
+    # (HOI4D 23 对支撑 × ~11 帧曾导致 5.2 放置策略 ~25min)
+    _MAX_VOTE_FRAMES = 5
     votes = Counter()
-    for img, src in instance_frames:
+    # 静默失败计数: 曾因 NameError(_vlm_inference 未定义) 导致投票全失败却
+    # 无任何日志, fallback 恒返回 "on_top", 缺陷隐藏数月。这里显式记录失败数,
+    # 让"策略恒为 on_top"能被日志识别, 而不是靠再次踩坑才发现。
+    n_vote_total = 0
+    n_vote_failed = 0
+    first_error = None
+    for img, src in instance_frames[:_MAX_VOTE_FRAMES]:
+        n_vote_total += 1
         try:
-            raw_text = _vlm_inference(img, model, processor, prompt, max_new_tokens=256)
+            raw_text = vlm_inference(img, model, processor, prompt, max_new_tokens=256,
+                                caller="stage5_placement_strategy")
             json_str = _extract_json_from_text(raw_text)
             if json_str:
                 data = json.loads(json_str)
                 strategy = data.get("strategy", "").strip().lower()
                 if strategy in VALID_STRATEGIES:
                     votes[strategy] += 1
-        except Exception:
-            continue
+            else:
+                n_vote_failed += 1
+                first_error = first_error or "VLM 未返回可解析的 JSON"
+        except Exception as e:
+            n_vote_failed += 1
+            first_error = first_error or f"{type(e).__name__}: {e}"
+
+    if n_vote_failed:
+        print(f"      ⚠️ [strategy_vote] {supported_name}: "
+              f"{n_vote_failed}/{n_vote_total} 帧投票失败 ({first_error})"
+              f" → 该物体策略将回退默认", flush=True)
 
     if votes:
         best_strategy = votes.most_common(1)[0][0]
@@ -1063,6 +1092,21 @@ def _get_aabb_overlap(mesh_a, mesh_b):
     return overlaps, overlap_x, overlap_y, overlap_z
 
 
+# 穿模检测参数 (原先硬编码在函数体内, 无集中定义):
+# _PEN_SURFACE_SAMPLES 表面采样点数——trimesh 4.x 的关键字是 count
+# _PEN_STALL_LIMIT 连续多少轮"总分离量未下降"即判定不收敛并停止。
+#   单靠 max_iterations 兜底会在发散时空转 (实测 127 次仍未收敛)
+_PEN_STALL_LIMIT = 3
+_PEN_SURFACE_SAMPLES = 2000
+# _PEN_SURFACE_TOL_FALLBACK 采样点到对方 mesh 表面的距离阈值 (m):
+#   与改动前一致 (0.01)。曾尝试收紧到 0.002 + 改用 contains(), 但该改动基于
+#   "穿模全属误报"的错误前提 (已用 FCL 纠正: egodex_4 有 4 对真穿模,
+#   cloth_0↔cloth_1 有 7578 个 FCL 接触点), 故已回退。
+_PEN_SURFACE_TOL_FALLBACK = 0.01
+# _PEN_MIN_INSIDE 判定穿模所需的最少采样点数, 与改动前一致
+_PEN_MIN_INSIDE = 3
+
+
 def _check_mesh_penetration_fcl(mesh_a, mesh_b):
     """使用FCL精确碰撞检测判断mesh_a是否穿入mesh_b
 
@@ -1139,8 +1183,11 @@ def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
     if not overlaps:
         return False, 0.0, 2
 
+    # 表面采样点。trimesh 4.x 的 sample_surface 签名是 (mesh, count, ...),
+    # 关键字叫 count 而非 n_samples —— 之前误用 n_samples 会抛 TypeError 被
+    # except 吞掉, 静默退化成"只用 mesh 顶点做最近距离判断"。
     try:
-        pts_a, _ = trimesh.sample.sample_surface(mesh_a, n_samples)
+        pts_a, _ = trimesh.sample.sample_surface(mesh_a, _PEN_SURFACE_SAMPLES)
     except Exception:
         pts_a = mesh_a.vertices
     if len(pts_a) == 0:
@@ -1149,11 +1196,11 @@ def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
     tree_b = cKDTree(mesh_b.vertices)
     dists, _ = tree_b.query(pts_a)
 
-    inside_count = (dists < 0.01).sum()
-    if inside_count < 3:
+    inside_count = (dists < _PEN_SURFACE_TOL_FALLBACK).sum()
+    if inside_count < _PEN_MIN_INSIDE:
         return False, 0.0, 2
 
-    inside_pts = pts_a[dists < 0.01]
+    inside_pts = pts_a[dists < _PEN_SURFACE_TOL_FALLBACK]
     center_a = mesh_a.bounds.mean(axis=0)
     center_b = mesh_b.bounds.mean(axis=0)
     diff = center_a - center_b
@@ -1161,7 +1208,7 @@ def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
     abs_diff = np.abs(diff)
     sep_axis = int(np.argmax(abs_diff))
 
-    penetration_depth = float(np.mean(dists[dists < 0.01])) + 0.005
+    penetration_depth = float(np.mean(dists[dists < _PEN_SURFACE_TOL_FALLBACK])) + 0.005
 
     return True, penetration_depth, sep_axis
 
@@ -1225,6 +1272,27 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
             base = name.rsplit('_', 1)[0] if '_' in name else name
             wall_names.add(base.lower().strip())
             wall_names.add(name.lower().strip())
+
+    # 构建 on_top 声明关系对 (实例级): A 的关系是 "supported by B" 且 B 不是
+    # floor/wall/other_objects。这类 pair 的垂直位置由 5.2 的 on_top 精修负责。
+    #
+    # 必须从穿模检测中排除: on_top 把物体精确贴到支撑物顶面, 接触面间隙为 0,
+    # 碰撞检测必然判成重叠 → 沿 z 推开 → 物体掉到地面 → 底面共面又判重叠 →
+    # 形成自维持循环。实测 egodex_33: 23 次修复 100% 是 z 轴分离且 100% 涉及
+    # on_top 物体, toy_1 被推 9 次 x 0.0056m = 0.050m; 全库 104 个 on_top 关系
+    # 只有 3 个贴合。这些 pair 的 xy 实测无重叠 (egodex_33 plate_0 上 4 个物体
+    # xy 重叠 0%), 排除检测不会漏掉真穿模。
+    on_top_pairs = set()
+    for name, rel in _all_rels.items():
+        if not rel.startswith("supported by "):
+            continue
+        sup = rel[len("supported by "):].strip()
+        if sup in ("floor", "wall", "other objects") or "_" not in sup:
+            continue
+        on_top_pairs.add(frozenset((name.lower().strip(), sup.lower().strip())))
+        # 同类别的不同实例也算(类别级关系时 name 可能是 base)
+        base = name.rsplit("_", 1)[0] if "_" in name else name
+        on_top_pairs.add(frozenset((base.lower().strip(), sup.rsplit("_", 1)[0].lower().strip())))
 
     # 构建 supporter→supported 映射, 用于层级穿模修复
     # 当 supporter (大物体) 移动时, 其 supported (小物体) 跟随移动 x,y
@@ -1310,10 +1378,15 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
             mesh = _get_transformed_mesh(info)
             all_meshes.append((category, idx, mesh, info))
 
+
     penetration_warnings = []
     effective_max_iter = 1 if dry_run else max_iterations
+    _prev_total_sep = None      # 上一轮的总分离量 (收敛判据用)
+    _stall_rounds = 0           # 连续无进展轮数
+    _iteration_total_sep = 0.0  # 本轮总分离量
     for iteration in range(effective_max_iter):
         any_resolved = False
+        _iteration_total_sep = 0.0
 
         for i in range(len(all_meshes)):
             for j in range(i + 1, len(all_meshes)):
@@ -1336,6 +1409,13 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 cat_j_is_wall = cat_j.lower().strip() in wall_names
 
                 if (cat_i_is_floor or cat_i_is_wall) and (cat_j_is_floor or cat_j_is_wall):
+                    continue
+
+                # 跳过 5.1 声明的 on_top 关系对: 其垂直位置由 5.2 on_top 精修负责,
+                # 零间隙接触会被误判为穿模并把物体推离支撑物 (见上方说明)。
+                _pair_key = frozenset((f"{cat_i}_{idx_i}".lower(),
+                                       f"{cat_j}_{idx_j}".lower()))
+                if _pair_key in on_top_pairs:
                     continue
 
                 pair_desc = f"{cat_i}_{idx_i} ↔ {cat_j}_{idx_j}"
@@ -1400,6 +1480,16 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                     sep_dist = pen_depth + 0.05
                 else:
                     sep_dist = pen_depth + 0.01
+
+                # ── 发散修复: 分离量必须覆盖实际重叠, 而非仅 pen_depth ──
+                # pen_depth 是"采样点到对方表面的最近距离 + 0.005", 量级仅厘米级;
+                # 而 AABB 重叠可达 0.57m (实测 egodex_4 cloth_0↔cloth_1)。
+                # 每轮只推开厘米级而重叠量不变 → 同一对反复触发, 迭代发散
+                # (实测 127 次后仍未收敛, cloth↔cloth 28 次、bowl↔bowl 22 次)。
+                # 这里取 max(pen_depth 推出的距离, 该轴的实际 AABB 重叠 + 余量)。
+                _ov_axis = {0: ox, 1: oy, 2: oz}[sep_axis]
+                if _ov_axis > 0:
+                    sep_dist = max(sep_dist, float(_ov_axis) + 0.005)
 
                 # ── 共享穿模修复: 两物体各自退一半 ──
                 # 条件: shared_penetration=True, 且两个物体都可移动（非 floor/wall, 非 z-only 受限小物体）
@@ -1527,14 +1617,33 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                                       f"xy偏移 ({xy_delta[0]:+.4f}, {xy_delta[1]:+.4f})", flush=True)
 
                 any_resolved = True
+                _iteration_total_sep += sep_dist
                 if verbose:
                     extra = " (z-only, 小物体)" if move_is_supported and sep_axis == 2 else ""
                     print(f"      🔧 穿模修复: {pair_desc} | {axis_name}轴分离 {sep_dist:.4f}m{extra}", flush=True)
 
-        if not dry_run and not any_resolved:
-            break
+        # ── 收敛判据 ──
+        # 仅有 max_iterations 兜底不够: 每轮都在"修"(any_resolved=True) 但实际
+        # 重叠没减少时会一直空转。加"连续 N 轮总分离量未下降则停止"。
+        # _prev_total_sep 由外层循环维护 (见下方), 首轮为None 表示无历史。
         if dry_run:
             break
+        if not any_resolved:
+            break
+        _total_sep = _iteration_total_sep
+        if _prev_total_sep is not None and _total_sep >= _prev_total_sep * 0.9:
+            _stall_rounds += 1
+            if verbose:
+                print(f"      ⚠️ 穿模修复无进展 ({_stall_rounds}/{_PEN_STALL_LIMIT}): "
+                      f"总分离量 {_prev_total_sep:.4f} → {_total_sep:.4f} m, 停止迭代",
+                      flush=True)
+            if _stall_rounds >= _PEN_STALL_LIMIT:
+                if verbose:
+                    print(f"      ⚠️ 穿模修复未能收敛, 保留当前位姿(仍有残留重叠)", flush=True)
+                break
+        else:
+            _stall_rounds = 0
+        _prev_total_sep = _total_sep
 
     if verbose:
         if dry_run:
@@ -1670,6 +1779,18 @@ def check_stability(all_instances, refined_relations=None, categories_and_relati
                 "issue": "悬空",
                 "detail": f"距支撑面 {gap:.3f}m (阈值 {gap_threshold}m)",
             })
+            # xy 拉回: 只修 z 会把物体放到"支撑面同高但水平错位"的位置
+            _pull = _pull_xy_into_supporter(mesh, supporter_mesh, verbose, f"{category}_{idx}")
+            if _pull is not None and _pull[2] > 0:
+                _dx, _dy, _shift = _pull
+                info["T"] = trimesh.transformations.translation_matrix(
+                    np.array([_dx, _dy, 0.0])) @ info["T"]
+                mesh = _get_transformed_mesh(info)  # 倾斜物体的 bbox 会随 xy 变化, 重算
+                bottom_z = mesh.bounds[0, 2]
+                gap = bottom_z - supporter_top_z
+                if verbose:
+                    print(f"      🔧 Phase2 xy拉回: {category}_{idx} 平移({_dx:+.3f},{_dy:+.3f})m "
+                          f"→ 支撑物足迹内 (距离 {_shift:.3f}m)", flush=True)
             z_fix = gap
             info["T"] = trimesh.transformations.translation_matrix(
                 np.array([0.0, 0.0, -z_fix])
@@ -1694,6 +1815,25 @@ def check_stability(all_instances, refined_relations=None, categories_and_relati
         support_ratio = overlap_area / supported_area if supported_area > 1e-6 else 0.0
 
         if support_ratio < contact_threshold:
+            # ── xy 拉回: 足迹几乎无重叠时, 先把物体 xy 拉回支撑物足迹内 ──
+            if support_ratio < 0.05:
+                _pull = _pull_xy_into_supporter(mesh, supporter_mesh, verbose, f"{category}_{idx}")
+                if _pull is None:
+                    unstable_list.append({
+                        "name": f"{category}_{idx}",
+                        "issue": "接触不足",
+                        "detail": "xy距支撑物 >0.6m, 不自动拉回, 需人工确认",
+                    })
+                    continue
+                _dx, _dy, _shift = _pull
+                if _shift > 0:
+                    info["T"][0, 3] += _dx
+                    info["T"][1, 3] += _dy
+                    mesh = _get_transformed_mesh(info)  # xy 变了, 重算包围盒供 z 对齐
+                    if verbose:
+                        print(f"      🔧 Phase3 xy拉回: {category}_{idx} 平移({_dx:+.3f},{_dy:+.3f})m "
+                              f"→ 支撑物足迹内 (距离 {_shift:.3f}m)", flush=True)
+
             # 接触不足: 直接对齐 z 轴
             supporter_top_z = supporter_mesh.bounds[1, 2]
             supported_bottom_z = mesh.bounds[0, 2]
@@ -1822,6 +1962,45 @@ def _project_footprint(mesh):
     except ImportError:
         return None
 
+
+def _pull_xy_into_supporter(mesh, supporter_mesh, verbose=False, name=""):
+    """把物体 xy 平移到支撑物足迹内缩区的最近点 (Phase2/Phase3 共用)
+
+    重建/SAM3D 给出的 xy 可能偏离支撑物, 只修 z 会造成"同高但水平悬空"。
+    内缩 0.6×物体半径, 允许轻微出沿; 位移上限 0.6m 防误判瞬移。
+
+    返回:
+        (dx, dy, shift) — 需要平移时 shift>0; 无需移动 (0,0,0.0);
+        距离超限返回 None (调用方应标记 unstable)
+    """
+    try:
+        from shapely.ops import nearest_points as _nearest_points
+        supported_proj = _project_footprint(mesh)
+        supporter_proj = _project_footprint(supporter_mesh)
+        if (supported_proj is None or supporter_proj is None
+                or supported_proj.is_empty or supporter_proj.is_empty):
+            return (0.0, 0.0, 0.0)
+        obj_half = max(supported_proj.bounds[2] - supported_proj.bounds[0],
+                       supported_proj.bounds[3] - supported_proj.bounds[1]) / 2
+        inner = supporter_proj.buffer(-0.6 * obj_half)
+        if inner.is_empty:
+            inner = supporter_proj
+        obj_center = supported_proj.centroid
+        target = _nearest_points(inner, obj_center)[0]
+        dx, dy = target.x - obj_center.x, target.y - obj_center.y
+        shift = float(np.hypot(dx, dy))
+        if shift <= 1e-3:
+            return (0.0, 0.0, 0.0)
+        if shift > 0.6:
+            if verbose:
+                print(f"      ⚠️ {name} xy距支撑物 {shift:.2f}m > 0.6m, 不自动拉回", flush=True)
+            return None
+        return (dx, dy, shift)
+    except Exception as e:
+        if verbose:
+            print(f"      ⚠️ {name} xy拉回失败: {e}", flush=True)
+        return (0.0, 0.0, 0.0)
+
 def refine_inter_object_relations(all_instances, refined_relations,
                                   walls_info=None, verbose=True,
                                   vlm_checkpoint=None, scene_dir=None,
@@ -1873,6 +2052,7 @@ def refine_inter_object_relations(all_instances, refined_relations,
 
     # ── 策略判定 ──
     placement_strategies = {}
+    _final_strategies = {}   # {实例名: 最终策略}, 循环结束后落盘供 5.25 使用
 
     use_vlm = vlm_checkpoint is not None and scene_dir is not None
 
@@ -1895,6 +2075,15 @@ def refine_inter_object_relations(all_instances, refined_relations,
         # 也加入 refined_relations 中的所有 key 以支持模糊匹配
         for name in refined_relations.keys():
             all_categories.add(name)
+
+        # 归一化为类别名: 实例名 "bottle_0" -> "bottle"
+        # 否则 _fuzzy_match_name 会匹配到 "bottle_0" 并生成 ghost key "bottle_0_0"
+        import re as _re_norm
+        normalized_categories = set()
+        for name in all_categories:
+            stripped = _re_norm.sub(r'_\d+$', '', name)
+            normalized_categories.add(stripped)
+        all_categories = list(normalized_categories)
 
         # 加载帧: optimal_frames/ + keyframes/
         optimal_frames_dir = os.path.join(scene_dir, "optimal_frames")
@@ -1954,11 +2143,15 @@ def refine_inter_object_relations(all_instances, refined_relations,
 
         # 按实例投票判定策略
         for supported_name, supporter_name in supported_pairs:
-            # 找到该物体的所有实例帧
-            best_strategy = None
-            best_votes = 0
-
-            # 遍历所有实例 key，找到属于 supported_name 的
+            # 收集属于该类别的实例帧。
+            # 只取帧最多的一个实例作代表: 要回答的问题是"supported_name 相对
+            # supporter_name 怎么放", 与具体哪个实例无关。此前遍历该类别下
+            # 每个实例各投一次 (bottle 有 16 实例 → 16x5=80 次VLM 调用),
+            # 但结果只取第一个 (best_strategy), 其余 15 个纯属浪费。
+            # HOI4D 082_C5 实测: 每物体 60~65 票, 全场景 1078 次调用 (~50min)。
+            # 多实例投票语义在此保留扩展点: 若将来需要按实例区分, 应改用
+            # 一次调用问多个实例 (如 5.1 的 query_instances 做法)。
+            cat_frames = []
             for inst_key, frames in instance_to_frames.items():
                 cat = instance_to_category.get(inst_key, "")
                 # 模糊匹配: inst_key 的 category 部分匹配 supported_name
@@ -1966,17 +2159,16 @@ def refine_inter_object_relations(all_instances, refined_relations,
                     continue
                 if not frames:
                     continue
+                cat_frames.append((len(frames), inst_key, frames))
 
-                strategy = vlm_lookup_placement_strategy(
-                    inst_key, supporter_name, supported_pairs,
-                    vlm_model, vlm_processor, frames,
+            best_strategy = None
+            if cat_frames:
+                # 代表实例: 帧最多者 (可见角度最充分)
+                _, rep_key, rep_frames = max(cat_frames, key=lambda x: x[0])
+                best_strategy = vlm_lookup_placement_strategy(
+                    rep_key, supporter_name, supported_pairs,
+                    vlm_model, vlm_processor, rep_frames,
                 )
-                # 多实例投票: 取出现最多的策略
-                if strategy not in placement_strategies.values():
-                    pass
-                # 简化: 取第一个有帧实例的策略（多实例场景下可扩展为投票）
-                if best_strategy is None:
-                    best_strategy = strategy
 
             if best_strategy is None:
                 best_strategy = "on_top"
@@ -2068,54 +2260,125 @@ def refine_inter_object_relations(all_instances, refined_relations,
                         print(f"      ⚠️  initial_offset 计算失败: {e}", flush=True)
                     initial_offset = None
 
-            # VLM判断精修程度 (大精修/小精修/正确)
+            # 精修程度 (大精修/小精修/正确) —— 几何优先, VLM 只在几何已接近时表态
+            #
+            # VLM 是看**照片**回答的, 而照片里物体往往确实在支撑物上 (视频就是这么拍的),
+            # 但 3D 坐标可能完全错位。HOI4D 082_C5 实测: 瓶底 z≈0 而台面 z=0.971
+            # (悬空 0.971m), VLM 却 23/23 回答 "correct", 导致 on_top 对齐被整体跳过,
+            # 21 个物体全留在地面 —— 5.1 判对的关系被 5.2 推翻。
+            # 因此: 先看几何。明显错位 (|z_offset| 大) 时直接执行对齐, 不问 VLM;
+            # 只有几何本来就接近贴合时, VLM 的"是否已正确"才有意义 (此时它用于
+            # 避免无谓调整)。顺带省掉大量无意义调用 (原本每对支撑都问一次 VLM)。
             refinement_degree = None
             if vlm_model is not None and strategy == "on_top":
-                # 加载该物体的最优帧图像
-                _optimal_frame_path = None
-                _optimal_dir = os.path.join(scene_dir, "optimal_frames") if scene_dir else None
-                if _optimal_dir and os.path.isdir(_optimal_dir):
-                    # 查找匹配该类别的帧
-                    for _fname in sorted(os.listdir(_optimal_dir)):
-                        if supported_cat.lower() in _fname.lower() or supported_name.lower() in _fname.lower():
-                            _optimal_frame_path = os.path.join(_optimal_dir, _fname)
-                            break
-                    # 回退: 取第一张帧
-                    if _optimal_frame_path is None:
-                        _all_frames = sorted(os.listdir(_optimal_dir))
-                        if _all_frames:
-                            _optimal_frame_path = os.path.join(_optimal_dir, _all_frames[0])
+                # 几何前置检查: 物体底面与支撑物顶面的 z 偏差
+                _gap = None
+                try:
+                    _sup_mesh = _get_transformed_mesh(supporter_info)
+                    _sup_top_z = float(_sup_mesh.bounds[1, 2])
+                    _sup_mesh2 = _get_transformed_mesh(supported_info)
+                    _sup_bottom_z = float(_sup_mesh2.bounds[0, 2])
+                    _gap = _sup_top_z - _sup_bottom_z
+                except Exception:
+                    _gap = None
 
-                if _optimal_frame_path and os.path.isfile(_optimal_frame_path):
-                    try:
-                        from PIL import Image as PILImage
-                        _img = PILImage.open(_optimal_frame_path).convert("RGB")
-                        refinement_degree = _judge_refinement_degree_with_vlm(
-                            vlm_model, vlm_processor, _img,
-                            supported_name, supporter_name
-                        )
-                        if verbose:
-                            print(f"      📊 VLM精修程度: {refinement_degree}", flush=True)
-                    except Exception as e:
-                        if verbose:
-                            print(f"      ⚠️ VLM精修程度判断失败: {e}", flush=True)
-                        refinement_degree = None
+                if _gap is not None and abs(_gap) >= GEOM_ALIGNED_TOL:
+                    # 几何上明显没对齐 → 必定需要调整, 不问VLM
+                    if verbose:
+                        print(f"      📐 几何偏差 {_gap:+.3f}m ≥ {GEOM_ALIGNED_TOL}m, "
+                              f"跳过 VLM 判定直接对齐", flush=True)
+                    refinement_degree = None      # None = 始终执行完整对齐
+                else:
+                    # 几何已接近贴合 → 问 VLM 是否已正确 (避免无谓调整)
+                    _optimal_frame_path = None
+                    _optimal_dir = os.path.join(scene_dir, "optimal_frames") if scene_dir else None
+                    if _optimal_dir and os.path.isdir(_optimal_dir):
+                        # 查找匹配该类别的帧
+                        for _fname in sorted(os.listdir(_optimal_dir)):
+                            if supported_cat.lower() in _fname.lower() or supported_name.lower() in _fname.lower():
+                                _optimal_frame_path = os.path.join(_optimal_dir, _fname)
+                                break
+                        # 回退: 取第一张帧
+                        if _optimal_frame_path is None:
+                            _all_frames = sorted(os.listdir(_optimal_dir))
+                            if _all_frames:
+                                _optimal_frame_path = os.path.join(_optimal_dir, _all_frames[0])
+
+                    if _optimal_frame_path and os.path.isfile(_optimal_frame_path):
+                        try:
+                            from PIL import Image as PILImage
+                            _img = PILImage.open(_optimal_frame_path).convert("RGB")
+                            refinement_degree = _judge_refinement_degree_with_vlm(
+                                vlm_model, vlm_processor, _img,
+                                supported_name, supporter_name
+                            )
+                            if verbose:
+                                print(f"      📊 VLM精修程度: {refinement_degree}", flush=True)
+                        except Exception as e:
+                            if verbose:
+                                print(f"      ⚠️ VLM精修程度判断失败: {e}", flush=True)
+                            refinement_degree = None
+                    if verbose and _gap is not None:
+                        print(f"      📐 几何偏差 {_gap:+.3f}m < {GEOM_ALIGNED_TOL}m, 已咨询 VLM",
+                              flush=True)
 
             try:
-                if strategy in ("against_side", "leaning"):
+                # 按各精修函数的真实签名分派。
+                # sp_refine_on_top(supported, supporter, max_offset, initial_offset,
+                #                   refinement_degree) —— 支持全部 3 个额外参数;
+                # sp_refine_inside / sp_refine_hanging_below 只有 (supported, supporter);
+                # sp_refine_against_side / leaning 额外需要 walls_info。
+                # 原代码对 on_top/inside 共用一个 else 分支无条件传 3 个参数,
+                # 导致 inside 等策略抛 TypeError 被 except 吞掉 → 静默失效。
+                if strategy == "against_side":
                     supported_instances[inst_idx] = sp_refine_fn(
                         supported_info, supporter_info, walls_info
                     )
-                else:
-                    # on_top/inside: 传入 refinement_degree
+                elif strategy == "leaning":
+                    # sp_refine_leaning 只接受 2 个参数 (内部转调 against_side),
+                    # 不能传 walls_info
+                    supported_instances[inst_idx] = sp_refine_fn(
+                        supported_info, supporter_info
+                    )
+                elif strategy == "on_top":
                     supported_instances[inst_idx] = sp_refine_fn(
                         supported_info, supporter_info,
                         max_offset=0.3, initial_offset=initial_offset,
                         refinement_degree=refinement_degree
                     )
+                else:
+                    # inside / hanging_below: 仅两个位置参数
+                    supported_instances[inst_idx] = sp_refine_fn(
+                        supported_info, supporter_info
+                    )
             except Exception as e:
                 if verbose:
-                    print(f"      ❌ 精修失败: {e}", flush=True)
+                    print(f"      ❌ 精修失败 (strategy={strategy}): {e}", flush=True)
+
+            # 落盘每实例的最终策略: refined_relations 只写 "supported by X",
+            # 不含on_top / inside / against_side 的区分。5.25 的 on_top 重贴必须
+            # 知道策略,否则会把 inside 的物体也贴到支撑物顶面 (实测 bread_0 是
+            # inside, 会被错贴到碗沿)。
+            # supported_name 已是完整实例名 (如 lego_0); 类别级时是 lego。
+            # 不能再拼 _inst_idx —— 那会得到 lego_0_0, 与 5.25 查的 key 不一致,
+            # 导致策略查不到、inside 被当on_top 错贴到支撑物顶面。
+            _final_strategies[supported_name] = strategy
+            if supported_cat is not None and inst_idx > 0:
+                # 类别级名称 (如 "lego") 下的每个实例单独记录
+                _final_strategies[f"{supported_cat}_{inst_idx}"] = strategy
+
+    # 落盘策略供 5.25 使用 (best-effort: 失败不影响主流水线)
+    if scene_dir:
+        try:
+            with open(os.path.join(scene_dir, "placement_strategies.json"), "w",
+                      encoding="utf-8") as _f:
+                json.dump(_final_strategies, _f, indent=2, ensure_ascii=False)
+            if verbose:
+                print(f"   💾 放置策略已保存 ({len(_final_strategies)} 条): "
+                      f"{os.path.join(scene_dir, 'placement_strategies.json')}", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ 放置策略保存失败 (不影响主流水线): {e}", flush=True)
 
     # ── 全局穿模解决 ──
     all_instances = resolve_penetrations(all_instances, refined_relations, verbose=verbose,
@@ -2181,6 +2444,13 @@ def refine_inter_object_relations(all_instances, refined_relations,
             _scene.export(_final_glb)
             if verbose:
                 print(f"   💾 Stage5最终结果已保存: {_final_glb}", flush=True)
+            # Stage5 四视图预览 (front/side/top/iso), 渲染失败不影响管线
+            try:
+                from tools.render_glb_preview import render_preview_png
+                render_preview_png(_final_glb)
+            except Exception as _e:
+                if verbose:
+                    print(f"   ⚠️ Stage5 预览图生成失败: {_e}", flush=True)
         except Exception as e:
             if verbose:
                 print(f"   ⚠️ Stage5最终结果保存失败: {e}", flush=True)
