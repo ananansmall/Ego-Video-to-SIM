@@ -2202,3 +2202,23 @@ Stage 6 的输出 key 是 `bowl_inst0`, Stage 6.1 的 URDF link 名是 `bowl_0` 
 - 三份 Stage 6 文档口径冲突 —— 本次已合并解决, 无遗留。
 
 ---
+## [2026-10-09 11:25] 打包发布 Snapshot v0.2-2026-10-09 到 GitHub
+
+把 Snapshot v0.1 (2026-09-24) 以来累积的全部变更打成快照入库并推送。
+
+- 提交: `ebaff28` — "Snapshot v0.2: Stage 6 收敛为物理仿真 + 接通材质链路 +
+  pyrender 方案B"; `git push origin main` 快进 `d6dd04d..ebaff28`, **未用 force**。
+- 规模: **34 个文件 (17 修改 / 17 新增 / 0 删除)**, 9906 insertions(+), 1592(-)。
+- 本次快照重点 (Stage 6): 定位收敛为"URDF → SAPIEN 物理仿真 → 渲染 GIF";
+  接通 Stage6(materials.json) → Stage6.1 断链; SAPIEN 渲染失效走 pyrender 方案 B。
+  其它累积项 (Stage5 精修、尺寸校准 guard、坐标系对齐 B~E、tools/analysis 重建等)
+  逐条见上方各条目。
+- **零删除**: 提交前已核验 `git status` 无任何 D/R 记录。被合并成存根的两份旧文档
+  (`stage6_design.md` / `stage61_urdf_plan.md`), 其原文全文**原样归档**到
+  `docs/design/archive/*_v1.md` (678/749 行完整保留), 并在存根与 `docs/README.md`
+  里互相指路 —— 满足"不覆盖原文件"的要求。
+- 遗留: `output_v2/` 在 `.gitignore` 内 (合理的产物目录), 所以
+  `output_v2/stage61_gif_gallery.html` 与各场景 GIF **不入库**;
+  入库的是它的生成脚本 `tools/analysis/make_stage61_gallery.py`, 随时可重新生成。
+
+---
