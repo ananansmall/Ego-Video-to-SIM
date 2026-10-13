@@ -13,3 +13,6 @@
 [submodule "libs/position_retargeting"]
 	path = libs/position_retargeting
 	url = https://github.com/dexsuite/dex-retargeting.git
+[submodule "Real2SimGripper"]
+	path = Real2SimGripper
+	url = https://github.com/ananansmall/Real2SimGripper.git
