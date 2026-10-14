@@ -328,6 +328,7 @@ def run_stage3_7_pick_place(output_path, all_masks=None, world_points=None,
         world_points = data['world_points']
     n_frames_rgb = int(world_points.shape[0])
     total_frames = None
+    ratio_source = 'argument'
     if frame_ratio is None:
         ca_path = os.path.join(output_path, 'coordinate_alignment.json')
         if os.path.exists(ca_path):
@@ -336,8 +337,23 @@ def run_stage3_7_pick_place(output_path, all_masks=None, world_points=None,
             total_frames = cad.get('total_frames')
             if total_frames:
                 frame_ratio = float(total_frames) / n_frames_rgb
+                ratio_source = 'coordinate_alignment.total_frames'
         if frame_ratio is None:
             frame_ratio = 1.0
+            ratio_source = 'fallback_1.0'
+            # 时长类阈值 (MIN_MOTION_DURATION 等) 定义在原始视频帧空间, 小物体判
+            # 动态用的是 `max_run × frame_ratio >= MIN_MOTION_DURATION`。
+            # 这里拿不到 total_frames, 该条件会退化成"连续 15 个 RGB 帧"。而输入
+            # 视频都是抽帧的, 抽帧后连续位移段本来就被截短, 所以这个条件会偏严:
+            # 实测 002_C1_Bowl 的 brush_inst0 (path/net/pnet 三条都过, 只因
+            # max_run=7 < 15 被卡) 就是这样漏掉的。
+            #
+            # 这里不改判定公式: 帧数本身不真实, 就按实际观测到的帧如实判断, 不做
+            # 补偿。只把风险讲清楚, 免得"漏检"被当成"物体真的没动"。
+            print(f"   ⚠️ [Stage 3.7] 未取到 total_frames, frame_ratio 退化为 1.0 "
+                  f"(来源: {ratio_source})", flush=True)
+            print(f"      → 小物体(质心法)的 max_run×ratio>={MIN_MOTION_DURATION} "
+                  f"会偏严, 可能漏检真实的抓取动作", flush=True)
     else:
         total_frames = int(round(n_frames_rgb * frame_ratio))
 
@@ -357,6 +373,9 @@ def run_stage3_7_pick_place(output_path, all_masks=None, world_points=None,
 
     result = {
         'frame_ratio': frame_ratio,
+        # 便于事后区分"真实算出的 ratio"与"退化成 1.0",
+        # 后者意味着小物体判定偏严 (见上面的告警)
+        'ratio_source': ratio_source,
         'n_frames_rgb': n_frames_rgb,
         'total_frames': total_frames if total_frames else int(round(n_frames_rgb * frame_ratio)),
         'interactions': interactions,

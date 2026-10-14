@@ -935,8 +935,9 @@ def main():
                     help="完全不读 Stage 6 的 materials.json (退回 URDF 的 VLM 质量 + "
                          "EmbodiedGen 硬编码 mu1=0.6/mu2=0.5/restitution=0.02)")
     ap.add_argument("--mass_source", choices=["vlm", "density"], default="vlm",
-                    help="最终质量取哪个来源: vlm=URDF 里 VLM 猜的质量(默认, 稳); "
-                         "density=Stage 6 密度×mesh 体积(物理正确但受尺度漂移污染)")
+                    help="最终质量取哪个来源: urdf=URDF <inertial> 的质量(默认, "
+                         "由 mesh 体积 × 类别密度估算); "
+                         "density=Stage 6 密度×mesh 体积(受尺度漂移污染)")
     ap.add_argument("--fovy", type=float, default=50.0)
     args = ap.parse_args()
 
@@ -948,6 +949,17 @@ def main():
 
     print(f"解析 {urdf} ...")
     objects = parse_urdf(urdf)
+
+    # 修复: floor_plane 是场景地板, 却被当作普通 link 建成了 dynamic 刚体。
+    # 实测 cup_vggt_omega 的 floor_plane_z0 是 10m x 10m x 5mm 实心板,
+    # 体积 0.5 m³ -> 400 kg, 与 SAPIEN 的 scene.add_ground(0) 静态地面功能重叠,
+    # 还会压住/弹飞其他物体。这里直接剔除, 地面交由 add_ground 提供。
+    _floor_names = {o["name"] for o in objects if "floor" in o["name"].lower()}
+    if _floor_names:
+        objects = [o for o in objects if o["name"] not in _floor_names]
+        print(f"  [FILTER] 剔除地板实例 {sorted(_floor_names)} "
+              f"(地面由 scene.add_ground 提供, 不再作为 400kg 动态刚体)")
+
     if args.max_objects > 0:
         objects = objects[:args.max_objects]
         print(f"  [调试] 只装前 {args.max_objects} 个物体")
@@ -973,9 +985,10 @@ def main():
                   f"-> 隐含线性尺度误差 ≈ {dv['implied_linear_scale_error']}x "
                   f"({dv['n_compared']} 个物体可比)")
     else:
-        print("  [WARN] 无 Stage 6 materials.json -> 质量仍用 URDF 的 VLM 值, "
-              "摩擦仍用 EmbodiedGen 硬编码的 mu1=0.60/mu2=0.50/restitution=0.02 "
-              "(先跑 mainv3 --enable_stage6 可补)")
+        print("  [WARN] 无 Stage 6 materials.json -> 质量用 URDF 的 <inertial> "
+              "(由 mesh 体积 × 类别密度估算, 见 src/stage61_urdf_generator.py), "
+              "并非 VLM 估值; 摩擦仍用 EmbodiedGen 硬编码的 "
+              "mu1=0.60/mu2=0.50/restitution=0.02 (先跑 mainv3 --enable_stage6 可补)")
 
     # ---- 事前检查: 质量/惯量/初始穿透 (不依赖仿真) ----
     precheck = []

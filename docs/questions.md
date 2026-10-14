@@ -830,3 +830,291 @@ pyrender 路径只是把真实相机位姿如实呈现出来。
 9. mainv3.py:1316,1545 stage5 位姿记录按 category 查询却传入实例级 key，relation 恒 "unknown"。
 
 **已核实非问题**: 7a 日志 `stage1_strict (R[2,2]=-0.4286)` — stage1_strict 有内部质量门（平面拟合残差<0.02m、墙正交 5° 内），R[2,2] 只反映 VGGT 原始坐标系朝向，不表示对齐失败。
+
+---
+
+### Q19: FP track 的 pose 估计轨迹抖动严重（静止物体路径累积 3~7m），有什么好的修复方法？
+
+**回答**: 对比验证了 4 类方法，结论如下（数据见 `output_v2/7_vggt_omega/fp_static_lock_eval.json`，验证脚本 `tools/analysis/fp_static_lock_eval.py`）：
+
+**方法对比**：
+
+| 方法 | 结论 |
+|---|---|
+| A. 提高 track_refine_iter (2→5) | 未测（推理翻倍，只能缓解不根除） |
+| B. 静止段锁定位姿 | **有效，推荐**。8 实例 path 1.9~7.1m → 静止物体全部归零，IoU 保持 |
+| C. mask 质心逐帧校正 | **有害，弃用**。mesh 质心投影 ≠ mask 质心（mesh 遮挡缺失/边界差），每帧强行对齐把 plate IoU 0.887→0.145 |
+| D. 段内中值锚定 | **有害，弃用**。FP track 平移是长随机游走（plate 在 0.3m 范围游走，中值离真值 16cm），中值≠真值 |
+
+**方案 B 正确实现要点**（两个关键踩坑）：
+1. **运动判定**：用 GT mask 质心+depth 反投影到世界系，滑动窗口净位移阈值判定（win=9、thr=5cm 最优）。阈值 2cm 时反投影噪声误触发一半帧为"运动"
+2. **锚点选择**：静止段必须锚定**段首**位姿（= register 或运动结束位姿，register 首帧 IoU 0.40~0.97 全部准确），不能用段内中值/四元数平均（随机游走有偏）
+
+**锁定后效果**（win=9, thr=0.05, anchor=first, --no_correct）：
+
+| 实例 | FP原始 path/IoU | 锁定后 path/IoU | GT净位移 |
+|---|---|---|---|
+| plate_inst0 | 1.920m / 0.887 | **0.000m** / 0.848 | 0.006m（真静止）|
+| block_inst2 | 5.608m / 0.467 | 2.360m / 0.372 | 0.048m |
+| toy_inst0 | 5.214m / 0.653 | 3.030m / 0.659 | 0.347m（真运动）|
+| toy_inst1 | 7.105m / 0.318 | 4.442m / 0.327 | 0.347m |
+
+**剩余问题**：真实运动的物体（toy_inst0/1）在运动段内 FP 抖动仍在（锁定后 path 3~4.4m vs GT path 1.1m，其中 GT path 本身含反投影噪声）。运动段的进一步改善方向：提高 track_refine_iter、运动段平移 EMA 平滑、或运动中周期性 re-register。
+
+**与 mainv3 的集成点**：stage3 已有动态判定（质心/重叠方法），直接复用其静止/运动分段，静止段用 FP register 位姿填充，运动段用 FP track——即 stage3.5 插入点（stage3 之后、stage4 之前）。
+
+### Q20: FoundationPose 跟踪工作目前进展到哪里？产物在哪里？还有什么问题？
+
+**回答**:
+
+**已完成**（7_vggt_omega 场景，8 个去重后实例）：
+1. 全链路跑通：mask 自动匹配（register IoU 判据，`fp_mask_select/<obj>.json`）→ FP register+track 113 帧 → 世界系转换（ob_in_world）→ IoU 评测
+2. 首帧 register 全部准确（IoU 0.40~0.97），链路正确性由 plate_inst0 全帧 IoU 0.887 背书
+3. 抖动修复方案定型：静止段锁位姿（win=9/thr=5cm/段首锚定），plate path 1.92m→0，详见 Q19
+4. 2D+3D 合一 GIF：8 实例 combo.gif 已生成
+
+**产物位置**：
+- 可视化目录：`ReplicateAnyScene/test/fp_vis/index.html`（索引页）+ `<obj>/combo.gif`（2D+3D 合一）+ `<obj>/small.gif` + `traj.png`
+- 原始输出：`output_v2/7_vggt_omega/fp_data_<obj>/`（输入）、`fp_out_<obj>/`（位姿+IoU 报告）、`fp_vis/<obj>/`
+- 汇总数据：`fp_batch_report.json`（批量评测）、`fp_static_lock_eval.json`（锁位姿验证）
+- 工具脚本：`tools/analysis/fp_prepare_data.py`、`fp_select_mask.py`、`fp_run_tracking.py`、`fp_iou_eval.py`、`fp_batch_eval.py`、`fp_overlay_batch.py`、`fp_gif_2d3d.py`、`fp_static_lock_eval.py`
+
+**遗留问题**：
+1. **运动段内 FP 抖动仍在**：锁定后 toy_inst0/1 path 仍 3~4.4m（GT 1.1m），运动段需 EMA 平滑或周期性 re-register
+2. **未集成 mainv3**：建议插入点 stage3 之后 stage4 之前，复用 stage3 动态判定分段，跨双 conda 环境子进程调用
+3. **跨场景未验证**：2chair-bottle/3chair-bottle 仅准备了数据（fp_data_bottle0 100 帧），未跑完整流程
+4. **index.html 未更新**：卡片仍只链 small.gif，未加 combo.gif 入口
+5. index.html 需用系统浏览器或 `python -m http.server` 打开（IDE 内置预览注入 Vite 代理会 abort 静态页）
+
+### Q21: 运动段内的 FP track 抖动如何解决？修复效果如何量化？
+
+**回答**:
+
+**方法**：在方案B（静止段锁位姿）基础上增加**运动段 savgol 平滑**，组合成完整修复管线（`fp_static_lock_eval.py`）：
+
+1. 静止段：GT mask 世界系轨迹滑动窗口（win=9, thr=5cm）判定 → 锁定段首位姿（`lock_static`，anchor='first'）
+2. 运动段：段内平移逐轴 savgol（win=21, polyorder=3）+ 旋转四元数（符号对齐后）savgol（`smooth_moving`，fp_static_lock_eval.py L154-179）
+
+窗口选择依据（路径长度扫描，toy_inst0/1）：
+| 方案 | toy_inst0 | toy_inst1 |
+|---|---|---|
+| 原始 FP | 5.21 | 7.10 |
+| 仅锁静止 | 3.03 | 4.44 |
+| savgol w9/w15/w21/w31 | 2.00/1.66/1.54/1.40 | 2.85/2.38/2.20/2.28 |
+| 中值9+savgol w21 | 1.43 | 2.08 |
+
+选定 **w21 单遍**（简单够用；w31 toy_inst1 反而回升；中值组合仅再降 0.1m，不值得加复杂度）。净位移（真实 pick-place 运动，GT 0.347m）在所有窗口下均保留（0.764/0.922m，由段锚点决定与窗口无关）。
+
+**最终量化对比**（path 单位 m，IoU stride=2 光栅化）：
+
+| 实例 | FP原始 path/IoU | 修复后 path/IoU | GT path/net | 运动帧 |
+|---|---|---|---|---|
+| plate_inst0 | 1.920/0.887 | **0.000**/0.848 | 0.280/0.006 | 0/113 |
+| toy_inst0 | 5.214/0.653 | **1.539**/0.650 | 1.123/0.347 | 53/113 |
+| toy_inst1 | 7.105/0.318 | **2.204**/0.317 | 1.123/0.347 | 53/113 |
+| block_inst2 | 5.608/0.467 | **2.360**/0.372 | 0.389/0.048 | 11/113 |
+| block_inst0 | 3.129/0.263 | 2.027/0.248 | 0.482/0.084 | 40/113 |
+| block_inst1 | 5.037/0.162 | 3.436/0.141 | 0.482/0.084 | 40/113 |
+| toy_inst2 | 4.569/0.146 | 3.908/0.153 | 0.475/0.083 | 41/113 |
+| toy_inst3 | 3.867/0.107 | 2.135/0.157 | 0.390/0.048 | 10/113 |
+
+结论：高 IoU 实例（plate/toy_inst0/1）抖动压掉 55%~100% 且 IoU 持平（±0.003）；block_inst2 IoU 降 0.095（低 IoU 实例本身位姿不准，平滑无从补救）；toy_inst3 IoU 反升 0.05。
+
+**产物**：
+- 修复后位姿：`fp_out_<obj>/ob_in_world_locked/{t:06d}.txt`（不动原始 ob_in_world）
+- 修复后可视化：8 实例 combo.gif 已用 `fp_gif_2d3d.py --poses ob_in_world_locked` 重生成并同步 `test/fp_vis/<obj>/`
+- 汇总数据：`fp_static_lock_eval.json`
+
+**运行命令**：
+```bash
+python fp_static_lock_eval.py --scene_dir <SD> --win 9 --thr 0.05 --no_correct --anchor first --smooth_win 21 --save_locked
+python fp_gif_2d3d.py --scene_dir <SD> --poses ob_in_world_locked
+```
+
+### Q22: 为什么对静止物体也跑了 FP 跟踪？3D 面板里物体和轨迹为什么是分开的？
+
+**回答**:
+
+**问题1（对静止物体也跑了跟踪）**：之前的批量脚本直接遍历 `fp_batch_report.json` 的全部 8 个实例，没有接主流程 stage3 的动态判定。实际上 `pick_place_frames_combined.json` 判定本场景**只有 toy_inst1 是动态物体**（pick 46 / place 97），其余 7 个（3 block、plate、toy_inst0/2/3）都是静止的——对静止物体跑 track 只会得到抖动漂移的垃圾轨迹，还会"莫名其妙识别不同的东西"（FP 在低纹理/相似物体间漂移，IoU 0.1~0.3 的实例即此表现）。
+
+修复：`fp_gif_2d3d.py` 和 `fp_static_lock_eval.py` 新增 `dynamic_keys()`，默认只处理 stage3 判定为动态的实例；`--objs` 可指定、`--all` 取消过滤。
+
+**问题2（3D 面板物体和轨迹分离）**：3D 面板里青色 mesh 点云画在位姿变换后的真实位置，但橙色 FP 轨迹画的是 `ob_in_world` 的**平移分量 t**（= mesh 坐标系原点在世界系的位置）。toy_inst1 的 mesh.obj 原点离几何中心 **0.622m**（centroid=[-0.432,-0.446,0.041]），plate 也偏 0.147m——所以轨迹整体偏离物体一团点云。
+
+修复：轨迹改画 mesh 质心轨迹 `c_w(t) = R(t)@c + t(t)`（fp_gif_2d3d.py L102-105），与 GT 轨迹（mask 质心反投影，本来就是物体视觉中心）同一参考点，两者才可比。
+
+**清理**：test/fp_vis 下 7 个静态实例目录已删除，只保留 toy_inst1。场景目录 output_v2 下的 fp_data_*/fp_out_* 原始产物未动。
+
+**关于跟踪精度**：toy_inst1 修复后 path 2.20m / IoU 0.317（GT 1.12m/0.347 净位移），残余偏差是 FP track 本身在运动段的漂移，离线平滑只能压高频抖动，无法纠正低频漂移；若要更准需周期性 re-register 或换更强的跟踪器。
+
+### Q23: GIF 里红色/绿色轮廓是什么？SAM3 逐帧都跟着物体，为什么 FP 还会检测到别的物体？有没有方法改进？其他视频测过吗？
+
+**回答**:
+
+**颜色含义**（fp_gif_2d3d.py）：2D 面板红轮廓 = SAM3 GT mask（物体实际位置），绿轮廓 = FP 位姿下 mesh 投影（跟踪结果），橙点 = 投影质心历史尾迹；3D 面板青点云 = 物体 mesh，橙线 = FP 质心轨迹，绿线 = GT 质心轨迹，红三角 = 当前相机。
+
+**为什么会锁到别的物体**：fp_run_tracking.py L105-107 显示 SAM3 mask **只在帧 0 的 register 用过一次**（`est.register(..., ob_mask=mask)`），后续 track 循环是纯 RGB-D render-and-compare——FP 用自己上一帧渲染结果与当前帧匹配更新位姿，**没有用 SAM3 逐帧 mask**。位姿一旦滑动，render-and-compare 会锁到相似物体上，无约束拉回。SAM3 逐帧 mask 在管线中仅用于事后 IoU 评测，未参与跟踪。
+
+**改进方法**（按性价比）：
+1. mask 引导周期性 re-register：每隔 N 帧 / pick-place 边界（stage3 已给出帧号）用当帧 SAM3 mask + depth 重新 register，复用现有 register 代码，改动最小
+2. track 每帧输入用 SAM3 mask 裁剪的 RGB-D
+3. mask 反投影质心做平移软约束
+
+**其他视频**：尚未测试。除 7_vggt_omega 外有 stage3 动态判定的场景：116_C5_CellPhone_185deg_vggt_omega（2 交互）、121_C5_CellPhone_161deg_vggt_omega（2）、2chair-bottle_vggt_omega（2）、3chair-bottle_vggt_omega（3）。工具链（fp_prepare_data → fp_select_mask → fp_pick_mesh → fp_run_tracking → fp_gif_2d3d）齐备，计划只跑各场景动态实例。
+
+## Q32: LiteReality-Agent 能否替代 stage5 精修？agent 部分能否用 opencode？ (2026-10-13)
+
+**回答**:
+
+调研对象：[LiteReality-Agent](https://github.com/LiteReality/LiteReality-Agent)（Cambridge，arXiv 2610.01863，2026-10-01 发布）。核心思想是把 3D 重建变成 coding 任务：agent 迭代编写 `Room.py`，编译成 Blender/GLB/URDF/MJCF，MuJoCo 直接可仿真；通过 observe-edit-verify 循环（render 对比实拍 / critic 打分 / check_collisions 碰撞检查等 capability tool）收集证据反复修正。
+
+### 结论：不能整体替代，但精修层（layout/QC）与 stage5 完全对位，可移植
+
+| 本项目 stage5 | LiteReality-Agent 对应层 | 对比 |
+|---|---|---|
+| 5.1 VLM 投票 supported-by | `check_support`：footprint 下方最高顶面 / floor / wall anchor，纯确定性几何，强制唯一支撑者+链到地+无环 | 后者无需 VLM；VLM 只负责缺支撑物时补建模 |
+| 5.2-② SP 贴合（minor 档 0.15m 限幅） | support snap：Z 平移消 gap，root-first 链式，**同样是 0.15m cap**，超出升级给 agent | 设计几乎一致，限幅值相同 |
+| 5.2-③ 穿模迭代 | `resolve`：detect→nudge→detect；每个 clash 自带 metric 修复（world_dxdy）；接触由真实三角形判定，凸分解只算距离不算接触 | 解决了 121 场景"8 轮打地鼠"同款问题，更严谨 |
+| 5.2-④ check_stability | 编译质量/惯性/collider 的 MuJoCo 场景 + shake test | 从几何启发式兜底升级为真实物理验证 |
+
+### 不能整体替代的原因
+1. **输入契约不同**：它要求 iOS 扫描 RGB-D + RoomPlan `room.usdz`；本项目是 ego video → VGGT 实例 mesh（all_instances.pkl），无深度、无房间结构化先验
+2. **物体来源不同**：它做资产检索/生成（TRELLIS + GroundingDINO，24GB GPU 或 Modal），产出 CAD；本项目核心价值是真实重建 mesh + FP 轨迹，换成检索模型会丢失
+3. **依赖重**：Blender 5.x、图像生成 API key、内置 provider 仅 `claude`/`codex` 两个
+
+### 推荐方案 A：移植 QC 层 + opencode 驱动精修循环
+1. 引入 `room_qc` 的 `check_glb`（碰撞）/`check_support`（支撑）两道确定性门控（pip 安装该包调用或按其逻辑移植）；输入为带 extras 的 GLB——可用 all_instances.pkl 实例 mesh+位姿编译，floor/wall 类实例对应其"固定实体"
+2. stage 5.1 VLM 关系推断保留作先验，support check 做几何校验/纠正（与 2026-08-25 修复的"VLM 管关系、几何管摆放"分工一致）
+3. 精修循环 agent 化：渲染四视图 + findings → opencode agent 编辑位姿 JSON → 重跑 gate → 收敛出 final GLB。capability tools 注册为 MCP（opencode.json 配 stdio server），`opencode run` 非交互驱动，provider 用已有配置
+
+### 方案 B（不推荐）：完整接入 + 写第三个 provider
+`agent/providers/base.py` 是 seam（AgentHarness Protocol：SessionSpec 进、归一化事件流出），把 "opencode" 加进 `PROVIDERS`、实现 opencode provider 即可（capability tools 走 stdio MCP，codex 同款路径）。但输入契约改造量太大，不划算。
+
+### opencode 作为 harness 的已知限制（与其对 codex 的处理一致）
+- 无 PreToolUse hooks → step budget 退化为硬停（无 wind-down）
+- 无 cost 上报；无工具白名单（shell 始终可用）
+- LiteReality 的 `describe()` 已有降级提示模式，可照搬
+
+## Q33: 方案 A 具体是什么？ (2026-10-13)
+
+**回答**:
+
+方案 A = 不引入 LiteReality-Agent 整个系统（它要求 iOS RGB-D 扫描 + TRELLIS 资产生成 + Blender 5.x），只把它的"精修层"（room_qc）移植过来，替换 stage5 中最痛苦的 5.2-② SP 贴合、5.2-③ 穿模迭代、5.2-④ check_stability，agent 换成已配好的 opencode。分四步：
+
+1. **编译带 extras 的 GLB**：把 `all_instances.pkl` 的实例 mesh+位姿、`relations_scene_graph.json` 的关系编译成一个 GLB，分类（floor/wall/普通物体）、墙线等元数据写入 glTF `extras`——这是 LiteReality `room_qc` 的输入契约；floor/wall 实例对应其"固定实体"
+2. **两道确定性门控（移植）**：
+   - `check_support`：对每个物体找支撑者（footprint 下方最高顶面 / floor / wall anchor），量 gap → 报 `no_contact`/`embedded`/`unsupported`；修复 = Z 向平移（≤0.15m，root-first 链式）——等价于 5.1+5.2-②，但纯几何可复现
+   - `check_glb`：真实三角形判接触 + 凸分解量穿透深度 → 每个 clash 附带 metric 修复向量（`world_dxdy`）——等价于 5.2-③，不会出现 121 场景"8 轮打地鼠"
+3. **opencode agent 兜底循环**：门控解决不了的（如 `unsupported`——支撑物未重建出来）交给 agent：MCP 注册 `check_support`/`check_glb`/`render` 三个工具，opencode 看到渲染对比 + findings 后编辑位姿 JSON → 重新编译 → 重跑门控，循环收敛；`opencode.json` 注册 stdio MCP server，`opencode run` 非交互驱动
+4. **输出 final GLB**，替代现有 5.2 产出
+
+与现状的对应：5.1 VLM 关系推断保留作 `check_support` 先验（"VLM 管关系、几何管摆放"，与 2026-08-25 修复确立的分工一致）；`refine_inter_object_placement.py` 本体不动，保留作回退。改动集中在：新增一个精修入口脚本 + 移植两个 check 函数 + 一个 MCP server。
+
+## Q34: check_support / check_glb 是 agent 操作吗？ (2026-10-13)
+
+**回答**:
+
+不是。两者是**纯确定性 Python 函数**（无模型、无 agent），能直接命令行跑、exit 0/1 判通过：
+
+```bash
+python -m litereality_agent.pipeline.room_qc.support --glb Room.glb    # exit 0 = pass
+python -m litereality_agent.pipeline.room_qc.collision --glb Room.glb
+```
+
+修复也大部分是确定性的：支撑 gap → Z 向 snap；碰撞 → 按 findings 自带的 `world_dxdy` 平移，detect→nudge→detect 循环。几何问题用几何方法解最快、最可复现，LiteReality 的设计核心是**确定性优先、agent 兜底**。
+
+方案 A 中 agent 角色因此很窄：门控确定性修复成功（预期覆盖绝大多数贴合与毫米级穿透）时 agent 完全不参与、不花 token；仅少数边缘情况出场。121 场景"8 轮打地鼠"的根因正是几何问题被错误参数反复硬推——确定性门控每个 clash 自带修复向量，两轮即收敛。
+
+agent 只处理确定性修不了的两类情况：
+
+| finding | 为什么确定性修不了 | 谁修 |
+|---|---|---|
+| `unsupported`（footprint 下面啥都没有） | 支撑物未重建（墙隔板/支架），要补物体不是移位，补什么要看照片 | agent 读参考帧补建模 |
+| `capped`（需要位移 >0.15m/nudge 上限） | 上游摆放错误，硬推会把场景推坏 | agent 重新理解该物体位置 |
+| `support_cycle`（A 压 B 压 A） | 布局语义错误无解 | 直接报人 |
+
+## Q35: github.com/agentic-real2sim/agentic_real2sim 介入进来会不会更好？ (2026-10-13)
+
+**回答**:
+
+结论：**不适合介入，stage5.5 继续走 opencode agent 方案**。理由逐条核对：
+
+| 维度 | agentic_real2sim | 本项目现状 |
+|---|---|---|
+| 输入契约 | 需要 **DROID 机器人平台轨迹数据**（多视角 RGB-D + 机械臂动作流），输入假设是机器人操作日志 | 我们输入是单目/稀疏视角视频 + VGGT 重建，没有机器人动作流 |
+| 部署规模 | 5 个模拟环境（ManiSkill 等）合计约 80GB、GPU 服务化部署 | 单场景精修，无需重型仿真集群 |
+| 架构定位 | **端到端管线**：视频→场景重建→物理仿真→agent 闭环生成动作轨迹 | 我们已有完整 stage1~5 管线，缺的只是"摆放语义精修"一层 |
+| agent harness | 自带 agent 框架（非 opencode），与既有 opencode 工具链不兼容 | stage5.5 已用 opencode + stage55_cli 跑通 |
+
+可借鉴的思想（作为后续增强项，而非现在引入）：
+- **物理落座仿真验证**：把 stage5.5 修正后的场景丢进 SAPIEN 做一步 settle 仿真，看物体是否稳定落座（不滑落、不弹起），作为最终质量门控——这比纯几何 AABB 检测更能发现"看似不穿模但物理上必然翻倒"的摆放。
+- 其余部分（场景重建、动作生成）与本项目重叠且输入不匹配。
+
+因此不引入该仓库，仅吸收"物理落座验证"思想作为 stage5.5 的可选 stage5.6 增强。
+
+## Q36: stage5.5 的 prompt 是如何参考 LiteReality-Agent 的？他们是每个数据生成一个 prompt 吗？ (2026-10-14)
+
+**回答**:
+
+不是 per-dataset prompt。LiteReality-Agent 和本实现的 stage5.5 都是**一段写死的通用 prompt + 运行时工具喂场景信息**的三层分离：
+
+| 层 | LiteReality-Agent | stage5.5 实现 |
+|---|---|---|
+| Prompt（全场景共用） | 固定任务描述：迭代编辑 Room.py 直到渲染对齐实拍、门控通过 | `build_agent_prompt()`（run_stage55.py L59-108）一段固定文本 |
+| 场景差异 | 不进 prompt，由工具输出进入：render vs 实拍对比、check_collisions findings、critic 打分 | 不进 prompt：check_glb/check_support JSON findings + render 四视图 + optimal_frames 实拍参考帧，agent 用 bash/read 自取 |
+| 状态载体 | Room.py（改代码=改场景） | stage55_work.glb（set_xy=改场景） |
+
+`build_agent_prompt()` 的 f-string 只做路径注入（work.glb、参考帧目录），无任何场景相关描述——泛化靠"prompt 只描述 observe→edit→verify 通用工作流"实现。
+
+Prompt 里的"例子"（小物件搭在支撑物 A 边缘实拍在 B 上 / 家具地面互叠实拍前后错开）是**失败模式说明书**而非场景指令，用于向 agent 解释"check 报 ok 不代表语义对"这个检测盲区；2026-10-14 已从 121 场景特有表述（杯子/高桌/矮桌）抽象化以避免过拟合单场景。
+
+分工遵循 LiteReality"确定性优先、agent 兜底"核心：snap（Z 贴合）/nudge（MTV 向量收敛穿透）为确定性代码，agent 只处理检测器看不见的语义错误（放错支撑物、家具应错开）。后续增强：① stage5.6 物理落座验证（SAPIEN settle，对应其 MuJoCo shake test）；② opencode 无 PreToolUse hooks 导致轮次硬停，需提示词"执行完才能结束"缓解（GLM-5.2 两次失败根因）。
+
+**Q36 补充（2026-10-14，prompt 原文核实）**：直接读取 LiteReality-Agent 仓库 `src/litereality_agent/agent/author.py` L68 的 `PROMPT` 常量确认：其 prompt 是一段写死的通用 SOP（角色定义 → "Two jobs, IN THIS ORDER"（先墙体结构后材质 FLOOR→WALLS→CEILING，再补墙挂件）→ 工具用法（render/critic/fetch_material）→ 约束（Edit ONLY Room.py、Be CONSERVATIVE and evidence-based）），**零场景内容**：无物体名、无坐标、无"移动某物"指令；场景信息靠 agent 首步 "Read Room.md and Room.py IN FULL" + head-on stitches 照片（`{stitch_lines}` 仅路径注入）+ render/critic 工具输出进入。注意细节：他们的 prompt 反而**禁止移动家具**（"do NOT move/resize the furniture object boxes"，家具来自 RoomPlan 扫描可信），agent 只管墙体/材质/挂件；stage5.5 相反——mesh 可信、摆放不可信，agent 只管 set_xy。任务分工相反、机制同构。另有 4 个 profile（base/detail/simulation/open）按任务档位分 prompt 变体，非按数据集分。
+
+### Q24: mask 引导 re-register (--rekey) 改进效果如何？跨场景测试结果？
+
+**回答**:
+
+**方法**（fp_run_tracking.py 新增 `--rekey N`）：旧管线 SAM3 mask 只在帧 0 register 用一次，后续 track 是纯 RGB-D render-and-compare，无 mask 约束 → 遮挡后漂移锁到相似物体（袖子等）。改进：每隔 N 帧（默认 15）且当帧有 SAM3 mask 时重新 `est.register`（mask+depth），register 失败回退 track。mask 逐帧保存于 `fp_data_<obj>/mask/`（113 帧全齐，遮挡时面积变小但 SAM3 不丢）。
+
+**toy_inst1（7_vggt_omega）**：IoU 0.318 → **0.523**（+64%），min 0.224。质心轨迹 path 1.71m vs GT 1.12m。旧结果备份 `fp_out_toy_inst1_orig/`。
+
+**跨场景 4 场景 bottle_inst0 全链**（select_mask → prepare → rekey tracking → GIF）：
+
+| 场景 | rekey path | GT path | IoU |
+|---|---|---|---|
+| 116_C5_CellPhone_185deg | 0.72m | 0.74m | 0.555 |
+| 121_C5_CellPhone_161deg | 3.84m | 0.40m | 0.432（部分失败） |
+| 2chair-bottle | 1.84m | 1.97m | 0.688 |
+| 3chair-bottle | 4.23m | 4.18m | 0.603 |
+
+116/2chair/3chair path 与 GT 几乎一致，遮挡+手举段均跟住；121 有漂移段（遮挡段 IoU 掉 0，path 虚高 10 倍）待查（候选原因：mesh 选择/depth 质量）。
+
+**踩坑**：
+1. register 在等价位姿间翻转 → 平移分量跳变 2×0.622m（mesh 原点离质心距离），**平移分量 path 是表示层假象**，应看质心轨迹（R@c+t）path；savgol 平滑跨 register 跳变会把两个等价位姿平均成错误位姿（IoU 0.523→0.361），**rekey 后不再叠加 lock+savgol**
+2. fp_gif_2d3d 的 test 同步目录改为 `<场景名>_<实例名>`，避免跨场景同名实例 combo.gif 互相覆盖
+3. GIF 渲染：GT mask 红色半透明填充（fill=0.45）+ 3px 轮廓、FP 投影绿色 fill=0.18——小物体（~500px）纯细轮廓在视频里像背景图案难以辨认
+
+**产物**：`test/fp_vis/{7_vggt_omega_toy_inst1,116_..._bottle_inst0,121_...,2chair-...,3chair-...}/combo.gif`（红=SAM3 真值、绿=FP 跟踪、橙点=质心尾迹）。
+
+### Q28: 用 SpatialTrackerV2 替代 FoundationPose 做物体跟踪的效果如何？
+
+**回答**: 已实现 [spa_track_object.py](../tools/analysis/spa_track_object.py) 适配脚本，流程：SpaTrackerV2-Offline 前馈输出 2D 点轨迹（mask 内均匀采样 query）→ 用自有 depth/cam_K/extrinsics 反投影回 VGGT 世界系（不用模型自己的 BA 世界系，保证与 GT 同系同尺度）→ mesh 采样点 ICP 到 query 帧物体点云锚定 P0 → 逐帧加权 Kabsch（vis×conf 加权，2 轮剔离群）恢复刚体位姿。结果缓存 spa_tracks.npz，重跑位姿恢复无需 GPU。
+
+**toy_inst1 单场景对比**：
+
+| 方法 | 面片 IoU | 质心 path | GT path |
+|---|---|---|---|
+| FP rekey | **0.529** | 1.71m（+52%） | 1.12m |
+| SpaTrackerV2 | 0.479 | **1.09m（-2.8%）** | 1.12m |
+
+结论：SpaTrackerV2 的 3D 轨迹精度显著更好（路径误差 2.8% vs FP 的 52% 高估），但投影 IoU 略低，主因是深度反投影的逐帧噪声（~35mm/帧抖动）。
+
+**实验教训**：
+1. 平滑不是万能药：savgol 窗口21（项目 FP 惯例）对快速运动段过度平滑，IoU 崩溃至 0.04；窗口7 折中 0.464；位姿中值滤波+旋转测地均值在快旋转帧失败（IoU 0.00，路径暴涨 3.34m）；原始未滤波版本最优。
+2. fp_data 的 mesh.obj 本身已在 VGGT 世界系摆放（bbox 与 mask+depth 点云同位置），ICP 初始值必须包含单位阵——PCA 主轴初始旋转全部错误，阈值 5cm 内零对应导致 fitness=0。
+3. open3d point-to-plane 精配在噪声法向下可能发散，必须守护：精配 fitness/rmse 未变好则保留 point-to-point 粗配结果。
+4. 依赖坑：pyceres 2.6 与 pycolmap 3.11.1 的 ceres 绑定冲突（ImportError: PositiveExponentialManifold），需 pyceres==2.4；PyPI utils3d 0.1.3 无 torch 子模块，需手动装 EasternJournalist/utils3d@d3a577a；moviepy 必须 1.0.3（2.x 无 moviepy.editor）。
+
+运行：`CUDA_VISIBLE_DEVICES=1 python tools/analysis/spa_track_object.py --scene_dir output_v2/7_vggt_omega --obj toy_inst1 --n_pts 600 --depth_win 1`（foundationpose env）。GIF 对比：`fp_vis/toy_inst1/combo_spa.gif` vs `combo_fp_rekey.gif`。

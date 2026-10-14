@@ -127,14 +127,22 @@ final_scene_stage5.glb  +  materials.json(可选)
 |---|---|---|
 | 静/动摩擦 mu1/mu2 | **Stage 6 材质** | 取代 URDF 里 EmbodiedGen 硬编码的 0.60/0.50 |
 | 恢复系数 restitution | **Stage 6 材质** | 取代硬编码的 0.02 |
-| 质量 mass | URDF 的 VLM 值（默认） | `--mass_source density` 可换成 密度×体积 |
+| 质量 mass | URDF 的 `<inertial>`：**mesh 体积 × 类别密度** | 见下方更正；`--mass_source density` 换成 Stage 6 的 per-instance 密度 |
 | 惯量 inertia | 由 mesh + 最终质量现算 | URDF 里的 `ixx=iyy=izz=1.0` 是占位值，必须重算 |
 
-**质量为什么没跟着换成密度法**：试过，结果是 `newspaper_1` 算出 10.9kg、
-`table_0` 35kg。密度质量 / VLM 质量的中位数约 **2~5x**，换算成线性尺度误差
-**1.2~1.7x** —— 与 `SAM3D_SCALE_DRIFT_REPORT.md` 记载的 ~1.5x 漂移吻合，说明是
-mesh 整体偏大而不是密度不该用。所以只用那些**不依赖绝对尺度**的量（摩擦/恢复），
-质量留给 VLM。这个比值本身也被做成尺度漂移诊断量写进报告（见 §7 表格）。
+> **更正（2026-10-10 读码核实）**：本表此前写「质量 = URDF 的 VLM 值」，与实现不符。
+> `src/stage61_urdf_generator.py:315-329` 实际用 `mesh 体积 × density_map`（密度表仅
+> `chair/table/bottle/cup` + `default` 五档）计算 mass，而 VLM 返回的
+> `min_mass/max_mass` 在同文件 L327-328 被**无条件覆盖丢弃**。`--mass_source density`
+> 只是把密度换成 Stage 6 `materials.json` 的 per-instance 值，本质仍是「体积 × 密度」。
+>
+> 由此产生的现象：`newspaper_1` 算出 10.9kg、`table_0` 35kg，两条路径的比值中位数约
+> **2~5x**，换算成线性尺度误差 **1.2~1.7x** —— 与 `SAM3D_SCALE_DRIFT_REPORT.md`
+> 记载的 ~1.5x 漂移吻合。该比值同时被做成尺度漂移诊断量写进报告（见 §7 表格）。
+>
+> 补充：非水密网格（218 个物体中 42 个）的 `trimesh.volume` 存在不确定性，现在会打
+> WARN 提示；但**不改成包围盒近似** —— 实测包围盒/trimesh 体积比中位 21.9x、最大 471x
+> （`newspaper_0` 会从 0.18kg 变成 84.7kg），反而更差（`src/stage61_urdf_generator.py`）。
 
 ---
 
@@ -206,7 +214,8 @@ $PY tools/analysis/make_stage61_gallery.py   # -> output_v2/stage61_gif_gallery.
 3. **`phone_vggt_omega` 有 36 个"空帧"**（索引 83~119，见报告 `empty_frame_indices`）：
    不是渲染失败——那段真实视频是手持手机特写、相机离被摄物极近，而 sim 里手机已
    落地离场，画面只剩地面。
-4. **质量依赖 VLM 猜测**：见 §5，受制于上游的尺度漂移。
+4. **质量由 mesh 体积 × 类别密度估算**（不是 VLM 估值，见 §5）：受制于上游 mesh
+   尺度漂移，且密度表仅 5 档，大体积家具（桌子/柜子）易被严重高估。
 5. **环境分裂**：②③ 用 `sapien` env，① 用 `ReplicateAnyScene` env，文档别写混。
 6. **mesh 命名双前缀**：`urdf/mesh/block_0_block_0.obj`（类别+实例名重复拼接）。
 
@@ -275,7 +284,8 @@ materials.json  +  materials_debug.json
 ```
 final_scene_stage5.glb
   Step1 GLB 拆解     : 每物体居中 → 导出裸 OBJ + world_position + ground_z
-  Step2 逐物体 URDF  : Open3D 渲染4视图 → Qwen VLM 判属性(类别/高度/质量/摩擦)
+  Step2 逐物体 URDF  : Open3D 渲染4视图 → Qwen VLM 判属性(类别/描述/摩擦)
+                       质量不取 VLM 值, 改由 mesh 体积 × 类别密度计算
                        → coacd 凸分解 → EmbodiedGen generate_urdf()
   Step3 合并         : 复制 mesh 到 urdf/mesh/ + 统一前缀 → scene.urdf
                        (fixed joint, parent=base, origin=world_position)

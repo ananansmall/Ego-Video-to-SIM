@@ -2141,6 +2141,49 @@ def vlm_judge_relationships(unique_objects, sam_results, frame_paths_with_indice
 # Step 8: 输出场景JSON
 # ============================================================
 
+# 人体部位 / 操作者身体部分。
+# VLM_DETECT_PROMPT 里已写了 "Ignore: hands, body parts, walls, floors,
+# ceilings", 但实测靠不住: 86.mp4 (人在桌前操作食物) 仍然输出了 "arm",
+# 而 156.mp4 (静态摆物的场景) 没有 —— 说明 VLM 会把画面中突出的肢体当成物体。
+# 放任的后果不只是多生成一个模型: 手臂是「操作者」, 会被 pick_place_detector
+# 判成抓取事件 (86 的 arm_inst1 被判出 4 次 pick/place), 还会污染支撑关系
+# (plate_0 → supported by arm_1, 实际水平重叠 0%)。
+# 因此这里在 Stage1 的唯一出口统一拦掉, 不依赖 VLM 自觉。
+BODY_PART_CATEGORIES = {
+    # 上肢
+    'arm', 'hand', 'finger', 'thumb', 'fist', 'palm', 'wrist', 'forearm', 'elbow',
+    'shoulder',
+    # 下肢
+    'leg', 'foot', 'toe', 'knee', 'ankle', 'thigh', 'hip',
+    # 躯干 / 头
+    'body', 'torso', 'head', 'face', 'neck', 'hair', 'chest', 'back', 'belly',
+    'waist',
+    # 感官
+    'eye', 'ear', 'nose', 'mouth', 'lip', 'teeth', 'tongue',
+    # 人本身
+    'person', 'people', 'human', 'man', 'woman', 'child', 'kid', 'baby', 'boy',
+    'girl', 'guy', 'lady',
+}
+
+
+def _is_body_part(category_name):
+    """判断类别名是否为人体部位 / 操作者身体部分。
+
+    会同时处理带实例后缀的形式 (arm_0 → arm)。故意用「精确匹配」而不是子串匹配,
+    避免误伤 armchair / chair / handle / footstool / alarm 这些合法类别。
+    """
+    if not category_name:
+        return False
+    name = str(category_name).lower().strip()
+    if name in BODY_PART_CATEGORIES:
+        return True
+    # 去掉 _<数字> 实例后缀再判一次
+    head, sep, tail = name.rpartition('_')
+    if sep and tail.isdigit():
+        return head in BODY_PART_CATEGORIES
+    return False
+
+
 def generate_scene_json(category_registry, output_path):
     """
     将最终的场景类别-关系映射保存为JSON文件
@@ -2154,7 +2197,20 @@ def generate_scene_json(category_registry, output_path):
     print(f"{'='*70}\n", flush=True)
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    sorted_registry = dict(sorted(category_registry.items()))
+
+    # 过滤人体部位 (说明见 BODY_PART_CATEGORIES 处注释)。
+    # 兜底: 若过滤后什么都不剩, 说明这个场景几乎全是肢体 (极端情况), 保留原清单
+    # 而不是输出空场景 —— 空场景会让后续 Stage 无物体可处理。
+    body_parts = sorted(n for n in category_registry if _is_body_part(n))
+    if body_parts:
+        print(f"   🚫 过滤人体部位 {body_parts} (VLM 未遵守 'Ignore: hands, body parts')",
+              flush=True)
+    filtered = {k: v for k, v in category_registry.items() if not _is_body_part(k)}
+    if not filtered:
+        print("   ⚠️ 过滤后无剩余物体, 保留原清单", flush=True)
+        filtered = dict(category_registry)
+
+    sorted_registry = dict(sorted(filtered.items()))
 
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(sorted_registry, f, indent=2, ensure_ascii=False)

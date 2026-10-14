@@ -39,7 +39,7 @@ def main(args):
     # Use sam3 to predict floor and wall to align the scene to room_coordinate_system
     sam3_image_model = load_sam3_image_model()
     wall_masks, floor_masks = segment_wall_and_floor(vggt_prediction_results['colors'], sam3_image_model)
-    R, t = align_to_room_coordinate_system(vggt_prediction_results['world_points'], wall_masks, floor_masks)
+    R, t, _align_info = align_to_room_coordinate_system(vggt_prediction_results['world_points'], wall_masks, floor_masks)
     vggt_prediction_results = align_vggt_predictions(vggt_prediction_results, R, t)
     # save related results
     os.makedirs(os.path.join(args.output_path, 'color'), exist_ok=True)

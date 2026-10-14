@@ -377,11 +377,10 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
     )
 
     # 五阶段坐标系对齐 (Stage1 严格 → Stage2 放宽 → Stage2.5 VLM辅助 → Stage3 大平面 → Stage4 GeoCalib)
-    R, t = align_to_room_coordinate_system(
+    R, t, alignment_info = align_to_room_coordinate_system(
         vggt_prediction_results['world_points'], wall_masks, floor_masks
     )
     alignment_stage = "stage1_strict"
-    alignment_info = {}
 
     if np.allclose(R, np.eye(3), atol=1e-6):
         print("   Stage1 (strict) 失败, 尝试 Stage2 (relaxed)...", flush=True)

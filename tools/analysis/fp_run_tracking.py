@@ -24,6 +24,7 @@ import numpy as np
 
 FP_ROOT = '/mnt/data_8THDD/lza/workspace/robot_world_ws/src/FoundationPose'
 sys.path.insert(0, FP_ROOT)
+sys.path.insert(0, os.path.join(FP_ROOT, 'mycpp', 'build'))  # estimater 需要 mycpp 扩展
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from trajectory_video_overlay import Projector, sample_object_surface_points  # noqa: E402
@@ -54,6 +55,15 @@ def main():
     parser.add_argument('--gpu', type=str, default='0')
     parser.add_argument('--est_refine_iter', type=int, default=5)
     parser.add_argument('--track_refine_iter', type=int, default=2)
+    parser.add_argument('--mesh', type=str, default=None,
+                        help='覆盖 mesh.obj 路径(批量筛选候选 mesh 时用)')
+    parser.add_argument('--n_frames', type=int, default=0,
+                        help='>0 只跟踪前 N 帧(快速筛选/冒烟测试)')
+    parser.add_argument('--pre_inst', type=int, default=None,
+                        help='GT mask 用哪个 _pre_dedup 实例; 默认读 fp_mask_select/<obj>.json')
+    parser.add_argument('--rekey', type=int, default=0,
+                        help='>0 每隔 N 帧用当帧 SAM3 mask 重新 register '
+                             '(mask 引导, 抗漂移; register 失败回退 track)')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -64,6 +74,8 @@ def main():
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
     n_frames = len(os.listdir(os.path.join(data_dir, 'rgb')))
+    if args.n_frames:
+        n_frames = min(n_frames, args.n_frames)
     print(f'frames: {n_frames}')
 
     # ---- FoundationPose 初始化 ----
@@ -71,9 +83,13 @@ def main():
     import nvdiffrast.torch as dr
     from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
 
-    mesh = trimesh.load(os.path.join(data_dir, 'mesh.obj'))
-    print(f'mesh: {len(mesh.vertices)} verts')
+    mesh = trimesh.load(args.mesh or os.path.join(data_dir, 'mesh.obj'))
+    print(f'mesh: {args.mesh or os.path.join(data_dir, "mesh.obj")} '
+          f'({len(mesh.vertices)} verts)')
     glctx = dr.RasterizeCudaContext()
+    # 注: 曾试过传 Z 轴 180° 对称变换, 但实测并未减少等价解翻转
+    # (旋转跳变 9 次 -> 11 次), 且已验证逐帧真实旋转仅 4.8°/帧, 数据本身健康。
+    # 跳变只出现在 rotvec/euler 表示层, 故不需要 symmetry_tfs。
     est = FoundationPose(model_pts=mesh.vertices.astype(np.float32),
                          model_normals=mesh.vertex_normals.astype(np.float32),
                          mesh=mesh, scorer=ScorePredictor(),
@@ -84,22 +100,35 @@ def main():
     # ---- 逐帧跟踪 ----
     poses_cam = {}
     for t in range(n_frames):
-        rgb = cv2.imread(os.path.join(data_dir, 'rgb', f'{t:06d}.png'))[..., ::-1]
+        rgb = np.ascontiguousarray(cv2.imread(os.path.join(data_dir, 'rgb', f'{t:06d}.png'))[..., ::-1])
         depth = cv2.imread(os.path.join(data_dir, 'depth', f'{t:06d}.png'),
                            cv2.IMREAD_UNCHANGED).astype(np.float32) / 1e3
         K = np.loadtxt(os.path.join(data_dir, 'cam_K', f'{t:06d}.txt'))
-        if t == 0:
-            mask = cv2.imread(os.path.join(data_dir, 'mask', '000000.png'), 0)
+        mask_path = os.path.join(data_dir, 'mask', f'{t:06d}.png')
+        # mask 引导: 帧 0 必须 register; 之后每隔 rekey 帧且当帧有 SAM3 mask 时
+        # 重新 register, 把漂移拉回真值物体 (纯 track 是 render-and-compare,
+        # 无 mask 约束, 会锁到相似物体上)
+        do_reg = t == 0
+        if not do_reg and args.rekey and t % args.rekey == 0:
+            do_reg = os.path.isfile(mask_path)
+        if do_reg:
+            mask = cv2.imread(mask_path, 0)
             mask = (mask > 0).astype(bool)
-            pose = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
-                                iteration=args.est_refine_iter)
+            try:
+                pose = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
+                                    iteration=args.est_refine_iter)
+            except Exception as e:
+                print(f'  [{t}] register failed ({e}), fallback to track')
+                pose = est.track_one(rgb=rgb, depth=depth, K=K,
+                                     iteration=args.track_refine_iter)
         else:
             pose = est.track_one(rgb=rgb, depth=depth, K=K,
                                  iteration=args.track_refine_iter)
         poses_cam[t] = np.asarray(pose)
         np.savetxt(os.path.join(out_dir, 'ob_in_cam', f'{t:06d}.txt'),
                    pose.reshape(4, 4))
-        print(f'  [{t}] pose t={np.round(pose[:3, 3], 3)}')
+        print(f'  [{t}] {"reg" if do_reg else "trk"} '
+              f'pose t={np.round(pose[:3, 3], 3)}')
 
     # ---- 相机系 → 世界系 (extrinsics 是 world-to-camera) ----
     for t in range(n_frames):
@@ -113,10 +142,19 @@ def main():
     with open(os.path.join(sd, '_pre_dedup_masks.pkl'), 'rb') as f:
         pkl = pickle.load(f)
     all_masks = pkl['all_masks']
-    cat, inst_s = args.obj.rsplit('_inst', 1)
-    inst = int(inst_s)
-    frames = all_masks[cat][inst]
+    cat = args.obj.rsplit('_inst', 1)[0]
+    # GT mask 必须与 prepare 用的是同一个 _pre_dedup 实例(否则校验的是错的物体)
+    pre_inst = args.pre_inst
+    if pre_inst is None:
+        sel = os.path.join(sd, 'fp_mask_select', f'{args.obj}.json')
+        if os.path.isfile(sel):
+            with open(sel) as f:
+                pre_inst = json.load(f)['best_pre_inst']
+        else:
+            pre_inst = int(args.obj.rsplit('_inst', 1)[1])
+    frames = all_masks[cat][pre_inst]
     frame_by_id = {fr['frame_id']: fr for fr in frames}
+    print(f'GT mask: _pre_dedup {cat}_inst{pre_inst} ({len(frames)} frames)')
     verts = np.asarray(mesh.vertices)
 
     report = {'obj': args.obj, 'frames': {}}

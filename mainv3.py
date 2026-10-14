@@ -377,11 +377,10 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
     )
 
     # 五阶段坐标系对齐 (Stage1 严格 → Stage2 放宽 → Stage2.5 VLM辅助 → Stage3 大平面 → Stage4 GeoCalib)
-    R, t = align_to_room_coordinate_system(
+    R, t, alignment_info = align_to_room_coordinate_system(
         vggt_prediction_results['world_points'], wall_masks, floor_masks
     )
     alignment_stage = "stage1_strict"
-    alignment_info = {}
 
     if np.allclose(R, np.eye(3), atol=1e-6):
         print("   Stage1 (strict) 失败, 尝试 Stage2 (relaxed)...", flush=True)
@@ -451,12 +450,43 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         else:
             alignment_stage = "stage4_geocalib"
 
-    print(f"   坐标系对齐完成: {alignment_stage} (R[2,2]={R[2,2]:.4f})", flush=True)
+    # 不再打印 R[2,2] 当质量指标 —— 它只在"VGGT 的 world 系恰好是 z-up"时才有
+    # 意义, 而实测 46 个场景 |R[2,2]| 中位数仅 0.42 (最小 0.047) 却对齐良好。
+    # 打出来会让人误以为对齐有问题。改打重力一致性 (不依赖坐标惯例)。
+    _q = (alignment_info or {}).get('quality') if isinstance(alignment_info, dict) else None
+    if _q:
+        print(f"   坐标系对齐完成: {alignment_stage} "
+              f"(重力一致性 median_angle={_q.get('median_angle_deg', float('nan')):.1f}°, "
+              f"内点率={_q.get('inlier_ratio', float('nan')):.2f})", flush=True)
+    else:
+        print(f"   坐标系对齐完成: {alignment_stage}", flush=True)
 
     # 保存坐标系对齐变换 (供 pose_changes.json 合并 + 调试追溯)
     extrinsics_before = vggt_prediction_results['extrinsics'].copy()
     vggt_prediction_results = align_vggt_predictions(vggt_prediction_results, R, t)
     extrinsics_after = vggt_prediction_results['extrinsics']
+
+    # ── 原始视频总帧数 ──
+    # Stage 3.7 (Pick/Place 检测) 用它算 frame_ratio = total_frames / RGB帧数。
+    # 该模块的时长类阈值 (MIN_MOTION_DURATION 等) 定义在原始视频帧空间, 缺了
+    # total_frames 会退化成 frame_ratio=1.0, pick/place 帧号随之差几倍
+    # (实测各场景 ratio 在 2.29~4.93 之间)。
+    n_frames_rgb = int(extrinsics_before.shape[0])
+    total_video_frames = 0
+    try:
+        _cap = cv2.VideoCapture(input_video)
+        if _cap.isOpened():
+            total_video_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        _cap.release()
+    except Exception as _e:
+        print(f"   ⚠️ 读取视频总帧数失败: {_e}", flush=True)
+    if total_video_frames <= 0:
+        total_video_frames = n_frames_rgb
+        print(f"   ⚠️ 无法获取原始视频帧数, total_frames 退化为 RGB 帧数 "
+              f"{n_frames_rgb} (Stage 3.7 的 frame_ratio 将为 1.0)", flush=True)
+    else:
+        print(f"   原始视频帧数: {total_video_frames} (RGB {n_frames_rgb} 帧, "
+              f"frame_ratio={total_video_frames / max(n_frames_rgb, 1):.2f})", flush=True)
 
     coord_align_info = {
         "alignment_stage": alignment_stage,
@@ -465,7 +495,8 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         "method_detail": alignment_info,
         "extrinsics_before_first_frame": extrinsics_before[0].tolist(),
         "extrinsics_after_first_frame": extrinsics_after[0].tolist(),
-        "n_frames": int(extrinsics_before.shape[0]),
+        "n_frames": n_frames_rgb,
+        "total_frames": int(total_video_frames),
         "extrinsics_convention": "w2c (world→camera): p_cam = R @ p_world + t",
         "camera_position_formula": "cam_pos = -R_w2c.T @ t_w2c (不是 t 本身)",
     }
@@ -641,6 +672,66 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
         json.dump(instance_visibility, f, indent=2, ensure_ascii=False)
     print(f"   💾 Saved instance_visibility.json ({sum(len(v) for v in instance_visibility.values())} instances)", flush=True)
 
+    # ── Stage 3.7: Pick/Place 帧检测 (大小物体分治) ──
+    # 为什么必须接这一步: 本函数后段原先用自带的三条件判动态
+    #   is_dynamic = (global_disp>0.05) and (moving_ratio>0.3) and (light_moving_ratio>0.8)
+    # 实测该判据在 5 个有标注场景上召回 0% (5 个全漏检)。原因是它依赖"帧间大位移
+    # 占比": 真实抓取-放置是连续平滑动作, 帧间位移每帧只有 1~2cm, 永远达不到
+    # moving_ratio>30% (2chair-bottle 的 global_disp 已达 1.11m, 却因 moving_ratio=2%
+    # 被判静态)。pick_place_detector 的分治判据用累计路径/净位移 (小物体) 和点云
+    # 重叠率 (大物体), 不依赖帧间大位移, 同组场景召回 5/5、零误检零漏检。
+    #
+    # 关键: 这里传 deduplicated_all_masks (去重后), 而不是让该函数去读
+    # _pre_dedup_masks.pkl (去重前)。两者实例编号空间不同, 实测 7_vggt_omega 里
+    # 同一物理物体在去重前叫 toy_inst1、去重后叫 toy_inst0, 直接混用会让下游
+    # 拿错物体。
+    _t37 = time.time()
+    pick_place_result = {}
+    # 动态检测自身的状态: 用于区分「场景里确实没有动态物体」和「动态检测没跑起来」。
+    # 后者必须显式记录 —— 否则下游看到一个空的动态集合, 会误以为是前者。
+    _pp_status = {'available': False, 'reason': 'not_run'}
+    try:
+        from src.pick_place_detector import run_stage3_7_pick_place
+        pick_place_result = run_stage3_7_pick_place(
+            output_path,
+            all_masks=deduplicated_all_masks,
+            world_points=vggt_prediction_results['world_points'],
+        )
+        _pp_interactions = list(pick_place_result.get('interactions', []))
+        _pp_dynamic = {i['instance_name'] for i in _pp_interactions}
+        _pp_status = {
+            'available': True,
+            'n_interactions': len(_pp_interactions),
+            'frame_ratio': pick_place_result.get('frame_ratio'),
+            # fallback_1.0 表示没拿到 total_frames, 小物体判定会偏严 (可能漏检)
+            'ratio_source': pick_place_result.get('ratio_source'),
+        }
+        print(f"   🎯 Stage 3.7 Pick/Place: 检测到 {len(_pp_interactions)} 个交互 "
+              f"(frame_ratio={pick_place_result.get('frame_ratio')}), "
+              f"涉及实例 {sorted(_pp_dynamic)}", flush=True)
+        for _i in _pp_interactions:
+            print(f"      {_i['instance_name']}: pick={_i['pick_frame']} "
+                  f"place={_i['place_frame']} conf={_i['confidence']:.2f}", flush=True)
+    except Exception as _e:
+        _pp_interactions, _pp_dynamic = [], set()
+        _pp_status = {'available': False, 'reason': str(_e)}
+        print(f"   ⚠️ Stage 3.7 (Pick/Place) 失败: {_e}", flush=True)
+        print("      → 动态判定回退到兜底三条件", flush=True)
+        print("        但该兜底判据在 5 个有标注场景上召回 0% (5 个全部漏检): 真实抓取是")
+        print("        连续平滑动作, 帧间位移每帧仅 1~2cm, 达不到其 moving_ratio>30% 的要求")
+        print("        因此本次运行很可能不会输出任何动态物体 —— 这属于「动态检测失效」,",
+              flush=True)
+        print("        不是「场景里没有动态物体」。如需动态物体请先修好 Stage 3.7。", flush=True)
+
+    # 落盘动态检测状态 (成功/失败都写), 让产物自身能说明是哪一种情况
+    try:
+        with open(os.path.join(output_path, "dynamic_detection_status.json"),
+                  'w', encoding='utf-8') as _f:
+            json.dump(_pp_status, _f, indent=2, ensure_ascii=False)
+    except Exception as _e2:
+        print(f"   ⚠️ 动态检测状态落盘失败: {_e2}", flush=True)
+    print(f"   ⏱️ Stage 3.7 耗时: {time.time() - _t37:.1f}s", flush=True)
+
     # 在子进程中生成3D资产（避免CUDA内存冲突）
     all_instances = generate_3d_asset_in_subprocess(
         deduplicated_all_masks,
@@ -688,6 +779,28 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
 
             if len(centroid_data) < 2:
                 continue
+
+            # ── 初始帧 = 抓取前的静止位置 ──
+            # 原实现拿 first_visible_frame_id (首次被 SAM3 检测到的帧) 当"初始位置",
+            # 但那不等价: 物体可能在视频开头就已经在动 (比如一开始手就拿着它),
+            # 那种情况下"首次可见帧"里的位置不是静止位置, 渲染出来就很奇怪。
+            # Stage 3.7 已经给出了抓取时刻 pick_frame, 所以初始帧应当取 pick 帧
+            # 之前、该实例仍然可见的最后一帧。
+            # 注意两个帧空间: pick_frame 在原始视频帧空间, 而 centroid_data 的 fid
+            # 在 RGB 帧空间, 需要除以 frame_ratio 换算。
+            initial_frame_id = first_visible_frame_id
+            _pp_inst = [i for i in _pp_interactions
+                        if i['instance_name'] == f"{category}_inst{inst_idx}"]
+            if _pp_inst:
+                _ratio = float(pick_place_result.get('frame_ratio') or 1.0) or 1.0
+                _pick_frame_min = min(i['pick_frame'] for i in _pp_inst)
+                _pick_rgb = _pick_frame_min / _ratio
+                _before = [fid for fid, _ in centroid_data if fid <= _pick_rgb]
+                if _before:
+                    initial_frame_id = max(_before)
+                print(f"   {category}_{inst_idx}: 初始帧 = frame {initial_frame_id} "
+                      f"(pick={_pick_frame_min} / ratio={_ratio:.2f} → RGB≈{_pick_rgb:.0f}, "
+                      f"首次可见帧={first_visible_frame_id})", flush=True)
 
             # ── 位移计算 + MAD 离群点剔除 ──
             disps = np.array([np.linalg.norm(centroid_data[i][1] - centroid_data[i-1][1])
@@ -742,23 +855,39 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
             # ── 可见帧占比: 防止可见帧少的物体被 VGGT 噪声误判 ──
             visible_ratio = len(centroid_data) / max(total_frames, 1)
 
-            # ── 动态判定: 三条件并置 ──
-            # 条件1: global_disp > 0.05m — 首尾25%质心位移>5cm (物体真的换了位置)
-            # 条件2: moving_ratio (>5cm) > 0.3 — 大位移帧占比>30% (不是偶发漂移)
-            # 条件3: light_moving_ratio (>2cm) > 0.8 — 小位移帧占比>80% (持续稳定运动)
-            is_dynamic_inst = (global_disp > 0.05) and (moving_ratio > 0.3) and (light_moving_ratio > 0.8)
+            # ── 动态判定: 以 Stage 3.7 的 pick/place 结果为准 ──
+            # 旧三条件 (global_disp / moving_ratio / light_moving_ratio) 只在
+            # Stage 3.7 不可用时作兜底 —— 它在 5 个 GT 场景上召回 0% (全漏检),
+            # 原因见本函数 Stage 3.7 处的说明。
+            _pp_key = f"{category}_inst{inst_idx}"
+            if pick_place_result:
+                is_dynamic_inst = _pp_key in _pp_dynamic
+            else:
+                is_dynamic_inst = ((global_disp > 0.05) and (moving_ratio > 0.3)
+                                   and (light_moving_ratio > 0.8))
 
             if not is_dynamic_inst:
                 continue
 
-            reasons = []
-            if global_disp > 0.05: reasons.append(f"global_disp={global_disp:.3f}m")
-            if moving_ratio > 0.3: reasons.append(f"moving_ratio={moving_ratio:.0%}")
-            if light_moving_ratio > 0.8: reasons.append(f"light_moving_ratio={light_moving_ratio:.0%}")
-            print(f"   {category}_{inst_idx}: [DYNAMIC] global_disp={global_disp:.3f}m, "
-                  f"moving_ratio={moving_ratio:.0%}, light_moving_ratio={light_moving_ratio:.0%}, "
-                  f"visible_ratio={visible_ratio:.0%}, frames={len(centroid_data)}/{total_frames} "
-                  f"→ {', '.join(reasons)}", flush=True)
+            _pp_its = [i for i in _pp_interactions if i['instance_name'] == _pp_key]
+            if _pp_its:
+                reasons = [f"pick={i['pick_frame']} place={i['place_frame']} "
+                           f"conf={i['confidence']:.2f}" for i in _pp_its]
+                print(f"   {category}_{inst_idx}: [DYNAMIC] Stage3.7 pick/place: "
+                      f"global_disp={global_disp:.3f}m, "
+                      f"visible_ratio={visible_ratio:.0%}, "
+                      f"frames={len(centroid_data)} → {'; '.join(reasons)}", flush=True)
+            else:
+                reasons = []
+                if global_disp > 0.05:
+                    reasons.append(f"global_disp={global_disp:.3f}m")
+                print(f"   {category}_{inst_idx}: [DYNAMIC] (兜底三条件) "
+                      f"global_disp={global_disp:.3f}m, "
+                      f"moving_ratio={moving_ratio:.0%}, "
+                      f"light_moving_ratio={light_moving_ratio:.0%}, "
+                      f"visible_ratio={visible_ratio:.0%}, "
+                      f"frames={len(centroid_data)}/{total_frames} "
+                      f"→ {', '.join(reasons)}", flush=True)
 
             # ── 动态物体点云轨迹输出 ──
             dyn_output_dir = os.path.join(output_path, "dynamic_pointclouds")
@@ -787,15 +916,29 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                 frame_pts.append(pts)
 
             # 写入 PLY 文件, 用红→蓝渐变表示时间顺序
-            total_frames = len(frame_ids)
+            #
+            # B1 修复: 原实现在这个逐帧循环里用「固定文件名 + 'w' 模式」写入, 每帧
+            # 覆盖上一帧 —— 实测 7_vggt_omega 的日志打印了 113 次"动态点云轨迹已
+            # 保存", 磁盘上却只剩最后一帧的点。而注释写明的意图是"红→蓝渐变表示
+            # 时间顺序", 即一个文件里装下所有帧的点、用颜色编码时间。
+            # 现在改为循环内累积、循环外只写一次。
+            #
+            # B2 修复: 原代码复用外层变量名 total_frames 来存"本段帧数", 导致处理
+            # 完第一个物体后, 外层 total_frames(RGB 总帧数) 被永久改写, 影响后续
+            # 物体的 visible_ratio。改用局部名 n_seg_frames。
+            n_seg_frames = len(frame_ids)
+            _all_pts = []
             for fi, (fid, pts) in enumerate(zip(frame_ids, frame_pts)):
-                t_ratio = fi / max(total_frames - 1, 1)
+                t_ratio = fi / max(n_seg_frames - 1, 1)
                 r = int(255 * (1 - t_ratio))
                 g = int(0)
                 b = int(255 * t_ratio)
                 color_rgb = np.full((pts.shape[0], 3), [r, g, b], dtype=np.uint8)
-                combined = np.hstack([pts.astype(np.float64), color_rgb.astype(np.float64)])
+                _all_pts.append(np.hstack([pts.astype(np.float64),
+                                           color_rgb.astype(np.float64)]))
 
+            if _all_pts:
+                combined = np.vstack(_all_pts)
                 ply_header = (
                     "ply\n"
                     "format ascii 1.0\n"
@@ -813,7 +956,10 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                 with open(ply_path, 'w') as f:
                     f.write(ply_header)
                     np.savetxt(f, combined, fmt='%.6f %.6f %.6f %d %d %d')
-                print(f"   {category}_{inst_idx}: 动态点云轨迹已保存: {ply_path} ({len(combined)} vertices)", flush=True)
+                print(f"   {category}_{inst_idx}: 动态点云轨迹已保存: {ply_path} "
+                      f"({len(frame_ids)} 帧, {len(combined)} vertices)", flush=True)
+            else:
+                print(f"   {category}_{inst_idx}: ⚠️ 无有效点云, 跳过轨迹 PLY", flush=True)
 
             # 计算轨迹信息 (复用已有的 centroid_data)
             visible_frames = [fid for fid, _ in centroid_data]
@@ -835,7 +981,10 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                 "visible_frames": visible_frames,
                 "centroids": centroids,
                 "total_displacement": total_disp,
-                "motion_direction": motion_dir
+                "motion_direction": motion_dir,
+                # Stage 3.7 的 pick/place 事件 (原始视频帧空间)。
+                # 走兜底三条件时该列表为空 —— 下游可据此区分判定来源。
+                "pick_place": _pp_its,
             }
 
             # ── 点云清理: 动态物体只保留首帧点云, 剔除其他帧的点云 ──
@@ -855,21 +1004,21 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
             #     print(f"   {category}_{inst_idx}: [DYNAMIC] 点云清理: 保留首帧{first_visible_frame_id}, "
             #           f"剔除其他 {cleaned_count} 帧的实例点云", flush=True)
 
-            first_visible_centroid = None
+            initial_centroid = None
             optimal_centroid = None
-            first_visible_pts = None
+            initial_pts = None
             optimal_pts = None
             for fid, c in centroid_data:
-                if fid == first_visible_frame_id and first_visible_centroid is None:
-                    first_visible_centroid = c
-                    # 提取首帧点云
+                if fid == initial_frame_id and initial_centroid is None:
+                    initial_centroid = c
+                    # 提取初始帧点云 (抓取前的静止位置)
                     for im_entry in sorted_masks:
-                        if im_entry['frame_id'] == first_visible_frame_id:
+                        if im_entry['frame_id'] == initial_frame_id:
                             mask_fv = im_entry['mask']
-                            pointmap_fv = vggt_prediction_results['world_points'][first_visible_frame_id]
+                            pointmap_fv = vggt_prediction_results['world_points'][initial_frame_id]
                             pts_fv = pointmap_fv[mask_fv > 0]
                             finite_fv = np.all(np.isfinite(pts_fv), axis=1)
-                            first_visible_pts = pts_fv[finite_fv]
+                            initial_pts = pts_fv[finite_fv]
                             break
                 if fid == optimal_frame_id:
                     optimal_centroid = c
@@ -884,10 +1033,10 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                             break
 
             # ── 位置 + 旋转调整 ──
-            # 平移：mesh 从最优帧位置移到首帧位置
-            # 旋转：用 PCA 估计两帧的朝向差，旋转到首帧朝向
-            if first_visible_centroid is not None and optimal_centroid is not None and first_visible_frame_id != optimal_frame_id:
-                offset = first_visible_centroid - optimal_centroid
+            # 平移：mesh 从最优帧位置移到「初始帧」(抓取前静止位置) 的位置
+            # 旋转：用 PCA 估计两帧的朝向差，旋转到初始帧朝向
+            if initial_centroid is not None and optimal_centroid is not None and initial_frame_id != optimal_frame_id:
+                offset = initial_centroid - optimal_centroid
                 needs_adjust = False
 
                 # 平移调整
@@ -898,25 +1047,25 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
 
                 # 旋转调整: PCA 估计主方向
                 rot_applied = False
-                if (first_visible_pts is not None and optimal_pts is not None
-                        and len(first_visible_pts) > 10 and len(optimal_pts) > 10):
+                if (initial_pts is not None and optimal_pts is not None
+                        and len(initial_pts) > 10 and len(optimal_pts) > 10):
                     try:
                         # 中心化点云
-                        pts_fv_c = first_visible_pts - first_visible_centroid
+                        pts_init_c = initial_pts - initial_centroid
                         pts_opt_c = optimal_pts - optimal_centroid
 
                         # PCA: 求协方差矩阵的主轴
-                        _, _, V_fv = np.linalg.svd(pts_fv_c.T @ pts_fv_c, full_matrices=True)
+                        _, _, V_init = np.linalg.svd(pts_init_c.T @ pts_init_c, full_matrices=True)
                         _, _, V_opt = np.linalg.svd(pts_opt_c.T @ pts_opt_c, full_matrices=True)
 
                         # V 的行就是主轴方向 (按方差降序排列)
-                        # 旋转矩阵 R = V_fv @ V_opt.T
-                        R_pca = V_fv @ V_opt.T
+                        # 旋转矩阵 R = V_init @ V_opt.T
+                        R_pca = V_init @ V_opt.T
 
                         # 检查是否是合法旋转矩阵（反射矩阵行列式=-1需要修正）
                         if np.linalg.det(R_pca) < 0:
-                            V_fv[:, 2] *= -1
-                            R_pca = V_fv @ V_opt.T
+                            V_init[:, 2] *= -1
+                            R_pca = V_init @ V_opt.T
 
                         # 旋转角 (用于日志)
                         trace_R = np.trace(R_pca)
@@ -932,7 +1081,9 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
 
                         if needs_adjust:
                             instance_info["T"] = T
-                            msg = f"   {category}_inst{inst_idx}: [DYNAMIC] 位置+旋转调整: mesh帧{optimal_frame_id} → 首次可见帧{first_visible_frame_id}, offset={np.linalg.norm(offset):.4f}m"
+                            msg = (f"   {category}_inst{inst_idx}: [DYNAMIC] 位置+旋转调整: "
+                                   f"mesh帧{optimal_frame_id} → 初始帧{initial_frame_id} "
+                                   f"(抓取前), offset={np.linalg.norm(offset):.4f}m")
                             if rot_applied:
                                 msg += f", rot={rot_angle:.1f}deg"
                             print(msg, flush=True)

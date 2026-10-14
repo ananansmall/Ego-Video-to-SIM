@@ -220,6 +220,8 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
     Returns:
     - R: numpy array of shape (3, 3) representing the rotation matrix to align the scene to the room coordinate system.
     - t: numpy array of shape (3,) representing the translation vector to align the scene to the room coordinate system.
+    - info: dict, 诊断信息 (失败时含 'reason')。与 Stage2/3/4 的返回签名保持一致,
+      使降级链每一级的成败原因都能落盘到 coordinate_alignment.json 的 method_detail。
     '''
     wall_plane_infos = []
     floor_plane_infos = []
@@ -237,22 +239,46 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
         plane_info = get_plane_info(pointmap, mask)
         if plane_info['mean_distance'] < floor_mean_distance_thres:
             floor_plane_infos.append(plane_info)
+    # 累积诊断信息。原先本函数只返回 (R, t), 导致 40 个 stage1_strict 场景的
+    # coordinate_alignment.json 里 method_detail 永远是空的 —— "为什么这一级
+    # 判成功、选中的是哪个平面"完全不可追溯。Stage2/3/4 都有 info, 这里补齐。
+    align_info = {
+        'method': 'floor+wall',
+        'n_wall_masks': len(wall_masks),
+        'n_floor_masks': len(floor_masks),
+        'n_wall_planes': len(wall_plane_infos),
+        'n_floor_planes': len(floor_plane_infos),
+    }
     if len(floor_plane_infos) == 0:
-        return np.eye(3), np.zeros(3)
+        align_info['reason'] = 'no_valid_floor_plane'
+        return np.eye(3), np.zeros(3), align_info
     # choose the floor plane with the largest area and normal vector close to mean floor normal vector (in case wrong floor segmentation)
     mean_floor_normal = np.mean([info['normal'] for info in floor_plane_infos], axis=0)
     mean_floor_normal = mean_floor_normal / np.linalg.norm(mean_floor_normal)
+    # 法向分歧度: 判据 ① 只检查"各帧平面彼此一致", 不检查"这个平面是不是地面"。
+    # 记下实际分歧度, 便于事后分辨"自洽的错平面"。
+    _dev = [np.degrees(np.arccos(min(1.0, abs(float(np.dot(i['normal'], mean_floor_normal))))))
+            for i in floor_plane_infos]
+    align_info['normal_spread_deg'] = float(max(_dev)) if _dev else float('nan')
     vaild_floor_plane_infos = [info for info in floor_plane_infos if abs(np.dot(info['normal'], mean_floor_normal)) > np.cos(np.radians(30))]
+    align_info['n_consistent_floor_planes'] = len(vaild_floor_plane_infos)
     if len(vaild_floor_plane_infos) == 0:
         # 各帧 floor 平面法向分歧过大 (>30°), 无法一致对齐 → 返回单位阵表示失败,
         # 让 run_stage2 回退到 Stage2-relaxed / VLM / large_plane / GeoCalib 兜底链
-        return np.eye(3), np.zeros(3)
+        align_info['reason'] = 'no_consistent_floor_normal'
+        return np.eye(3), np.zeros(3), align_info
     floor_plane_info = max(vaild_floor_plane_infos, key=lambda x: x['area'])
     floor_normal = floor_plane_info['normal']
+    align_info['floor_area'] = float(floor_plane_info['area'])
+    align_info['floor_mean_distance'] = float(floor_plane_info['mean_distance'])
+    align_info['floor_centroid'] = [float(v) for v in floor_plane_info['centroid']]
+    align_info['selected_floor_normal'] = [float(v) for v in floor_normal]
     # choose the wall plane with the largest area and orthogonal (within 5 degrees) to the floor
     orthogonal_wall_plane_infos = [info for info in wall_plane_infos if abs(np.dot(info['normal'], floor_normal)) < np.cos(np.radians(85))]
+    align_info['n_orthogonal_walls'] = len(orthogonal_wall_plane_infos)
     if len(orthogonal_wall_plane_infos) == 0:
-        return np.eye(3), np.zeros(3)
+        align_info['reason'] = 'no_orthogonal_wall'
+        return np.eye(3), np.zeros(3), align_info
     wall_plane_info = max(orthogonal_wall_plane_infos, key=lambda x: x['area'])
     wall_normal_1 = wall_plane_info['normal']
     # the floor normal should be upward, use the wall centroid to determine the direction of the wall normal
@@ -278,7 +304,14 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
     max_coords = np.max(rotated_points, axis=0)
     center = (min_coords + max_coords) / 2
     t[:2] = -center[:2]
-    return R, t
+
+    align_info['wall_area'] = float(wall_plane_info['area'])
+    # floor_normal 可能在上面的 floor_to_wall 判据里被翻转过 (L286-287), 记最终值
+    align_info['floor_normal_final'] = [float(v) for v in floor_normal]
+    # 仅记录, 不参与判定 —— R[2,2]=floor_normal[2] 只在"VGGT world 是 z-up"
+    # 时才有意义, 而实测 46 个场景 |R[2,2]| 中位数 0.42 (最小 0.047) 却对齐良好。
+    align_info['R22_not_a_metric'] = abs(float(R[2, 2]))
+    return R, t, align_info
 
 
 def _estimate_floor_centroid(all_points, floor_normal, bottom_percentile=10):
@@ -614,20 +647,116 @@ def align_via_vlm_floor_points(world_points, images, sam3_image_model,
     }
 
 
-def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_threshold=3.0, quality_threshold=0.3):
+def _gravity_consistency_quality(gravity_world, inlier_mask=None, confidences=None,
+                                 max_angle_deg=15.0, min_inlier_ratio=0.5):
+    '''
+    评价 GeoCalib 重力估计的自洽性, 决定这条对齐结果可不可信。
+
+    为什么不用 |R[2,2]| (= floor_normal[2]): 那个判据要求 VGGT 的 world 坐标系
+    是 z-up, 但实测每个场景的 up 轴都不同 —— 全库 46 个场景 |R[2,2]| 中位数只有
+    0.42, 仅 3 个 > 0.9, 最极端的 egodex_28 是 0.047 (与 z 轴夹角 87.3°), 而该
+    场景对齐后 floor 物体贴合偏差中位数仅 5.3cm。它衡量的是坐标惯例, 不是对错。
+
+    这里改用"重力是同一个物理量、与相机姿态无关"这一事实: 各帧相机系重力经
+    R_w2c.T 转到世界系后必须指向同一方向。离散度大 = GeoCalib 估计不稳, 或
+    VGGT 外参不自洽, 两种情况都该拒绝这条结果。
+
+    Args:
+        gravity_world: (N,3) 各帧重力方向 (世界系, 指向 DOWN)
+        inlier_mask: (N,) bool, MAD 剔除后保留的帧; None 表示全部保留
+        confidences: (N,) 各帧置信度; None 表示不统计
+        max_angle_deg: 中位夹角上限
+        min_inlier_ratio: 内点帧占比下限
+    Returns:
+        (ok: bool, quality: dict, reason: str)
+    '''
+    g = np.asarray(gravity_world, dtype=float).reshape(-1, 3)
+    n_valid = int(g.shape[0])
+
+    def _empty(reason):
+        return False, {
+            "n_frames_valid": n_valid, "n_inliers": 0, "inlier_ratio": 0.0,
+            "median_angle_deg": float("nan"), "mean_confidence": 0.0,
+        }, reason
+
+    if n_valid == 0:
+        return _empty("geocalib_no_frames")
+
+    norms = np.linalg.norm(g, axis=1)
+    if not np.all(norms > 1e-12):
+        return _empty("geocalib_zero_gravity_vector")
+    g_unit = g / norms[:, None]
+
+    # 球面均值方向 (不加权), 与 align_via_geocalib 内部的 mean_vec 口径一致
+    mean_dir = g_unit.mean(axis=0)
+    mn = np.linalg.norm(mean_dir)
+    if mn < 1e-12:
+        return _empty("geocalib_antipodal_gravity")
+    mean_dir = mean_dir / mn
+
+    cos = np.clip(g_unit @ mean_dir, -1.0, 1.0)
+    angles_deg = np.degrees(np.arccos(cos))
+
+    if inlier_mask is None:
+        mask = np.ones(n_valid, dtype=bool)
+    else:
+        mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+        if mask.size != n_valid:
+            return _empty("geocalib_mask_shape_mismatch")
+
+    n_in = int(mask.sum())
+    inlier_ratio = n_in / max(n_valid, 1)
+    # 用中位数而非均值: 单个离群帧不该主导"一致性"判断
+    median_angle = float(np.median(angles_deg))
+    if confidences is None:
+        mean_conf = 0.0
+    else:
+        conf = np.asarray(confidences, dtype=float).reshape(-1)
+        mean_conf = float(conf.mean()) if conf.size else 0.0
+
+    quality = {
+        "n_frames_valid": n_valid,
+        "n_inliers": n_in,
+        "inlier_ratio": inlier_ratio,
+        "median_angle_deg": median_angle,
+        "mean_confidence": mean_conf,
+    }
+
+    if n_in == 0:
+        return False, quality, "geocalib_all_outliers"
+    if not np.isfinite(median_angle):
+        return False, quality, "geocalib_no_angle"
+    if median_angle > max_angle_deg:
+        return False, quality, (f"geocalib_inconsistent_gravity "
+                                f"median_angle={median_angle:.1f}deg > {max_angle_deg}")
+    if inlier_ratio < min_inlier_ratio:
+        return False, quality, (f"geocalib_low_inlier_ratio "
+                                f"{inlier_ratio:.2f} < {min_inlier_ratio}")
+    return True, quality, ""
+
+
+def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_threshold=3.0,
+                       quality_threshold=0.3, max_gravity_angle_deg=15.0,
+                       min_inlier_ratio=0.5):
     '''
     阶段4: 用 GeoCalib 从图像估计重力方向, 构造坐标系对齐.
 
     关键修复: GeoCalib 返回的 gravity 是相机坐标系下的向量, 必须用 extrinsics
-    变换到世界坐标系后才能作为 floor_normal. 原代码直接用相机坐标系 gravity, 导致
-    R[2,2] 偏小 (如 scene15 的 R[2,2]=0.2259, z 轴偏 77°).
+    变换到世界坐标系后才能作为 floor_normal. 原代码直接用相机坐标系 gravity.
+
+    注意: 原注释据此推出"变换后 R[2,2] 应接近 ±1, 偏小即 bug (如 scene15 的
+    R[2,2]=0.2259)"—— 这个推论不成立。R[2,2] = floor_normal[2] 只在"VGGT 的
+    world 坐标系是 z-up"时才有意义, 而实测 VGGT 每个场景的 up 轴都不同:
+    全库 46 个场景 |R[2,2]| 中位数仅 0.42, 仅 3 个 > 0.9, 最极端的 egodex_28
+    是 0.047 (floor_normal 与 z 轴夹角 87.3°), 但该场景 floor 物体贴合偏差
+    中位数只有 5.3cm —— 对齐本身是好的。见下方质量判据处的详细说明。
 
     流程:
       1. 对每帧图像运行 GeoCalib → 得到 gravity 向量 (相机坐标系, 指向 DOWN)
       2. 用 extrinsics 将每帧 gravity 从相机坐标变换到世界坐标
       3. 置信度加权的球面平均 + MAD 异常值剔除 → 世界坐标系下的 gravity
       4. floor_normal = -gravity (UP), 用 bottom-percentile 估计 floor_centroid
-      5. 构造 R, t; 若 |R[2,2]| < quality_threshold 则判定对齐失败
+      5. 构造 R, t; 用"重力估计的自洽性"判定质量 (不再用 |R[2,2]|)
 
     Args:
       images: numpy array of shape (S, H, W, 3), uint8 RGB
@@ -635,7 +764,11 @@ def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_thre
       extrinsics: (N, 4, 4) or (N, 3, 4) w2c 外参, 与 images 帧数对应
       max_frames: 最多处理多少帧 (GeoCalib 推理较慢, 默认30帧)
       mad_threshold: MAD 异常值剔除阈值 (默认3.0)
-      quality_threshold: 质量阈值, |R[2,2]| < threshold 判定失败 (默认0.3, 原0.5)
+      quality_threshold: [已废弃, 仅为兼容旧调用保留] 旧判据 |R[2,2]| 的阈值。
+          该判据假设 VGGT world 是 z-up, 已被证伪, 不再参与判定。
+      max_gravity_angle_deg: 新判据。各帧重力方向转到世界系后的离散度
+          (中位夹角) 超过该角度即判定不可信 (默认15°)
+      min_inlier_ratio: 新判据。MAD 剔除后的内点帧占比下限 (默认0.5)
 
     Returns:
       (R, t, info_dict): 成功
@@ -751,12 +884,34 @@ def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_thre
 
     R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
 
-    # 质量检查: R[2,2] = floor_normal[2], 理想值 ≈ ±1.0
-    # |R[2,2]| < quality_threshold 说明 floor 法线偏离竖直角度过大, 对齐失败
-    if abs(R[2, 2]) < quality_threshold:
+    # ── 质量判据 ──
+    # 旧判据: abs(R[2,2]) < quality_threshold, 依据是"R[2,2] = floor_normal[2],
+    # 理想值 ≈ ±1.0"。这个前提要求 VGGT 的 world 坐标系是 z-up。
+    #
+    # 该前提已被证伪。全库 46 个场景的实测:
+    #   |R[2,2]| 中位数 0.42, 仅 3 个 > 0.9, 最极端 egodex_28 只有 0.047
+    #   (floor_normal 与 z 轴夹角 87.3°)。
+    # 但 egodex_28 对齐后 floor 类物体贴合偏差中位数仅 5.3cm。
+    # 即 R[2,2] 衡量的是"VGGT 恰好把哪个轴当上"这个逐场景变化的坐标惯例,
+    # 与对齐正确性无关。若阈值回退到原来的 0.5, 会有 29/46 = 63% 的正确对齐
+    # 被误判失败并触发无谓降级。
+    #
+    # 新判据的依据: floor_normal 取自重力的反方向, 方向天然正确 —— 不需要
+    # "方向检查"。真正需要检查的是"重力估计本身可不可信"。重力是同一个物理量,
+    # 与相机姿态无关, 因此各帧相机系重力经 R_w2c.T 转到世界系后应当高度一致。
+    # 用这个离散度 (median_angle) 和内点率衡量, 二者都不依赖 VGGT 的坐标惯例。
+    _ok, quality, _reason = _gravity_consistency_quality(
+        vecs.numpy(), inlier_mask=inlier_mask.numpy(), confidences=confs.numpy(),
+        max_angle_deg=max_gravity_angle_deg, min_inlier_ratio=min_inlier_ratio,
+    )
+    # 仅作记录追溯, 不参与判定 (见上)
+    quality['R22_abs_not_a_metric'] = abs(float(R[2, 2]))
+
+    if not _ok:
         return np.eye(3), np.zeros(3), {
-            'reason': f'geocalib_poor_alignment R[2,2]={R[2,2]:.4f}',
+            'reason': _reason,
             'method': 'geocalib',
+            'quality': quality,
             'gravity_world': gravity_world.tolist(),
             'floor_normal': floor_normal.tolist(),
             'floor_centroid': floor_centroid.tolist(),
@@ -770,6 +925,7 @@ def align_via_geocalib(images, world_points, extrinsics, max_frames=30, mad_thre
 
     return R, t, {
         'method': 'geocalib',
+        'quality': quality,
         'gravity_world': gravity_world.tolist(),
         'floor_normal': floor_normal.tolist(),
         'floor_centroid': floor_centroid.tolist(),

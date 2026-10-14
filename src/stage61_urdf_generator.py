@@ -245,6 +245,56 @@ def extract_objects_from_glb(glb_path: str, temp_dir: str) -> list[dict]:
     return objects_info
 
 
+def _rewrite_urdf_inertia(urdf_path: str, mesh_folder: str) -> None:
+    """mesh 旋转回 Z-up 后, 用旋转后的 collision mesh 重算惯量并写回 URDF。
+
+    为什么必须做: EmbodiedGen 的 generate_urdf() 收到的输入 mesh 已被本文件上方
+    旋转成 Y-up(Step 2d 的 Z→Y), 它是在那个**中间朝向**下计算 <inertial> 的; 而
+    mesh 文件随后又被旋转回 Z-up, 于是 iyy/izz 互换。
+    实测 chair_1(2chair-bottle_vggt_omega): URDF 写 izz=12.6284, 但 Z-up 真值是
+    6.3896, 偏差 97.6%; chair_0 偏差 27.2%。这会让物理翻滚行为失真。
+
+    口径与 tools/stage61_physics_sim.py::recompute_inertia 完全一致(仿真侧一旦发现
+    URDF 惯性非占位值就直接采信, 不再重算): 水密网格用 trimesh.moment_inertia,
+    非水密/体积异常退回均匀密度长方体近似。
+    """
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    link = root.find("link")
+    if link is None:
+        return
+    m_el = link.find("inertial/mass")
+    i_el = link.find("inertial/inertia")
+    if m_el is None or i_el is None:
+        return
+    mass = float(m_el.get("value"))
+    cm = link.find(".//collision/geometry/mesh")
+    if cm is None or not cm.get("filename"):
+        return
+    mp = os.path.normpath(os.path.join(os.path.dirname(urdf_path), cm.get("filename")))
+    if not os.path.exists(mp):
+        return
+    m = trimesh.load(mp, force="mesh", process=False)
+    if m.is_watertight and m.volume > 0:
+        I = np.asarray(m.moment_inertia, dtype=np.float64) * (mass / float(m.volume))
+        vals = dict(ixx=I[0, 0], iyy=I[1, 1], izz=I[2, 2],
+                    ixy=I[0, 1], ixz=I[0, 2], iyz=I[1, 2])
+    else:
+        ext = m.extents
+        a, b, c = [float(max(v, 1e-4)) for v in ext]
+        vals = dict(ixx=mass * (b * b + c * c) / 12.0,
+                    iyy=mass * (a * a + c * c) / 12.0,
+                    izz=mass * (a * a + b * b) / 12.0,
+                    ixy=0.0, ixz=0.0, iyz=0.0)
+    for k, v in vals.items():
+        i_el.set(k, f"{v:.6f}")
+    tree.write(urdf_path, encoding="utf-8", xml_declaration=True)
+    logger.info(f"    惯量按 Z-up 重算写回: ixx={vals['ixx']:.6f} "
+                f"iyy={vals['iyy']:.6f} izz={vals['izz']:.6f}")
+
+
 # ─── Step 2: 逐个生成 URDF ──────────────────────────────────────────────────
 
 def generate_urdf_for_object(
@@ -318,11 +368,24 @@ def generate_urdf_for_object(
     attr_dict["real_height"] = real_height
 
     # Mass 从 mesh 体积 × 密度计算
-    volume = mesh_for_props.volume
+    # 关于非水密网格(实测 218 个物体里 42 个): 曾想改用包围盒体积, 但实测
+    # 包围盒/trimesh 体积比中位 21.9x、最大 471x (如 newspaper_0 0.000225 -> 0.1059 m³,
+    # 会把报纸算成 84.7kg), 明显更差。trimesh.volume 对这类"近似闭合"的网格反而给出
+    # 合理值, 故保留它, 仅打 WARN 标记不确定性, 不再静默使用。
+    volume = float(abs(mesh_for_props.volume))
+    volume_reliable = bool(mesh_for_props.is_watertight)
+    if not volume_reliable:
+        logger.warning(
+            f"    [质量] 网格非水密, trimesh.volume 有不确定性; "
+            f"仍采用 {volume:.6f} m³ (包围盒近似会高估 ~22x, 不采用)"
+        )
     # 按类别估算密度 (kg/m³)
     density_map = {"chair": 600, "table": 600, "bottle": 1000, "cup": 2500, "default": 800}
     density = density_map.get(category.lower(), density_map["default"])
     real_mass = round(volume * density, 4)
+    logger.info(f"    mass source: volume={volume:.6f} m³ "
+                f"(reliable={volume_reliable}) × density={density} "
+                f"= {real_mass:.4f} kg")
     # 为 EmbodiedGen 的 attr_dict 提供兼容字段
     attr_dict["min_mass"] = real_mass
     attr_dict["max_mass"] = real_mass
@@ -383,6 +446,11 @@ def generate_urdf_for_object(
             m.apply_transform(T_y_to_z)
             m.export(fpath)
             logger.info(f"    Rotated output mesh Y→Z: {fpath}")
+
+    # 3.5 惯量修正: generate_urdf() 是在上面的 Y-up 中间朝向下算 <inertial> 的,
+    #     mesh 此时已旋转回 Z-up, 必须用旋转后的 mesh 重算惯量并写回 URDF,
+    #     否则 iyy/izz 互换 (实测 chair_1 偏差 97.6%, 会让翻滚行为失真)。
+    _rewrite_urdf_inertia(urdf_path, mesh_folder)
 
     logger.info(f"    URDF saved to {urdf_path}")
     return urdf_path

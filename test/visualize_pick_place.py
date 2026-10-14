@@ -98,13 +98,24 @@ SCENES = {
     '3chair-bottle_vggt_omega':            4.93,
     '121_C5_CellPhone_161deg_vggt_omega':  3.00,
     '116_C5_CellPhone_185deg_vggt_omega':  3.00,
+    # 2026-10-10: 下面 4 个场景的 pick_place_frames.json 已用当前代码重新生成
+    # (原产物是 2026-07-30 的旧格式, 缺 pick_window/place_window, 本脚本会 KeyError)。
+    # 它们没有 coordinate_alignment.json, frame_ratio 退化为 1.0 (帧号即 RGB 空间)。
+    '002_C1_Bowl_364deg_vggt_omega':       1.00,
+    'beizi_vggt_omega':                    1.00,
+    'bottle_vggt_omega':                   1.00,
+    'phone_vggt_omega':                    1.00,
+    '86_verify':                           3.01875,
 }
 
 for scene, ratio in SCENES.items():
     if ONLY and scene not in ONLY:
         continue
     scene_dir = os.path.join(BASE, scene)
+    # 优先用 test_combined.py 的 combined 产物, 回退到 Stage 3.7 的标准输出
     json_path = os.path.join(scene_dir, 'pick_place_frames_combined.json')
+    if not os.path.exists(json_path):
+        json_path = os.path.join(scene_dir, 'pick_place_frames.json')
     if not os.path.exists(json_path):
         continue
     with open(json_path) as f:

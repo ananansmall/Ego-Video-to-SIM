@@ -2222,3 +2222,217 @@ Stage 6 的输出 key 是 `bowl_inst0`, Stage 6.1 的 URDF link 名是 `bowl_0` 
   入库的是它的生成脚本 `tools/analysis/make_stage61_gallery.py`, 随时可重新生成。
 
 ---
+
+## [2026-10-09 12:30] - 用 FoundationPose 替换 ICP 管线, 修复 2D 叠加位姿漂移
+
+### 背景
+`trajectory_video_overlay.py` 产出的 2D 叠加 GIF 位姿不准。量化诊断确认:
+逐帧"投影mesh vs SAM3 mask"的 IoU 在静止段 0.80~0.86, 但**举升段(帧60~80)
+掉到 0.35~0.38** —— 链式 ICP 在遮挡帧累积误差导致漂移。用户判断正确。
+本轮改用 FoundationPose(NVlabs, CVPR 2024)做 model-based 6DoF 跟踪。
+
+### Added
+- `tools/analysis/fp_prepare_data.py`: 为 FoundationPose 准备输入。
+  从 VGGT world_points 投影生成逐帧深度(米→16bit mm png), 逐帧反推内参
+  (`recover_intrinsic`, 与 vggt-omega 反投影同口径), 复制 rgb/mask, 拷 URDF mesh。
+  输出 `foundationpose_data/`(113 帧)。
+- `tools/analysis/fp_run_tracking.py`: FoundationPose 跟踪 runner。
+  帧0 `register`(render-and-compare 自主搜初始位姿) → 后续 `track_one`。
+  输出 `foundationpose_out/{ob_in_cam,ob_in_world}/`。注意 rgb 必须
+  `np.ascontiguousarray(...[...,::-1])`, 否则 torch 拒绝负 stride 数组。
+- `tools/analysis/fp_iou_eval.py`: **面片光栅化** IoU 评估。
+  顶点投影+3×3膨胀会系统性高估投影面积, 把 IoU 压低 0.05~0.10。
+- `tools/analysis/fp_overlay_gif.py`: 2D 叠加 GIF(面片级轮廓 + 历史尾迹)。
+- `tools/analysis/fp_trajectory_plot.py`: 世界系 3D 轨迹三联图。
+- `tools/analysis/fp_export_glb.py`: 用 FP 位姿导出内嵌动画 GLB
+  (复用已验证的 `gltf_builder.export_glb_with_animation`)。
+- `tools/analysis/fp_diagnose.py`: 位姿偏差来源诊断(自跟踪 vs ICP 基线对照)。
+
+### Changed
+- `tools/analysis/fp_run_tracking.py`: 撤销 `symmetry_tfs` 开关 —— 实测传入
+  Z轴180° 对称变换并未减少等价解翻转(跳变 9 次→11 次), 且已验证逐帧真实
+  旋转仅 4.8°/帧, 数据本身健康。保留注释说明为何不需要。
+
+### 实现要点(踩坑记录)
+1. **pytorch3d 预编译 wheel 403**(dl.fbaipublicfiles.com), 只能源码编译。
+   nvdiffrast/pytorch3d 均需 `CUDA_HOME=$CONDA_PREFIX` 且
+   `CPATH` 包含 `$P/targets/x86_64-linux/include` + torch 自带 `nvidia/*/include`。
+   实际推理路径只用到 `so3_exp_map`/`rotation_6d_to_matrix` 等纯数学函数,
+   renderer 部分无人调用。
+2. **GitHub codeload 不支持断点续传**(卡在 6.5MB/37MB), 改用
+   `ghfast.top` 镜像(8MB/s)。
+3. **ICP 的 `centroids` 与 mesh 顶点原点不一致** —— 把它当物体原点投影会
+   整体平移错, 投影直接落在画面外(IoU=0)。实测用真实深度反算物体中心
+   应在相机系 (0.100, 0.222, 0.647), 而 ICP centroid 转相机系是
+   (-0.622, -0.731, 0.880), 完全错误; FP 输出 (0.105, 0.220, 0.674)
+   毫米级吻合。**旧"ICP 静止段 0.80"基线的评估口径本身有问题。**
+4. **姿态曲线不能用欧拉角/旋转向量**: 物体总转角 167°, rotvec 在 ±π 边界
+   反复跳变(看似 6.2rad), 但逐帧真实旋转仅 mean 4.8°/max 31.8°, 无一帧
+   超 90° —— 纯属表示退化。改画"相对首帧"的旋转矩阵元素 R00/R11/R22。
+
+### 验证 (scene 7_vggt_omega, toy_inst1)
+- 位姿精度: 深度反算中心 vs FP 输出吻合毫米级(见要点3)。
+- 投影: FP mesh 投影 bbox x[369,407] 与 SAM3 mask bbox x[369,406] 几乎重合。
+- IoU(面片光栅): 全帧 mean=0.653/min=0.474;
+  **静止段 IoM(真实mask被覆盖)=0.968**, 举升段 0.750(手部遮挡使SAM3
+  只标可见部分, 属mask 局限)。
+- 交叉验证: 世界系净位移 **0.3471m** vs stage3 pick/place 判定 0.3431m。
+- `py_compile` 全部通过。
+
+### 产物
+- `foundationpose_out/overlay/toy_inst1.gif` — 2D 叠加(相机系)
+- `fp_glb/gif/toy_inst1.gif` — **3D 动画(世界系 Z-up)**
+- `fp_trajectory/toy_inst1_trajectory.png` — 3D 轨迹图(世界系)
+- `fp_glb/toy_inst1.glb` — 内嵌动画 GLB, 可直接 Blender/MeshLab 播放
+
+### Changed (git)
+- `mainv3.py`、`src/geometry_utils.py` — 非本轮改动, 之前遗留的未提交变更。
+
+###遗留 / 待办
+- 旧 `trajectory_overlay/`(ICP 版产物)仍在目录里, 其位姿已知不准,
+  建议删除或标注废弃; 本轮未擅自删除既有产物。
+- FoundationPose 依赖 conda env `/mnt/data/lza/conda_envs/foundationpose`,
+  不随仓库入库, 换机器需按要点1 重建。
+
+---
+## [2026-10-13 01:20] - 2D+3D 合一 GIF + 方案B(静止段锁位姿)离线验证
+
+### Added
+- tools/analysis/fp_gif_2d3d.py: 生成 2D+3D 合一 combo.gif。左半=视频叠加(绿=FP投影/红=GT mask/橙尾迹), 右半=世界系3D(mesh点云按ob_in_world变换+相机轨迹+FP轨迹橙+GT轨迹绿, 固定视角)。输出 fp_vis/<obj>/combo.gif 并自动同步 test/fp_vis/<obj>/。8/8 实例已生成(~8.5MB, 57帧)
+- tools/analysis/fp_static_lock_eval.py: 方案B离线验证——用GT mask反投影世界系轨迹做滑动窗口运动判定(win=9,thr=5cm最优), 静止段锚定段首位姿(anchor=first)。对比锁定前后 path/IoU 与GT真值
+- output_v2/7_vggt_omega/fp_static_lock_eval.json: 8实例验证数据
+
+### Changed
+- (无既有文件修改, 均为新增工具)
+
+### 验证结论 (方案B定型)
+- 静止段锁定(段首锚定)有效: plate_inst0 path 1.920m→0.000m, IoU 0.887→0.848(GT净位移0.006m真静止); toy_inst0 IoU 0.653→0.659 且 path 5.2→3.0m
+- 弃用 mask 质心逐帧校正: mesh质心投影≠mask质心, plate IoU 0.887→0.145
+- 弃用段内中值锚定: FP track平移是长随机游走, 中值离真值16cm; 必须锚定段首(register位姿, IoU 0.40~0.97全准)
+- 运动段FP抖动仍在(剩余问题), 集成mainv3时复用stage3动态判定分段
+
+---
+## [2026-10-12 22:36] - FP 运动段抖动修复 (savgol 平滑) + 最终结果
+
+### Added
+- output_v2/7_vggt_omega/fp_out_<obj>/ob_in_world_locked/: 8实例修复后位姿 (113帧/实例, 静止段锁定+运动段savgol w21), 原始 ob_in_world 未动
+
+### Changed
+- tools/analysis/fp_static_lock_eval.py: 新增 smooth_moving() (运动段平移逐轴savgol+旋转四元数savgol, 段内离线零滞后) 及 --smooth_win/--smooth_order/--save_locked 参数; 定型参数 --win 9 --thr 0.05 --no_correct --anchor first --smooth_win 21
+- tools/analysis/fp_gif_2d3d.py: build_frames() 新增 poses_dir 参数, main() 新增 --poses 选项, 可用修复后位姿重生成 combo.gif
+- output_v2/7_vggt_omega/fp_vis/<obj>/combo.gif + test/fp_vis/<obj>/combo.gif: 8实例全部用修复后位姿重新生成 (8.1~8.7MB, 57帧)
+- output_v2/7_vggt_omega/fp_static_lock_eval.json: 更新为「锁定+运动段平滑」最终数据
+- docs/questions.md: 追加 Q21 (运动段抖动解决方法+最终量化对比表)
+
+### 验证结论 (最终)
+- 高IoU实例抖动压掉55%~100%且IoU持平: plate 1.92→0.00m (0.887→0.848), toy_inst0 5.21→1.54m (0.653→0.650), toy_inst1 7.11→2.20m (0.318→0.317)
+- 真实pick-place运动保留: 净位移GT 0.347m, 修复后 0.764/0.922m (由段锚点决定, 与平滑窗口无关)
+- 低IoU实例 (block_inst2 IoU 0.467→0.372) 平滑无法补救原始位姿误差, 属FP track本身问题
+- 窗口扫描: w21最优平衡 (w31 toy_inst1回升; 中值9+savgol仅再降0.1m不引入)
+
+---
+## [2026-10-12 22:55] - FP 只跟踪动态实例 + 修复 3D 面板物体/轨迹分离
+
+### Changed
+- tools/analysis/fp_gif_2d3d.py: 新增 dynamic_keys() 按 stage3 判定 (pick_place_frames_combined.json) 过滤动态实例 (默认启用, --all 取消); 3D 面板 FP 轨迹由平移分量 t 改画 mesh 质心轨迹 R@c+t (toy_inst1 mesh 原点离几何中心 0.622m, 导致点云与轨迹分离)
+- tools/analysis/fp_static_lock_eval.py: 同样接入 dynamic_keys() 过滤 + --objs/--all 参数
+- test/fp_vis/: 删除 7 个静态实例目录, 只保留 toy_inst1 (stage3 判定唯一动态实例)
+- output_v2/7_vggt_omega/fp_vis/toy_inst1/combo.gif + test/fp_vis/toy_inst1/combo.gif: 质心轨迹修复版重新生成
+- output_v2/7_vggt_omega/fp_static_lock_eval.json: 只含 toy_inst1 (7.105/0.318 → 2.204/0.317)
+- docs/questions.md: 追加 Q22
+
+---
+
+## [2026-10-13] - 调研 LiteReality-Agent 替代 stage5 精修的可行性
+
+### Added
+- docs/questions.md: 追加 Q32 —— LiteReality-Agent 调研结论（不能整体替代：输入契约 iOS RGB-D+usdz vs ego video→VGGT 实例 mesh、物体来源检索 CAD vs 真实 mesh+FP 轨迹；但其 layout/QC 精修层与 stage5 逐环节对位：check_support 确定性支撑判定（0.15m cap 同值）、collision resolve（detect→nudge→detect+metric 修复）、MuJoCo shake test 对应 check_stability）
+
+### Changed
+- 无代码修改（纯调研任务）
+
+### ⚠️ Docs to Review
+- docs/research/ 可考虑新增 LiteReality-Agent 分析文档，记录 room_qc 门控设计（doc/QC/collision_check.md、doc/QC/supporting_relationship.md）与 stage5 的映射关系，供后续方案 A 移植时参考
+
+---
+
+## [2026-10-13] - 追加 Q33：方案 A 详细说明
+
+### Added
+- docs/questions.md: Q33 —— 方案 A 四步拆解（编译带 extras GLB → check_support/check_glb 两道确定性门控 → opencode agent MCP 兜底循环 → 输出 final GLB），5.1 VLM 关系保留作先验，refine_inter_object_placement.py 保留作回退
+
+---
+
+## [2026-10-13] - 追加 Q34：check_support/check_glb 是确定性函数而非 agent 操作
+
+### Added
+- docs/questions.md: Q34 —— 澄清确定性优先/agent兜底分工：两 check 为纯函数可命令行直跑，agent 仅处理 unsupported（补建模）与 capped（重理解位置），support_cycle 报人
+
+---
+
+## [2026-10-13 22:20] - stage5.5 端到端验证完成 (121 场景)
+
+### Added
+- tools/stage55_cli.py: stage5.5 确定性 QC + 位姿调整 CLI（inspect/check_support/snap_support/check_glb/nudge/set_xy/set_z/render），GLB 加载用 X180@Y_UP_TO_Z_UP 转常规 +z 朝上，与保存侧精确互逆；修改类命令追加 stage55_moves.jsonl
+- tools/run_stage55.py: 编排入口——复制 stage5 GLB 为工作副本 → 确定性预 snap → opencode agent 语义 set_xy 循环 → nudge 兜底 → 大 cap 收尾 snap → final_scene_stage55.glb + stage55_report.json + 四视图预览
+- 产物: output_v2/121_*/final_scene_stage55.glb、stage55_report.json、final_scene_stage55_preview.png
+
+### Changed
+- run_stage55.py 提示词: 禁止 agent 调用 nudge/snap/set_z 强制语义 set_xy；新增"large_gap 物体是首要任务"与"必须执行修改才能结束"硬约束
+- run_stage55.py 收尾 snap_support cap 0.15→0.60: agent 完成语义 XY 后，剩余垂直 gap 属合法落座行程
+
+### 验证结果 (121_C5_CellPhone_161deg_vggt_omega)
+- 碰撞对 1→0（bowl_1↔scissors_0 4.1cm，MTV nudge 3 轮收敛）；支撑问题 2→0（mug_1/scissors_0 悬空 0.446m 落座矮桌 table_1）
+- 语义正确性: 矮桌物体组合（mug+scissors+bowl+bottle）与实拍参考帧 mug_inst1_frame86.jpg 一致
+- agent 评估: sensenova-6.8-flash-lite 两轮均未执行任何 set_xy（读帧阶段输出截断）；确定性层独立达成正确结果，验证了"确定性优先、agent 兜底"设计
+
+### ⚠️ Docs to Review
+- docs/questions.md: Q32-Q35 已随任务同步更新，无需额外操作
+- 后续若接入更强免费模型（如 glm-5.2）激活 agent 语义修正，需补测 stage55_agent_run.log 决策质量
+
+---
+
+## [2026-10-14 12:00] - FoundationPose mask 引导 re-register + 跨场景测试
+
+### Added
+- `tools/analysis/fp_run_tracking.py`: `--rekey N` 参数——每隔 N 帧用当帧 SAM3 mask+depth 重新 register 抗漂移（register 失败回退 track，帧 0 仍强制 register），修复旧管线 mask 仅帧 0 使用导致遮挡后锁到相似物体的问题
+- 4 新场景 bottle_inst0 全链产物: output_v2/{116,121,2chair-bottle,3chair-bottle}/fp_data_|fp_out_|fp_vis/bottle_inst0
+
+### Changed
+- `tools/analysis/fp_gif_2d3d.py`: contour() 支持半透明填充（GT mask 红 fill=0.45+3px、FP 绿 fill=0.18，小物体细轮廓难辨认）；--objs 显式给定时跳过 fp_batch_report.json；test 同步目录改为 <场景名>_<实例名> 避免同名覆盖
+- toy_inst1 正式结果切换为 rekey 版（IoU 0.318→0.523），旧管线结果备份 fp_out_toy_inst1_orig/
+
+### Removed
+- test/fp_vis/bottle_inst0/（跨场景同名覆盖产生的冗余副本，与 3chair 版 md5 相同）
+- fp_out_toy_inst1/ob_in_world_locked/（rekey 后 savgol 跨等价位姿跳变平均导致 IoU 降至 0.361，有害无益）
+
+### 验证
+- 5 场景 IoU/path 对比：116 0.72/0.74m@0.555、2chair 1.84/1.97m@0.688、3chair 4.23/4.18m@0.603、7 1.71/1.12m@0.523 均 path 吻合；121 部分失败（3.84/0.40m@0.432）待查
+- 全部 combo.gif 重生成并同步 test/fp_vis/<场景>_<实例>/
+
+---
+## [2026-10-14 15:00] - SpatialTrackerV2 替代 FoundationPose 跟踪实现与 toy_inst1 对比测试
+
+### Added
+- src/SpaTrackerV2/: 克隆 henry123-boy/SpaTrackerV2（ICCV 2025，免 mesh 先验前馈 3D 点跟踪）
+- tools/analysis/spa_track_object.py: SpaTrackerV2 适配脚本——2D 点轨迹 + 自有 depth/K/ext 反投影回 VGGT 世界系 + ICP 锚定 P0 + 逐帧加权 Kabsch 恢复刚体位姿；输出 fp_out_<obj>_spa*/{ob_in_world,ob_in_cam} 与 FP 管线格式兼容；轨迹缓存 spa_tracks.npz；支持 --smooth_win/--med_win/--lock_static 滤波实验开关
+- output_v2/7_vggt_omega/fp_out_toy_inst1_spa_v2/: SpaTrackerV2 最优配置输出（600 pts, depth_win 1）
+- output_v2/7_vggt_omega/fp_vis/toy_inst1/combo_spa.gif + combo_fp_rekey.gif: 两方法 GIF 对比
+
+### Changed
+- tools/analysis/fp_gif_2d3d.py: --poses 支持绝对路径（非绝对路径仍按 fp_out_<obj>/<subdir> 解析）
+
+### Removed
+- tools/analysis/dbg_icp.py: ICP 调试临时脚本
+
+### 实验结论
+- toy_inst1: SpaTrackerV2 IoU 0.479 / path 1.09m（GT 1.12m，-2.8%）；FP rekey IoU 0.529 / path 1.71m（+52%）
+- SpaTrackerV2 轨迹精度大幅占优，IoU 略低（深度反投影逐帧噪声 ~35mm）
+- 平滑实验：savgol21 崩溃（0.04）、savgol7 0.464、中值滤波+测地均值快旋转帧失败（0.00）、原始最优
+- 教训：fp_data mesh.obj 已在世界系摆放，ICP 初始值必须含单位阵；point-to-plane 精配需守护
+- 依赖坑：pyceres==2.4（2.6 与 pycolmap 冲突）、utils3d 需 git@d3a577a 版、moviepy==1.0.3
+
+### ⚠️ Docs to Review
+- docs/questions.md: 已追加 Q28（本次同步完成）
+
+---
