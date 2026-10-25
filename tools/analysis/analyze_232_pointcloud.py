@@ -119,9 +119,9 @@ print(f"\n[6] 相机内参")
 print(f"    fx={intrinsic[0,0]:.1f}, fy={intrinsic[1,1]:.1f}")
 print(f"    cx={intrinsic[0,2]:.1f}, cy={intrinsic[1,2]:.1f}")
 
-# 7. 检查 final_scene.glb
+# 7. 检查 final_scene_basic.glb
 print(f"\n[7] 最终场景分析")
-glb_path = os.path.join(OUTPUT_DIR, 'final_scene.glb')
+glb_path = os.path.join(OUTPUT_DIR, 'final_scene_basic.glb')
 if os.path.exists(glb_path):
     scene = trimesh.load(glb_path)
     if hasattr(scene, 'geometry'):

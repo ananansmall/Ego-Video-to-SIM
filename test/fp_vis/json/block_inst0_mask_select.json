@@ -1,0 +1,25 @@
+{
+  "obj": "block_inst0",
+  "best_pre_inst": 1,
+  "best_iou": 0.648854961832061,
+  "candidates": [
+    {
+      "pre_inst": 1,
+      "iou": 0.648854961832061,
+      "proj_area": 980,
+      "mask_area": 748
+    },
+    {
+      "pre_inst": 2,
+      "iou": 0.25806451612903225,
+      "proj_area": 819,
+      "mask_area": 234
+    },
+    {
+      "pre_inst": 0,
+      "iou": 0.15594541910331383,
+      "proj_area": 943,
+      "mask_area": 243
+    }
+  ]
+}

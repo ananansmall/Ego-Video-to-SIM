@@ -160,7 +160,7 @@ def compute_normal_consistency(pred_points, pred_normals, gt_points, gt_normals)
 
 def evaluate_spatial_accuracy(output_path, sample_count=None, glb_path=None):
     if glb_path is None:
-        glb_path = os.path.join(output_path, 'final_scene.glb')
+        glb_path = os.path.join(output_path, 'final_scene_stage5.glb')
     intrinsic_path = os.path.join(output_path, 'intrinsic.txt')
     extrinsics_dir = os.path.join(output_path, 'extrinsics')
     color_dir = os.path.join(output_path, 'color')

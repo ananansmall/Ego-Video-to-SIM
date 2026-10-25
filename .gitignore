@@ -39,6 +39,8 @@ env/
 
 # Large data directories
 output_v2/
+output_v3/
+logs/
 outputs/
 models/
 assets/

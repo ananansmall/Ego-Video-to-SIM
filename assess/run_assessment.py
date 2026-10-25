@@ -90,7 +90,7 @@ def run_visual_assessment(output_path, compute_lpips_flag=True, sample_count=Non
     render_dir = os.path.join(output_path, 'rendered')
 
     if glb_path is None:
-        glb_path = os.path.join(output_path, 'final_scene.glb')
+        glb_path = os.path.join(output_path, 'final_scene_stage5.glb')
 
     if not os.path.exists(render_dir) or len(os.listdir(render_dir)) == 0:
         intrinsic_path = os.path.join(output_path, 'intrinsic.txt')
@@ -278,7 +278,7 @@ def main():
     parser = argparse.ArgumentParser(description="ReplicateAnyScene Assessment")
     parser.add_argument("--output_path", type=str, required=True, help="Output directory from main.py")
     parser.add_argument("--glb_path", type=str, default=None,
-                        help="Custom GLB file path for assessment (default: output_path/final_scene.glb)")
+                        help="Custom GLB file path for assessment (default: output_path/final_scene_stage5.glb)")
     parser.add_argument("--category_path", type=str, default=None, help="Category JSON path")
     parser.add_argument("--ground_truth_json", type=str, default=None, help="Ground truth category JSON")
     parser.add_argument("--reference_mesh", type=str, default=None,
@@ -319,7 +319,7 @@ def main():
         if geom:
             all_results['spatial'] = geom
 
-    eval_glb_path = glb_path if glb_path else os.path.join(args.output_path, 'final_scene.glb')
+    eval_glb_path = glb_path if glb_path else os.path.join(args.output_path, 'final_scene_stage5.glb')
     normalize = not args.no_normalize
     if args.reference_mesh and os.path.exists(args.reference_mesh) and os.path.exists(eval_glb_path):
         mesh_geom = run_mesh_geometry_assessment(

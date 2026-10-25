@@ -4,6 +4,47 @@
 
 ---
 
+## [2026-10-25 23:59] - v0.4 快照: 重力可见化 + 位置对齐默认开启 + 感知/摆放链路 20+ 处修复
+
+### 管线行为变更 (默认路径)
+- **Stage 4 视觉-空间对齐默认开启** (`--disable_stage4` 可关): 真值叠加实测,
+  无对齐时场景物体完全在真实相机视野外 (分米级偏移), 开启后重建桌面与真实帧完全重合。
+- **Stage 5 出口新增重力可见化** (tools/ground_fix.py): 薄板桌面自动合成 4 桌腿
+  (0.75m 先验, 桌腿未入画的俯拍视频)、支撑物跟随抬升、沉地实例无条件兜底抢救、
+  地板基准面加入场景、出口自检落盘 ground_report.json。
+
+### 感知层修复
+- 关键帧索引空间统一 (VGGT 槽位 vs 原视频帧号, bug#1 全家族: 采样/射线投射/播种/Step5.5/SAM-floor 五处)
+- 检测框像素空间对齐 (原图 1920x1080 vs VGGT 518x518, 不缩放射线偏 ~50 度)
+- 关系查询名字空间统一 (merge_synonyms, 修 "mug"/"cup" 查不到静默兜底 floor)
+- 三处代码兜底 floor → other objects (与 prompt 设计意图一致)
+- 点云全无效时关键帧兜底改均匀采样; merge_synonyms 空格归一
+
+### 摆放层修复
+- separate_object_penetrations: AABB 收缩 3mm (贴合不误判穿模) + 具名堆叠对
+  沿 z 抬升 (不再水平推离桌面) + 足迹外堆叠对跳过防死循环
+- 倒置翻正: 三处 theta>90 度 align -z → +z (旧代码把倒置"对齐成完美倒置")
+- 5.15 floor 翻转加离地门限 (>0.15m 保留原关系防砸地); floor 关系坐实检查
+  (repair_floor_relations, 基础精修前调用, 修桌上物体被判 floor 后砸地)
+- sp_refine_on_top 支撑面估计: 低于底面的顶点均值 → 窗口内局部顶面中位数
+  (旧法把桌腿顶点算进去, 物体越修越沉)
+- Phase1 贴地加 0.5m 门限; 离线工具 pkl 回写; zip 截断告警; grid 节点滤除
+
+### 新工具
+- tools/orientation_judge.py: 倒置/倾斜家具的 VLM 渲染判定 + 家具直立规则 + 尺度先验
+- tools/ground_fix.py: 见上
+- tools/verify_instances.py: 逐实例体检 (朝向/贴合/尺度/穿模)
+- tools/render_glb_preview.py: camview 自动取景 (修"贴脸碎片"); stage61 同修
+- rescale 校准报告 / planar_flags / ground_report 落盘 (静默失败可见化)
+- scene_jsons/: 感知失败场景的手工类别表 (112/121/151/002 已验证)
+
+### 验证
+- 2chair-bottle 全自动全链 5/5 满分 (桌子尺度原生正确, 瓶/包自动上桌)
+- 微信全程 (Stage 1 检出历史失败的 earbud case, 动态首帧 pick 前最稳帧)
+- HOI4D hoi4d.mp4 4/5; curated JSON 四场景 121 10/10、112 6/9、002 6/10、151 11/24
+- 46 场景补丁链批量 0 错误; 回归单测 9/9
+
+---
 ## [2026-10-04 00:40] - 修复 inside/leaning 策略精修的签名不匹配 (从未真正生效)
 
 ### 问题
@@ -2434,5 +2475,160 @@ Stage 6 的输出 key 是 `bowl_inst0`, Stage 6.1 的 URDF link 名是 `bowl_0` 
 
 ### ⚠️ Docs to Review
 - docs/questions.md: 已追加 Q28（本次同步完成）
+
+---
+## [2026-10-14 16:30] - SpaTrackerV2 跨 5 场景批量对比
+
+### Added
+- output_v2/{116,121,2chair-bottle,3chair-bottle}/fp_out_bottle_inst0_spa_v2/: SpaTrackerV2 批量输出（600 pts, depth_win 1）
+- test/fp_vis/<场景>_bottle_inst0/combo_spa.gif: 4 个 bottle 场景 Spa GIF
+
+### 实验结论
+- path 稳健性：Spa 5 场景中 4 个 ±7% 内（toy -3%/116 +7%/2chair -4%/3chair +5%）；FP 在 toy +52%、121 +848% 灾难漂移
+- IoU：FP 普遍更高 0.05~0.20（render-and-compare 贴合外观）；Spa 0.45~0.52（depth 反投影 ~30mm 噪声）
+- 121: Spa IoU 0.524 反超 FP 0.458；path 只到伪 GT 一半，定位为快速运动段欠跟踪（t=10-30、70-90 爆发只跟上一半）
+- fp_iou_eval 跨场景评测必须传 --scene_dir，否则读默认场景 masks
+
+---
+## [2026-10-15 10:20] - SpaTrackerV2 论文介绍（纯问答）
+
+### Changed
+- docs/questions.md: 追加 Q29 — SpaTrackerV2 论文（ICCV 2025, arXiv 2507.12462）介绍：模块化拼接痛点、三因子分解方法、RGB/RGBD 两模式与项目用法、结合 5 场景实测的局限
+
+---
+## [2026-10-15 11:30] - 3chair-bottle 世界系质疑验证（纯分析，无管线代码修改）
+
+### Added
+- test/fp_vis/3chair-bottle_vggt_omega_bottle_inst0/world_frame_check.png: 世界系验证图（点云+地面平面+z轴+相机/瓶子轨迹，侧视+俯视）
+- tmp/check_floor.py, tmp/plot_world_check.py: 地板 RANSAC 拟合与可视化脚本（中间产物，在 tmp）
+
+### Changed
+- docs/questions.md: Q31 补充 —— 实测反驳"未对齐房间坐标系"质疑：extrinsics/0.txt 与 coordinate_alignment.json extrinsics_after_first_frame 逐元素一致；point_cloud.ply RANSAC 地板法向与 z 夹角 0.7°、地面 z≈0.011；结论 GIF 观感异常源于 Spa ICP 旋转锚定错误（mesh 斜躺 ~70°），非坐标系问题
+
+---
+## [2026-10-15 17:30] - SpaTrackerV2 ICP 长轴锚定修复（朝向问题）+ output_v3 场景测试
+
+### Changed
+- tools/analysis/spa_track_object.py: 新增 axis_align_inits()（mesh 长轴对 ±GT 长轴 + 绕轴 0/90/180/270 自转枚举为 ICP 初始值）；icp_mesh_to_cloud 增加 axis_pair 参数，候选先按 |R@v_m·a_gt|>=0.90 过滤再选 rmse 最小（无候选过轴回退全局最优），返回值增加 axis_dot
+- tools/analysis/fp_gif_2d3d.py: 帧数来源改为 poses 同级 ob_in_cam 优先（兼容 output_v3 等无 fp_out_<obj> 目录的场景）
+
+### Added
+- output_v2/3chair-bottle_vggt_omega/fp_out_bottle_inst0_spa_v3/: 修复后重跑（ICP axis_dot=1.00, rmse 16.3mm, fitness 1.00；朝向 |dot| 0.33→0.998；path 4.21m vs GT 4.18m；IoU 0.397）
+- output_v3/vertical_pick_place_115/: fp_mask_select + fp_data_bottle_inst0 + fp_out_bottle_inst0_spa_v3（axis_dot=0.99, path 1.10m, IoU 运动段 0.337）+ fp_vis/bottle_inst0/combo_spa_v3.gif
+- output_v3/basic_pick_place_17/: fp_mask_select + fp_data_toy_inst0 + fp_out_toy_inst0_spa_v3（回归验证：非对称物体 axis_dot=1.00, rmse 10.8mm, IoU 0.65~0.69 不受影响）+ fp_vis/toy_inst0/combo_spa_v3.gif
+- test/fp_vis/{3chair-bottle,115,17}*/combo_spa_v3.gif: 三场景修复后 GIF
+
+### ⚠️ Docs to Review
+- docs/questions.md Q31: 修复已落地（长轴锚定），如需可补充修复结果
+- project_memory.md: SpaTrackerV2 长轴锚定修复结论待同步
+
+---
+
+## [2026-10-15 19:00] - 动态物体定位与摆放补正修复（output_v3 验证）
+
+### Added
+- `test/test_ground_sunken.py`: 落地补正「陷地分支」回归测试（7 组 17 项），锁住陷地压回/悬空保护/非 floor 不动/类别级回退
+- `test/test_initial_frame_stable.py`: 初始帧「最长稳定段中位数」回归测试（7 组 13 项），复刻 basic_pick_place_17 的单帧离群真实数据
+- `test/test_ground_ref_z.py`: 落地补正「参考高度 ref_z」回归测试（7 组 14 项），区分"被上游推高"与"坐标系未对齐"
+- `docs/design/STAGE5_SUMMARY.md`: Stage 5 子阶段全貌（5.1/5.2/5.25/5.5）+ 近一月改动总结 + 三类坑
+- `docs/design/stage5_pipeline.png`: Stage 5 数据流与 5.25 补正判定分支示意图（英文标注，环境无中文字体）
+- `docs/design/initial_frame_fix.png`: 初始帧选择策略对比（4 个 case 的 z 轨迹 + pick/旧/新初始帧标记）
+- `docs/design/initial_frame_3d.png`: 初始帧修复的 3D 点云对比（旧红 vs 新绿）
+
+### Changed
+- `src/pick_place_detector.py`: ① 时长阈值按视频长度自适应（新增 `DURATION_ADAPT_DIVISOR=5`/`DURATION_ADAPT_FLOOR=5` + `_effective_duration()`，`MIN_MOTION_DURATION`/`MIN_INTERACT_DURATION` 取 `min(阈值, n_frames//5)`）。原固定 15 帧对 60~62 帧短视频过严，实测 4 个场景交互被漏检（如 vertical_pick_place_115 bottle path=1.015m 仅 max_run=13<15 被判静态）② 产物新增 `ratio_source` 字段，区分真实算出的 ratio 与退化的 fallback_1.0
+- `src/sp_refinement.py`: ① `ground_floating_objects` 新增**陷地分支**（原 `if z_min <= float_eps: continue` 把陷地和已贴地一起跳过；现 z_min<0 直接压回 z=0）。实测 basic_pick_place_46 card_0 因 5.1 误判 floor 导致 Stage3 贴地精修未执行，保持 z_min=-0.049m ② 新增 `ref_z`/`ref_tol` 参数：区分两种高空悬停——参考值≈0 且当前高出 ref_tol 判为"被上游推高"（压回），参考值本身就高判为"坐标系未对齐"（保持跳过）。实测 basic_pick_place_17 toy_1(0.8806m)/toy_5(0.6379m) 因超 float_z_max(0.5) 被跳过而飘在空中
+- `mainv3.py`: ① 动态物体初始帧从「pick 前最后一帧」改为「pick 前最长稳定段的中位数」（相邻帧质心位移≤0.02m 为稳定，至少 3 帧）。原逻辑被两类问题打穿：单帧离群点（17 的 toy_inst0 frame21 z 跳 +0.24 后立刻回落，pick=29 正好命中→初始位置 +0.242m）与 pick 检测偏晚（118 的 block 从 frame22 起每帧只动 1cm，渐进上升骗过单帧判据→frame30 已抬升 6cm）② 构造 `ref_z`（每个实例在最早可见帧的 VGGT 点云底部 z）传给 5.25 落地补正。注意：初版误用 `pose_history` 变量导致 `NameError`（该变量在 run_stage5 中不存在，仅为 _record_pose_stage 内部参数且未被调用），已改为点云方案 ③ glb 产出文件名 `final_scene.glb` → `final_scene_basic.glb`（原文件是 Stage3 基础精修产物，非最终产物，命名误导下游）
+- `tools/generate_scene_json_stage1.py`: Stage1 出口 `generate_scene_json()` 新增 `BODY_PART_CATEGORIES`（约 50 个人体部位词）+ `_is_body_part()`，精确匹配（非子串）避免误伤 armchair/chair/handle/footstool/alarm。原 VLM_DETECT_PROMPT 虽写有 `Ignore: hands, body parts` 但 VLM 不遵守，实测 86.mp4 仍输出 `arm`，导致操作者手臂被判 pick/place 事件并污染支撑关系
+- `stage4/run_alignment.py` `scripts/*` `tools/run_post_pipeline.py` `tools/run_stage55.py` `tools/rebuild_glbs_from_json.py` `tools/diagnose_penetration.py` `tools/apply_pose_changes.py` `tools/analysis/*`: glb 引用随改名分流（起点用途→`final_scene_basic.glb`）
+- `assess/geometry_metrics.py` `assess/run_assessment.py` `assess/textual_metrics.py` `object_tracking/run_pipeline.py`: glb 引用改为 `final_scene_stage5.glb`（最终产物）
+- `mainv2.py` `object_tracking/simulation/scene_builder.py` `object_tracking/01_glb_video_align.py`: 注释同步更正
+
+### ⚠️ Docs to Review
+- `docs/design/STAGE5_SUMMARY.md`: 本次新建，已含全部三类修复与对比表；后续若再改 5.25 判定需同步第 4.2 节
+- `PROJECT_SUMMARY.md`: 未检查是否提及 `final_scene.glb` 命名，若提及需同步为 `final_scene_basic.glb` / `final_scene_stage5.glb`
+- `Coordinate_System_Alignment_Guide.md`: 若提及 `alignment_stage` 取值需注意与 mainv3 的 `--enable_stage4`（ICP 迭代）区分，三套 stage 编号体系并存
+
+---
+
+
+## [2026-10-18 22:59] - Mira-Scene 调研文档与 Q34~Q39 记录
+
+### Added
+- `docs/research/MIRA_SCENE_BORROWING.md`: Mira-Scene（arXiv 2609.23796, HKU+VAST）调研与 RAS 借鉴方案——与 RAS 定位区别对比表、尺度链路（单目深度全局尺度 vs RAS 逐物体校准，默认 enable_metric:false 为相对深度）、API key 使用位置（environment 全景图必需可跳过、segmentation VLM 可换本地模型）、5 份 prompt 资产清单（list_objects_major_v5/tabletop/missing_objects critic/agent 66KB/scene_graph）、RAS VLM_DETECT_PROMPT 实例坍缩根因诊断与 5 条改法（含改写后的 prompt 草稿）、首帧生成资产路线（EgoHOS 选无手帧→TRELLIS.2/Hunyuan3D 生成→mask+depth ICP 对齐，参照 arXiv 2512.19684/2512.24428/2602.06226/2603.02133）、三阶段实施路线与 Mira 试跑检查单
+- `docs/questions.md`: 追加 Q34（Mira-Scene 与 RAS 区别/效果/部署）、Q35（尺度与 API key）、Q36（prompt 资产可借鉴性）、Q37（RAS prompt 诊断与改法）、Q38（SAM3/VLM 分工与去重阈值根因）、Q39（2025-2026 real2sim/生成式资产路线调研与改进路线）
+
+### Changed
+- 无代码变更（本次为纯调研与文档任务）
+
+### ⚠️ Docs to Review
+- 无需同步：本次未改任何代码/管线/配置；后续实施 prompt+去重改动时需回看 `MIRA_SCENE_BORROWING.md` 4.3 节的 SYNONYM_MAP/UnionFind 适配提醒
+
+---
+
+## [2026-10-23 19:31] - EgoFound3R 手部 mesh 与 VGGT-Omega 点云尺度对齐验证
+
+### Added
+- `tools/verify_egofound_scale.py`: EgoFound3R (MINT-SJTU) ↔ 本地 VGGT-Omega 的尺度/帧对齐验证工具
+  - 帧 1:1 对齐: 源视频均匀采样 N 帧 → PNG(本地 `load_and_preprocess_images` 688x384) + 同帧无损重编码 `sampled.mp4`(EgoFound3R, `--input-fps/--high-fps=30 --global-stride 5 --input-resize-mode stretch 688x384`)
+  - 本地侧: `src.vggt_omega_predict.vggt_omega_predict` → depths/extrinsics/intrinsic/world_points/colors
+  - EgoFound3R 侧: subprocess 调 `infer_marker_video.py`（单 chunk → 单一 metric 因子 f，`--save-debug-tensors`）
+  - 指标: raw 深度/相机一致性、内参对比、`metric_scale.f`、ego 自洽性、本地 gauge 校准 g、核心簇残差
+  - 渲染: 2D 叠加(手部投影到模型输入帧)、3D 同视角、手部中心侧视正交视图、世界系 PLY、深度一致性直方图
+- 验证产物: `output_v3/egofound_verify/weixin_195833_224_h264/`（frames/、sampled.mp4、local_vggt/、egofound3r/、verify/{metrics.json,overlay2d_*,render3d_*,sideview_*,egometric_*,world_frame*.ply,contact_check.png}）
+
+### Changed
+- 无（本次为纯新增验证工具，未改动 Stage1-6 既有管线）
+
+### Removed
+- 无
+
+### 验证结论（测试视频 assets/weixin_195833_224_h264.mp4，60 帧）
+- 帧/尺寸/权重/代码全部一致: `T_R=60`、`T_G=12`、输入 688x384、同一 `vggt_omega_1b_512.pt`、两套 vggt-omega 源码逐文件相同、lossless 视频往返 mean|diff|=0.4
+- **EgoFound3R raw 几何 ≠ 本地干净前向**: `local_raw / ego_raw ≈ 0.45`（约 2.2x 系统差），内参 fx 差 9.87%
+  - 根因: EgoFound3R 走 "多速率(12 锚帧) + 第 18 层后手部 prompt 注入" 前向（`prompt_injection_layer=18` → `mid_layer_index=17`），几何头从受 prompt 影响的 token 解码；已排除代码/权重/像素/帧数/bf16 假设
+  - **因此 `metric_scale.raw_to_meter_effective`(f=0.2347) 不能直接乘到本地点云上**
+- 正确对齐方式（本脚本实现）:
+  - A. 本地 gauge: 场景=本地 raw 点云；手部=metric × `g`（g 由 ego 内部同款估计器校准，实测 g=2.064，中位 log 比 0.0000，MAD=0.184；核心簇 g_core=1.794，MAD=0.072）
+  - B. ego 自洽 gauge: `depth_metric_global` + ego metric 手部（仅 G 锚帧，手 vs 自身深度中位 -0.0929，±10% 内 36.4%）
+- 手部投影必须用 ego 自身 `K_full`（其 overlay.mp4 手部贴合良好，证明手部几何与 K 自洽；用本地 K 会产生 10% 投影畸变）
+- 副发现: 本地 `vggt_omega` raw 深度 ≈ 1.9~2.2x 真实米制（该视频 raw 中位 0.97 vs ego metric ≈0.50），即现有管线未做 metric 校准；EgoFound3R 的 f 可用于给本地场景做 metric 化
+
+### ⚠️ Docs to Review
+- `docs/design/coordinate_and_alignment.md`: 未提及 VGGT-Omega raw 尺度并非米制（实测 ≈2x），建议补一节 "raw 尺度 vs metric 校准"，并注明可复用 EgoFound3R 的 raw→meter 因子
+- `TECHNICAL_DOCUMENTATION.md`: 若描述 Stage2 VGGT-Omega 输出尺度假设，需同步该结论
+- `docs/research/EGO_VIDEO_TO_SIM_ROADMAP.md`: 如后续把 EgoFound3R 接入 Stage2，需补 g/f 两种 gauge 的选择规则与帧映射契约（`global_frame_indices` / `intrinsics_full`）
+
+---
+
+## [2026-10-24 14:10] - EgoFound3R 手部 x 场景 3D 资产导出与交互式 HTML 查看器
+
+### Added
+- `tools/export_egofound_assets.py`: 导出"场景点云 + 手部 mesh"的 PLY/GLB (同一坐标系同一比例尺)
+  - `--source ras` → `assets/`: 本地 VGGT-Omega world_points + 手部(metric x g, g 默认取 g_core=1.794)
+  - `--source ego` → `assets_ego/`: **EgoFound3R 原生米制, 零标定**; 复用官方
+    `metric_geometry.unproject_depth_to_camera_points` + `camera_temporal_refiner.w2c_to_c2w`
+    (与 MetricHead 估 f 同一条路径, 数值与手写版完全一致: 247981 点 / bbox 1.553m / 手 0.231m)
+  - 修复手部 mesh 面索引 bug: 过滤无效顶点后按 marker 面重映射 (195 顶点/374 面全保留)
+- `tools/make_viewer_html.py`: 生成自包含交互式 HTML 查看器 (原生 WebGL, 无外部依赖, file:// 可开)
+  - 数据 base64 内嵌 (15 万点 + 3 只手 ≈ 3MB), 支持拖拽旋转/滚轮缩放/右键平移/自动旋转/点大小/手部显隐
+  - 修复关键渲染 bug: 手部 buffer 改为只创建一次 (原先每帧 create/delete buffer 导致顶点属性指针失效,
+    第二帧起点云 drawArrays 报 INVALID_OPERATION(1282) 不显示; 已用无头 chromium 截图验证修复)
+- 产物 `output_v3/egofound_verify/weixin_195833_224_h264/`:
+  - `viewer_ego_metric.html` (米制零标定) / `viewer_ras_gauge.html` (raw gauge, 手 x g)
+  - `assets_ego/` 与 `assets/` (scene_pointcloud.ply + hand_mesh_frame*.glb + scene_and_hand.glb)
+  - `verify/viewer_ego_screenshot.png` / `verify/viewer_ras_screenshot.png` (无头 chromium 验证截图)
+
+### Changed
+- 无既有管线改动 (本次仍为纯新增工具)
+
+### 验证结论补充
+- EgoFound3R 官方**无点云导出** (仅 inference_output.pt + overlay 视频), 点云需自行反投影;
+  已确认其内部官方函数即 `unproject_depth_to_camera_points`/`w2c_to_c2w` 并全部复用
+- 三个 gauge 关系数值互相印证: f=0.2347, local_raw/ego_raw=0.4529, g 理论值=0.4529/0.2347=1.93,
+  落在实测 g_core=1.794 ~ g_pooled=2.064 区间内
+
+### ⚠️ Docs to Review
+- 同上一笔记录; 若后续把 HTML 查看器接入交付流程, 需在 `docs/` 补一节 "查看器使用说明"
 
 ---

@@ -12,7 +12,7 @@ Step 0: GLB 场景与视频对齐验证
     → pyrender 渲染 GLB (y-up)
 
 用法:
-  python 01_glb_video_align.py --glb final_scene.glb --video 7.mp4 --extrinsics_dir extrinsics/ --intrinsic intrinsic.txt
+  python 01_glb_video_align.py --glb final_scene_basic.glb --video 7.mp4 --extrinsics_dir extrinsics/ --intrinsic intrinsic.txt
 """
 
 import os

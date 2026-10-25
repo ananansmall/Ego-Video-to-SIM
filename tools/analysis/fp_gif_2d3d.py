@@ -93,7 +93,12 @@ def build_frames(sd, key, stride=2, mesh_pts=1200, three_h=400, two_h=None,
 
     data = os.path.join(sd, f'fp_data_{key}')
     out = os.path.join(sd, f'fp_out_{key}')
-    n = len(os.listdir(os.path.join(out, 'ob_in_cam')))
+    # 帧数来源: poses 同级的 ob_in_cam 优先 (output_v3 等无 fp_out_<obj> 的场景)
+    base = out
+    if poses_dir and os.path.isdir(os.path.join(os.path.dirname(poses_dir),
+                                                'ob_in_cam')):
+        base = os.path.dirname(poses_dir)
+    n = len(os.listdir(os.path.join(base, 'ob_in_cam')))
 
     mesh = trimesh.load(os.path.join(data, 'mesh.obj'))
     vs = np.asarray(mesh.vertices)

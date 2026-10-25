@@ -25,6 +25,8 @@ import re
 import sys
 import time
 import subprocess
+import shutil
+import tempfile
 import numpy as np
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -69,7 +71,12 @@ VALID_SPATIAL_RELATIONSHIPS = [
 # 需要过滤的类别（属于floor/wall本身，不是独立物体）
 FILTER_CATEGORIES = {
     'floor', 'wall', 'ground', 'ceiling', 'floor_area', 'wall_section',
-    'flooring', 'wall_surface', 'room', 'space'
+    'flooring', 'wall_surface', 'room', 'space',
+    # VLM 照抄提示词占位符 / 泛指的产物。提示词已明确禁止, 这里是兜底 ——
+    # 实测 2026-10-19 weixin_195833_224 场景 VLM 仍返回了 "object",
+    # 占掉一个类别名额并把 Stage1 输出污染成 4 类 (真实只有 3 类)。
+    'object', 'objects', 'thing', 'things', 'item', 'items', 'stuff',
+    'noun', 'object1', 'object2', 'entity',
 }
 
 # 必须由地面支撑的类别（不可能挂在墙上）
@@ -146,18 +153,130 @@ SYNONYM_MAP = {
 # 第一次VLM调用: 物体检测提示词（仅名称，不判断位置和关系）
 # ============================================================
 
+# 检测提示词。
+#
+# 关键约束 (改之前务必先读): "name" 会被直接当作 SAM3 的分割文本提示
+# (mainv3.py → segment_and_track(category=name) → add_prompt(text=name))。
+# 因此 name 必须是"简单名词", 不能写成 "black chair on the left" 这种描述性
+# 短语 —— 文本提示越具体, SAM3 越容易切不出东西。想表达"有几个/在哪", 只能
+# 用附加字段, 不能污染 name。
+#
+# 相对旧版的改动及原因:
+#   ① 旧版有 "List each object type once per frame", 完全不给实例数量信息,
+#      SAM3 只能靠自身密集检测硬猜。实测 basic_pick_place_141 实拍约 8~11 个
+#      棋子, 最终只产出 9 个实例, log 里无从判断是"VLM 少数"还是"SAM3 漏切"。
+#      现在要求输出 count, 让这两件事第一次可分离诊断。
+#   ② 旧版 Ignore 列表只有 hands/body parts/walls/floors/ceilings, 实测噪声里
+#      出现 wall outlet×8、table, 都不在列表 → 靠下游 BODY_PART_CATEGORIES
+#      硬编码兜底。改为把背景结构显式列出。
+#   ③ 旧版没有合并规则, 盆栽+盆、杯+液体常被拆成两个实例。补一条, 并明确
+#      "容器内的物体是独立实例", 避免反向误合并。
 VLM_DETECT_PROMPT = """List all visible objects in this image. Output JSON only.
 
-{{"objects": [{{"name": "<object1>"}}, {{"name": "<object2>"}}]}}
+{{"objects": [{{"name": "<noun>", "count": 1}}, {{"name": "<noun>", "count": 2}}]}}
 
 Rules:
-- Simple singular English nouns, lowercase, no articles (a/an/the)
-- Describe what you see; do not copy the placeholder names above
-- For thin tall cylinders, prefer "bottle" over "cup" (cup is short and wide)
-- Ignore: hands, body parts, walls, floors, ceilings
-- List each object type once per frame
+- "name" MUST be a simple singular English noun in lowercase, no articles
+  (e.g. "bottle", "chess piece"). It is used as a segmentation text prompt,
+  so NEVER use descriptive phrases like "white cup on the left".
+- Describe what you actually see; do NOT copy the placeholder "<noun>" above.
+  Never output a name that is a generic word such as "object", "thing", "item".
+- "count" = how many separate physical instances of this type are visible.
+  Count carefully: identical-looking small objects must each be counted
+  (e.g. 8 chess pieces -> {{"name": "chess piece", "count": 8}}).
+- Report each object TYPE once, together with its instance count.
+- For thin tall cylinders prefer "bottle" over "cup" (cup is short and wide).
+- Merge into one entry only when physically inseparable: a plant with its pot,
+  a cup with the liquid inside it.
+  Objects stored inside an open container are SEPARATE entries.
+- Ignore: hands, body parts, walls, floors, ceilings, wall outlets, sockets,
+  light switches.
+- Table / desk / counter surfaces ARE objects — report them as "table",
+  "desk" or "counter". They are the support surface everything else rests on,
+  so they must NOT be treated as background.
+  (实测 weixin_195833_224: 旧版把白桌面当背景丢掉, 导致唯一的物体悬空在
+  空场景里, 只能贴到虚拟 z=0。)
 
 Output JSON:"""
+
+
+# ============================================================
+# API 模式: 用 opencode 的视觉模型替代本地 Qwen3.5-9B
+# ============================================================
+# 实测对比 (weixin_195833_224, 手持小物体 + 纯白背景):
+#   本地 Qwen3.5-9B + 旧 prompt → earbud case / eraser / object / stone
+#                                 (3 个是从白背景幻觉出来的, object 是占位符污染)
+#   6.8 + 新 prompt             → {"objects":[{"name":"button","count":1}]}
+#                                 (干净, 简单名词, 带数量)
+# 强视觉模型对"大面积纯色背景 + 小物体"这类场景明显更稳, 不会凭空造物体。
+API_VLM_MODEL = os.environ.get("RAS_STAGE1_VLM_MODEL",
+                               "sensenova/sensenova-6.8-flash-lite")
+USE_API_VLM = os.environ.get("RAS_STAGE1_USE_API", "0") == "1"
+OPENCODE_BIN = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _parse_batch_detect(raw, n):
+    """把批量检测的 VLM 输出拆成逐帧的 JSON 字符串列表。
+
+    VLM 返回 {"0": {"objects": [...]}, "1": {...}, ...}; 这里按 key 取出并
+    重新序列化成与逐帧模式相同的字符串, 让下游 _extract_json_from_text 无感知。
+    任何结构不符都返回 None, 由调用方退回逐帧。
+    """
+    if not raw:
+        return None
+    js = _extract_json_from_text(raw)
+    if js is None:
+        return None
+    out = []
+    for i in range(n):
+        v = js.get(str(i))
+        if isinstance(v, dict) and "objects" in v:
+            out.append(json.dumps(v, ensure_ascii=False))
+        elif isinstance(v, list):
+            out.append(json.dumps({"objects": v}, ensure_ascii=False))
+        else:
+            return None
+    return out
+
+
+def vlm_inference_api(image_path, prompt, model=None, timeout=420):
+    """用 opencode 调视觉模型做一次检测。
+
+    关键: cwd 必须是项目根、图片路径必须是项目内路径。
+    实测把图拷到 /tmp 并用它当 cwd 时, opencode 报
+        permission requested: external_directory (/tmp/*); auto-rejecting
+    然后静默返回空 —— 表现为"检测失败", 但看不出原因。
+
+    Returns:
+        模型原始输出文本; 失败返回空串 (由调用方回退到本地模型)。
+    """
+    model = model or API_VLM_MODEL
+    if not os.path.isfile(image_path) or not os.path.exists(OPENCODE_BIN):
+        return ""
+    cfg = {"$schema": "https://opencode.ai/config.json",
+           "permission": {"edit": "deny", "bash": {"*": "allow"},
+                          "webfetch": "deny"}}
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            cfg_path = f.name
+        env = dict(os.environ)
+        env["OPENCODE_CONFIG"] = cfg_path
+        rel = os.path.relpath(os.path.abspath(image_path), PROJECT_ROOT)
+        cmd = [OPENCODE_BIN, "run", "--model", model,
+               "Read the image at %s, then follow these instructions.\n\n%s"
+               % (rel, prompt)]
+        proc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env,
+                              capture_output=True, text=True, timeout=timeout)
+        return (proc.stdout or "").strip()
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.unlink(cfg_path)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -185,6 +304,37 @@ def _build_relationship_prompt(object_names, has_floor, has_wall):
     floor_info = "FLOOR is VISIBLE in this scene." if has_floor else "FLOOR is NOT visible in this scene."
     wall_info = "WALL is VISIBLE in this scene." if has_wall else "WALL is NOT visible in this scene."
 
+    # 兜底默认关系必须与"地面是否可见"一致。
+    # 原提示词无条件是 'If unsure, default to: "supported by floor"', 与上面刚写的
+    # "FLOOR is NOT visible" 自相矛盾; 俯视桌面场景 SAM 检测不到地面 (has_floor=False),
+    # VLM 对"靠什么支撑"确实没把握 → 按兜底把全部物体标成 floor。
+    # 实测后果 (basic_pick_place_111/14/46/47/64 五个场景): 100% 物体都是
+    # "supported by floor" → mainv3 里 has_inter_object=False → 5.2 段落整体跳过:
+    #   ① resolve_penetrations 不跑 → 物体间穿模残留 (46 的 box_1/box_2 重叠 92%)
+    #   ② placement_strategies.json 不写 → 5.25 的 on_top 无法区分 inside
+    # 看不到地面时, 物体必然是靠在场景内其它物体上 (桌面/托盘/盒面),
+    # 故该情形下默认 "supported by other objects"。
+    # 兜底默认关系统一用 "supported by other objects"。
+    #
+    # 为什么不再依赖 has_floor: 实测 SAM3 的地面检测对桌面特写场景不可靠 ——
+    # basic_pick_place_46 报 "floor=✅ (43 个 mask)", 把整个桌面当成了地面。
+    # 于是 has_floor=True, 若按它决定默认值, 仍然会把全部物体标成 floor。
+    # 一旦全标 floor:
+    #   ① mainv3 的 has_inter_object=False → 5.2 段落整体跳过
+    #      → resolve_penetrations 不跑 → 物体间穿模残留
+    #   ② placement_strategies.json 不写 → 5.25 的 on_top 无法区分 inside
+    #
+    # 改法: 默认交给下游的几何推断 (_infer_supporter 按 xy 重叠 + z 关系找真实
+    # 支撑物), 它比 VLM 的兜底和 SAM3 的 floor 检测都可靠 —— 真在地面上的物体
+    # 找不到下方支撑物时, 落地补正仍会把它压到 z=0。
+    _default_rule = ('- If unsure, default to: "supported by other objects" '
+                     '(the geometric stage will resolve the actual supporter; '
+                     'do NOT fall back to "supported by floor" as a catch-all)')
+    _overhead_rule = ('5. Tabletop / close-up / overhead views: do NOT use '
+                      '"supported by floor" as a catch-all. Objects resting on a '
+                      'table, tray, box or other item are '
+                      '"supported by other objects"')
+
     prompt = f"""You are a precise spatial relationship analysis API. Output ONLY valid JSON.
 
 **CRITICAL RULES**:
@@ -209,7 +359,7 @@ def _build_relationship_prompt(object_names, has_floor, has_wall):
 2. Small items on furniture (cup on table, lamp on desk, pillow on chair, keyboard on desk) → "supported by other objects"
 3. Things hanging on wall (picture, mirror, clock, poster, curtain) → "attached to wall"
 4. Things built into wall (door, window, outlet, vent) → "embedded in wall"
-5. Overhead/top-down view: Even from above, floor objects are still "supported by floor", furniture items are still "supported by other objects"
+{_overhead_rule}
 
 **Output format** (STRICT JSON):
 {{
@@ -222,7 +372,7 @@ def _build_relationship_prompt(object_names, has_floor, has_wall):
 **CRITICAL REQUIREMENTS**:
 - You MUST output exactly {num_objects} objects (one for each: [{objects_str}])
 - Do NOT skip any object!
-- If unsure, default to: "supported by floor"
+{_default_rule}
 
 **Now analyze this scene and OUTPUT JSON:**"""
     return prompt
@@ -450,8 +600,12 @@ def extract_frames_by_vggt_sampling(extrinsics, world_points, world_points_conf,
     valid_flat_mask = (wpc_flat >= init_threshold) & (wpc_flat > 0.1)
 
     if not valid_flat_mask.any():
-        print(f"   ⚠️  警告: 没有有效的点云数据", flush=True)
-        return list(range(min(max_frames, S)))
+        # 均匀覆盖全视频, 而不是 range(S)[:N] —— 后者全挤在视频开头,
+        # VLM 只看到前段 (与 bug#1 的关键帧偏置同性质)。
+        _n = min(max_frames, S)
+        _fallback = sorted({int(round(i * (S - 1) / max(_n - 1, 1))) for i in range(_n)})
+        print(f"   ⚠️  警告: 没有有效的点云数据, 关键帧退化为均匀采样 {_fallback}", flush=True)
+        return _fallback
 
     valid_points = wp_flat[valid_flat_mask]
     x_min, y_min, z_min = valid_points[:, 0].min(), valid_points[:, 1].min(), valid_points[:, 2].min()
@@ -681,12 +835,13 @@ def merge_synonyms(category_name):
     参数:
         category_name: 原始类别名称
     返回:
-        合并后的名称
+        合并后的名称 (空格转下划线, 与 MUST_BE_WALL_ATTACHED 等下划线
+        形式的规则集一致 —— 否则 "wall clock" 绕过物理纠错)
     """
     name = category_name.lower().strip()
     if name in SYNONYM_MAP:
         return SYNONYM_MAP[name]
-    return normalize_category_name(name)
+    return normalize_category_name(name.replace(" ", "_"))
 
 
 def _merge_multi_vlm_detections(main_detections, aux_detections):
@@ -934,75 +1089,120 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_mod
     all_detections = []
     total_objects = 0
 
-    for i, (vid_idx, frame_path) in enumerate(frame_paths_with_indices):
-        print(f"[{i+1}/{len(frame_paths_with_indices)}] [主VLM] 帧 #{vid_idx}...", end=" ", flush=True)
+    # ── 批量检测 ──
+    # 原来逐帧调一次 VLM: N 个关键帧 = N 次调用。实测 weixin (10 帧, API 模式)
+    # Stage1 光检测就 861s, 其中逐帧调用是主要开销 (每次约 40s, 含模型往返)。
+    # 改成每次带 BATCH 帧: 本地 VLM 支持一条消息多图, API 模式把多个路径写进
+    # prompt 让它逐个读。BATCH=5 时 10 帧从 10 次降到 2 次。
+    # 输出格式相应改成按帧索引分组的 JSON, 解析后拆回逐帧结果 —— 下游看到的
+    # 数据结构和逐帧版完全一致。
+    _BATCH = int(os.environ.get("STAGE1_VLM_BATCH", "5"))
+    _batches = [frame_paths_with_indices[i:i + _BATCH]
+                for i in range(0, len(frame_paths_with_indices), _BATCH)]
+    print(f"   批量检测: {len(frame_paths_with_indices)} 帧分 "
+          f"{len(_batches)} 批 (每批最多 {_BATCH} 帧)", flush=True)
 
+    for _bi, _batch in enumerate(_batches):
+        print(f"[{_bi+1}/{len(_batches)}] [主VLM] 帧 "
+              f"{[v for v, _ in _batch]} ...", end=" ", flush=True)
+        _texts = None
         try:
-            image = Image.open(frame_path).convert("RGB")
-            start_time = time.time()
-            output_text = vlm_inference(image, model, processor, VLM_DETECT_PROMPT, max_new_tokens=1024, caller="stage1_detect")
-            elapsed = time.time() - start_time
+            if USE_API_VLM and len(_batch) > 1:
+                _paths = "\n".join(p for _, p in _batch)
+                _bp = (f"Read these {len(_batch)} image files (one per line):\n"
+                       f"{_paths}\n\nFor EACH image, list the visible objects.\n"
+                       f"Output ONE JSON object keyed by image order "
+                       f"(0-based), no markdown fence:\n"
+                       f'{{"0": {{"objects": [{{"name": "..."}}]}}, '
+                       f'"1": {{"objects": [...]}}}}\n\n'
+                       f"Rules per image:\n"
+                       f"- Simple singular English nouns, lowercase\n"
+                       f"- Ignore: hands, body parts, walls, floors, ceilings\n"
+                       f"- List each object type once\n")
+                _raw = vlm_inference_api(_batch[0][1], _bp)
+                _texts = _parse_batch_detect(_raw, len(_batch))
+                if _raw and _texts is None:
+                    print("(批量解析失败, 退回逐帧) ", end="", flush=True)
+                    _texts = None
+        except Exception as _e:
+            print(f"(批量异常 {type(_e).__name__}, 退回逐帧) ", end="", flush=True)
+            _texts = None
 
-            json_str = _extract_json_from_text(output_text)
-
-            if json_str is None:
-                print(f"❌ 无法提取JSON ({elapsed:.1f}s)")
-                print(f"   📝 VLM原始输出 (前300字符): {output_text[:300]}", flush=True)
-                continue
-
+        for _j, (vid_idx, frame_path) in enumerate(_batch):
             try:
-                result = json.loads(json_str)
-            except json.JSONDecodeError as e1:
-                json_str_fixed = _fix_json_string(json_str)
+                image = Image.open(frame_path).convert("RGB")
+                start_time = time.time()
+                if _texts is not None and _j < len(_texts) and _texts[_j]:
+                    output_text = _texts[_j]
+                    elapsed = 0.0
+                elif USE_API_VLM:
+                    output_text = vlm_inference_api(frame_path, VLM_DETECT_PROMPT)
+                    if not output_text:
+                        print("(API失败, 回退本地VLM) ", end="", flush=True)
+                        output_text = vlm_inference(
+                            image, model, processor, VLM_DETECT_PROMPT,
+                            max_new_tokens=1024, caller="stage1_detect")
+                else:
+                    output_text = vlm_inference(image, model, processor, VLM_DETECT_PROMPT, max_new_tokens=1024, caller="stage1_detect")
+                elapsed = time.time() - start_time
+
+                json_str = _extract_json_from_text(output_text)
+                if json_str is None:
+                    print(f"❌ 帧#{vid_idx} 无法提取JSON ({elapsed:.1f}s)")
+                    continue
+
                 try:
-                    result = json.loads(json_str_fixed)
-                except json.JSONDecodeError as e2:
-                    print(f"❌ JSON解析失败 ({elapsed:.1f}s)")
-                    print(f"      🔍 提取的JSON字符串 (前500字符): {json_str[:500]}", flush=True)
-                    print(f"      🔧 修复后JSON (前500字符): {json_str_fixed[:500]}", flush=True)
-                    print(f"      ⚠️  原始错误: {str(e1)[:200]}", flush=True)
-                    print(f"      ⚠️  修复后错误: {str(e2)[:200]}", flush=True)
-                    print(f"      📝 VLM完整输出:\n{output_text}", flush=True)
-                    continue
-
-            if isinstance(result, list):
-                objects = result
-            else:
-                objects = result.get("objects", result.get("detections", []))
-
-            img_w, img_h = image.size
-            for obj in objects:
-                if not isinstance(obj, dict):
-                    continue
-                if "label" in obj and "name" not in obj:
-                    obj["name"] = obj.pop("label")
-                bbox = None
-                if "bbox" in obj:
-                    bbox = obj["bbox"]
-                elif "bbox_2d" in obj:
-                    bbox = obj["bbox_2d"]
-                if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-                    obj["center_x"] = (int(bbox[0]) + int(bbox[2])) // 2
-                    obj["center_y"] = (int(bbox[1]) + int(bbox[3])) // 2
-                    obj["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
-                if "center_x" not in obj or "center_y" not in obj:
-                    obj["center_x"] = img_w // 2
-                    obj["center_y"] = img_h // 2
-
-            valid_objects = [obj for obj in objects if "name" in obj]
-            total_objects += len(valid_objects)
-            all_detections.append({
-                "frame_idx": vid_idx,
-                "frame_path": frame_path,
-                "objects": valid_objects
-            })
-
-            obj_names = [obj["name"] for obj in valid_objects]
-            print(f"✅ {len(valid_objects)}个: {', '.join(obj_names)} ({elapsed:.1f}s)", flush=True)
-
-        except Exception as e:
-            print(f"❌ 错误: {e}", flush=True)
-
+                    result = json.loads(json_str)
+                except json.JSONDecodeError as e1:
+                    json_str_fixed = _fix_json_string(json_str)
+                    try:
+                        result = json.loads(json_str_fixed)
+                    except json.JSONDecodeError as e2:
+                        print(f"❌ JSON解析失败 ({elapsed:.1f}s)")
+                        print(f"      🔍 提取的JSON字符串 (前500字符): {json_str[:500]}", flush=True)
+                        print(f"      🔧 修复后JSON (前500字符): {json_str_fixed[:500]}", flush=True)
+                        print(f"      ⚠️  原始错误: {str(e1)[:200]}", flush=True)
+                        print(f"      ⚠️  修复后错误: {str(e2)[:200]}", flush=True)
+                        print(f"      📝 VLM完整输出:\n{output_text}", flush=True)
+                        continue
+    
+                if isinstance(result, list):
+                    objects = result
+                else:
+                    objects = result.get("objects", result.get("detections", []))
+    
+                img_w, img_h = image.size
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        continue
+                    if "label" in obj and "name" not in obj:
+                        obj["name"] = obj.pop("label")
+                    bbox = None
+                    if "bbox" in obj:
+                        bbox = obj["bbox"]
+                    elif "bbox_2d" in obj:
+                        bbox = obj["bbox_2d"]
+                    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                        obj["center_x"] = (int(bbox[0]) + int(bbox[2])) // 2
+                        obj["center_y"] = (int(bbox[1]) + int(bbox[3])) // 2
+                        obj["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+                    if "center_x" not in obj or "center_y" not in obj:
+                        obj["center_x"] = img_w // 2
+                        obj["center_y"] = img_h // 2
+    
+                valid_objects = [obj for obj in objects if "name" in obj]
+                total_objects += len(valid_objects)
+                all_detections.append({
+                    "frame_idx": vid_idx,
+                    "frame_path": frame_path,
+                    "objects": valid_objects
+                })
+    
+                obj_names = [obj["name"] for obj in valid_objects]
+                print(f"✅ {len(valid_objects)}个: {', '.join(obj_names)} ({elapsed:.1f}s)", flush=True)
+    
+            except Exception as e:
+                print(f"❌ 错误: {e}", flush=True)
     unique_main = set()
     for det in all_detections:
         for obj in det["objects"]:
@@ -1010,6 +1210,29 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_mod
             if std and std not in FILTER_CATEGORIES:
                 unique_main.add(std)
     print(f"\n📊 主VLM总计: {total_objects} 个物体实例, {len(unique_main)} 个独立类别", flush=True)
+
+    # count 字段诊断: 每类别取各帧中的最大自报实例数。
+    # 目的: 让"VLM 少数"与"SAM3 漏切"第一次可区分 —— 把这里的数字和下游
+    # _pre_dedup_masks.pkl 里该类别实际切出的 mask 数对比即可。
+    # 例如 141 若这里报 chess piece=8 而 SAM3 切出 9, 说明是 SAM3 侧问题;
+    # 若这里报 3 而实拍有 8, 才是 VLM 少数。
+    _cnt = {}
+    for _det in all_detections:
+        for _obj in _det.get("objects", []):
+            if "name" not in _obj:
+                continue
+            _std = merge_synonyms(_obj["name"].lower().strip().replace(" ", "_"))
+            if not _std or _std in FILTER_CATEGORIES:
+                continue
+            try:
+                _c = int(_obj.get("count", 1) or 1)
+            except Exception:
+                _c = 1
+            _cnt[_std] = max(_cnt.get(_std, 0), _c)
+    if _cnt:
+        _tot = sum(_cnt.values())
+        _top = dict(sorted(_cnt.items(), key=lambda x: -x[1]))
+        print(f"   🔢 VLM 自报实例数合计 {_tot}: {_top}", flush=True)
 
     if enable_multi_vlm and aux_model is not None and aux_processor is not None and len(unique_main) < aux_min_objects:
         print(f"\n{'='*70}", flush=True)
@@ -1101,13 +1324,19 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_mod
 # Step 4: 构建物体实例（射线投射法）
 # ============================================================
 
-def build_object_instances(all_detections, vggt_results):
+def build_object_instances(all_detections, vggt_results, total_video_frames=0,
+                           keyframe_size=None):
     """
     将VLM检测到的2D像素位置通过射线投射映射到3D空间
 
     参数:
-        all_detections: detect_objects_in_frames的输出
+        all_detections: detect_objects_in_frames的输出 (frame_idx 是原视频帧号)
         vggt_results: VGGT重建结果
+        total_video_frames: 原视频总帧数; > VGGT 帧数时 frame_idx 被视为
+            原视频帧号并转换为 VGGT 槽位 (bug#1: 关键帧按原视频帧号落盘,
+            直接当槽位用会越界丢弃或错位索引)
+        keyframe_size: (W, H) 原分辨率关键帧尺寸, 用于把检测框中心从原图
+            像素缩放到 VGGT 帧像素 (内参对应的是 VGGT 帧)
     返回:
         [{frame_idx, name, description, center_x, center_y, centroid}]
     """
@@ -1125,15 +1354,44 @@ def build_object_instances(all_detections, vggt_results):
     T_usable = min(T, T_ext)
     print(f"   📐 VGGT数据: wp={world_points.shape}, wpc={world_points_conf.shape}, ext={T_ext}, T_usable={T_usable}", flush=True)
 
+    # 原视频帧号 → VGGT 槽位 (load_video_frames 用 linspace(0, total-1, T) 抽帧)
+    _need_map = bool(total_video_frames and total_video_frames > T_usable > 1)
+    if _need_map:
+        print(f"   🔁 检测帧号索引转换: 原视频 {total_video_frames} 帧 → VGGT {T_usable} 槽位", flush=True)
+
+    def _vid2slot(f):
+        if not _need_map:
+            return int(f)
+        return int(min(T_usable - 1, max(0, round(f * (T_usable - 1) / (total_video_frames - 1)))))
+
+    # ── 像素空间对齐 ──
+    # keyframe_size=(W,H): 原分辨率关键帧尺寸。VGGT 预处理 (resize/crop) 后
+    # 内参对应的是 VGGT 帧像素, 两个空间不缩放会整体错位。
+    _uv_scale = None
+    if keyframe_size:
+        _Hv, _Wv = world_points.shape[0], world_points.shape[1]
+        _Wo, _Ho = keyframe_size
+        if _Wo > 0 and _Ho > 0:
+            _uv_scale = (_Wv / _Wo, _Hv / _Ho)
+            _ar_vggt = _Wv / max(_Hv, 1)
+            _ar_orig = _Wo / max(_Ho, 1)
+            if abs(_ar_vggt / max(_ar_orig, 1e-9) - 1.0) > 0.02:
+                print(f"   ⚠️ 关键帧宽高比 ({_Wo}x{_Ho}) 与 VGGT 帧 ({_Wv}x{_Hv}) "
+                      f"不一致 (crop 模式), 线性缩放可能有残余偏差", flush=True)
+            print(f"   🔍 像素空间对齐: 关键帧 {_Wo}x{_Ho} → VGGT {_Wv}x{_Hv} "
+                  f"(缩放 {_uv_scale[0]:.3f}/{_uv_scale[1]:.3f})", flush=True)
+
     object_instances = []
     total_instances = sum(len(d['objects']) for d in all_detections)
     success_count = 0
+    n_dropped = 0
 
     print(f"   为 {total_instances} 个物体实例估计3D位置...", flush=True)
 
     for detection in all_detections:
-        frame_idx = detection["frame_idx"]
+        frame_idx = _vid2slot(detection["frame_idx"])
         if frame_idx >= T_usable:
+            n_dropped += 1
             continue
 
         wp_frame = world_points[frame_idx]
@@ -1143,6 +1401,12 @@ def build_object_instances(all_detections, vggt_results):
         for obj in detection["objects"]:
             center_x = obj.get("center_x", 0)
             center_y = obj.get("center_y", 0)
+            # 检测框中心是"原分辨率关键帧"像素 (VLM 看的是原图), 而 intrinsic
+            # 是 VGGT 预处理帧的 —— 不缩放射线会偏离数倍 (实测 1920x1080 关键帧
+            # vs 688x384 VGGT 帧, 图像中心被算成 ~50° 偏轴)。
+            if _uv_scale:
+                center_x = center_x * _uv_scale[0]
+                center_y = center_y * _uv_scale[1]
 
             centroid = pixel_to_3d_position(
                 center_x, center_y,
@@ -1162,7 +1426,11 @@ def build_object_instances(all_detections, vggt_results):
                 "centroid": centroid,
             })
 
-    print(f"   ✅ {len(object_instances)} 个物体实例，{success_count} 个成功映射到3D\n", flush=True)
+    print(f"   ✅ {len(object_instances)} 个物体实例，{success_count} 个成功映射到3D", flush=True)
+    if n_dropped:
+        print(f"   ⚠️ {n_dropped} 个检测因帧号超出 VGGT 范围被丢弃 "
+              f"(索引转换后仍越界, 检查帧号空间映射)", flush=True)
+    print(flush=True)
     return object_instances
 
 
@@ -1289,6 +1557,20 @@ def _project_3d_to_2d(centroid, world_points_frame):
     return int(min_pos[1]), int(min_pos[0])
 
 
+def _video_frame_to_slot(vid_idx, total_video_frames, t_vggt):
+    """原视频帧号 → VGGT 槽位。
+
+    load_video_frames 用 np.linspace(0, total-1, T) 抽帧, 所以槽位 i 对应
+    原视频帧 round(i*(total-1)/(T-1))。total<=T 时两个索引空间重合, 原样返回。
+    (bug#1 家族: frame_paths_with_indices 存的是原视频帧号, 直接当槽位索引
+    world_points 会越界丢弃或错位取点。)
+    """
+    vid_idx = int(vid_idx)
+    if not total_video_frames or total_video_frames <= t_vggt or t_vggt <= 1:
+        return vid_idx
+    return int(min(t_vggt - 1, max(0, round(vid_idx * (t_vggt - 1) / (total_video_frames - 1)))))
+
+
 def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
                                           frame_paths_with_indices, model, processor,
                                           sam_results=None):
@@ -1314,6 +1596,8 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
         model: VLM模型
         processor: VLM处理器
         sam_results: SAM分割结果（可选，用于排除floor/wall区域）
+        total_video_frames: 原视频总帧数; > VGGT 帧数时 frame_paths_with_indices
+            里的帧号是原视频帧号, 索引 world_points 前必须换算成 VGGT 槽位
     返回:
         补充检测到的物体列表 [{name, centroid, source}]
     """
@@ -1324,6 +1608,14 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
     world_points = vggt_results['world_points'][0]
     world_points_conf = vggt_results['world_points_conf'][0]
     T, H, W = world_points.shape[:3]
+    _need_map = bool(total_video_frames and total_video_frames > T > 1)
+    if _need_map:
+        print(f"   🔁 帧号索引转换: 原视频 {total_video_frames} 帧 → VGGT {T} 槽位", flush=True)
+
+    def _vid2slot(vid_idx):
+        if not _need_map:
+            return int(vid_idx)
+        return int(min(T - 1, max(0, round(vid_idx * (T - 1) / (total_video_frames - 1)))))
 
     known_centroids = []
     for obj in unique_objects:
@@ -1499,10 +1791,11 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
         best_uv = None
 
         for vid_idx, frame_path in frame_paths_with_indices:
-            if vid_idx >= T:
+            slot = _vid2slot(vid_idx)
+            if slot >= T:
                 continue
-            wp_frame = world_points[vid_idx]
-            conf_frame = world_points_conf[vid_idx]
+            wp_frame = world_points[slot]
+            conf_frame = world_points_conf[slot]
             valid_mask = conf_frame > 0.5
             if not np.any(valid_mask):
                 continue
@@ -1533,8 +1826,13 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
 
         try:
             image = Image.open(frame_path).convert("RGB")
+            # u,v 是 pointmap (VGGT 帧 H,W) 空间的坐标; 裁剪的是原分辨率关键帧,
+            # 必须按尺寸比例缩放, 否则裁剪位置偏 ~2.8 倍 (实测 1920x1080 vs 688x384)
+            _sxu = image.width / float(W)
+            _syv = image.height / float(H)
+            u_img, v_img = u * _sxu, v * _syv
             half = SUPPLEMENTARY_CROP_SIZE // 2
-            crop_box = (u - half, v - half, u + half, v + half)
+            crop_box = (int(u_img - half), int(v_img - half), int(u_img + half), int(v_img + half))
             crop_box = (
                 max(0, crop_box[0]),
                 max(0, crop_box[1]),
@@ -1617,12 +1915,14 @@ def _resize_mask_to_pointmap(mask, pointmap):
 # SAM floor/wall分割
 # ============================================================
 
-def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
+def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results,
+                               total_video_frames=0):
     """
     使用SAM3分割floor和wall（复用object_segmentation.py）
 
     参数:
         frame_paths_with_indices: 关键帧路径列表
+        total_video_frames: 原视频总帧数 (帧号→VGGT槽位换算用, 与 Step5.5 同因)
         vggt_results: VGGT重建结果
     返回:
         {'has_floor': bool/None, 'has_wall': bool/None,
@@ -1715,9 +2015,13 @@ def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
                     keyframe_floor_masks[vid_idx] = chosen_mask
                 continue
 
-            if world_points is not None and vid_idx < world_points.shape[0]:
+            # frame_paths_with_indices 的帧号是原视频帧号 (total>T 时),
+            # 索引 world_points 前必须换算成 VGGT 槽位 (bug#1 同族)
+            _slot = _video_frame_to_slot(vid_idx, total_video_frames,
+                                         world_points.shape[0])
+            if world_points is not None and _slot < world_points.shape[0]:
                 from src.geometry_utils import get_plane_info
-                pointmap = world_points[vid_idx]
+                pointmap = world_points[_slot]
                 plane_infos = []
                 for fm in kf_floor_masks:
                     if fm['frame_id'] != 0:
@@ -1913,7 +2217,11 @@ def _post_process_relationships(relationships, object_names):
             continue
 
         if rel not in VALID_SPATIAL_RELATIONSHIPS:
-            rel = "supported by floor"
+            # 兜底用 "supported by other objects" 而非 floor: prompt 的默认
+            # 已改成 other objects (见 build_relationship_prompt 处的注释 ——
+            # 全部 floor 会让 mainv3 判 has_inter_object=False 而整段跳过 5.2),
+            # 代码级兜底必须与之一致, 否则 garbage 输出会把场景拖回全 floor。
+            rel = "supported by other objects"
 
         category_base = std_name.split("_")[0] if "_" in std_name else std_name
 
@@ -1936,8 +2244,8 @@ def _post_process_relationships(relationships, object_names):
     for name in object_names:
         std_name = merge_synonyms(name)
         if std_name not in corrected:
-            corrected[std_name] = "supported by floor"
-            print(f"      [兜底] '{std_name}': 无VLM判断，默认 supported by floor", flush=True)
+            corrected[std_name] = "supported by other objects"
+            print(f"      [兜底] '{std_name}': 无VLM判断，默认 supported by other objects", flush=True)
 
     return corrected
 
@@ -2031,7 +2339,17 @@ def vlm_judge_relationships(unique_objects, sam_results, frame_paths_with_indice
             frame_visibility[vid_idx] = set(object_names)
 
     # ---- 7.3 多帧VLM推理（per-frame可见性过滤） ----
-    objects_to_query = [n for n in object_names if n not in sam_floor_objects]
+    # 名字空间统一: frame_visibility 里存的是 merge_synonyms 标准名
+    # ("cup"/"chair"), 而 object_names 可能是合并组的原始代表名
+    # ("mug"/"chairs"/"remote control") —— 直接 in 匹配永远查不到, 物体在
+    # 所有帧都被跳过查询, 最终静默兜底成 floor (下游 5.1/5.2 随之跳过)。
+    # 成员判断统一走标准名, 投票与提示词仍用原始名。
+    _std_of = {n: merge_synonyms(n.lower().strip().replace(" ", "_"))
+               for n in object_names}
+    _sam_floor_std = {merge_synonyms(s.lower().strip().replace(" ", "_"))
+                      for s in sam_floor_objects}
+    objects_to_query = [n for n in object_names
+                        if _std_of.get(n, n) not in _sam_floor_std]
 
     if objects_to_query:
         print(f"\n   🤖 7.3 VLM关系判断: 需判断 {len(objects_to_query)} 个物体 (SAM已处理 {len(sam_floor_objects)} 个)", flush=True)
@@ -2043,7 +2361,8 @@ def vlm_judge_relationships(unique_objects, sam_results, frame_paths_with_indice
 
     for qi, (vid_idx, frame_path) in enumerate(frame_paths_with_indices if objects_to_query else []):
         visible_in_frame = frame_visibility.get(vid_idx, set())
-        frame_objects = [n for n in objects_to_query if n in visible_in_frame]
+        frame_objects = [n for n in objects_to_query
+                         if _std_of.get(n, n) in visible_in_frame]
 
         if not frame_objects:
             print(f"   [{qi+1}/{num_frames_to_query}] 帧 #{vid_idx}: 无待判断物体可见，跳过", flush=True)
@@ -2130,8 +2449,8 @@ def vlm_judge_relationships(unique_objects, sam_results, frame_paths_with_indice
             vote_info = dict(all_votes[std_name])
             print(f"   📋 {std_name}: {best_rel} (VLM投票: {vote_info})", flush=True)
         else:
-            final_objects[std_name] = "supported by floor"
-            print(f"   ⚠️  {std_name}: supported by floor (无SAM判断也无VLM投票，兜底默认)", flush=True)
+            final_objects[std_name] = "supported by other objects"
+            print(f"   ⚠️  {std_name}: supported by other objects (无SAM判断也无VLM投票，兜底默认)", flush=True)
 
     print(f"\n📊 关系判断完成，{len(final_objects)} 个物体\n", flush=True)
     return final_objects
@@ -2328,8 +2647,17 @@ def main():
     parser.add_argument('--no_supplementary_detect', action='store_true', default=False, help='禁用点云补充检测')
     parser.add_argument('--enable_multi_vlm', action='store_true', default=False, help='启用多VLM联合检测 (主+辅模型, 需要同时设置vlm_checkpoint_aux)')
     parser.add_argument('--aux_min_object_threshold', type=int, default=8, help='主模型检测物体数<该值时触发辅助VLM补全 (默认8)')
+    parser.add_argument('--use_api_vlm', action='store_true', default=False,
+                        help='用 opencode 的视觉模型做第一次检测 (替代本地 Qwen3.5-9B)。'
+                             '模型可用环境变量 RAS_STAGE1_VLM_MODEL 覆盖; '
+                             'API 失败会自动回退本地模型。')
 
     args = parser.parse_args()
+    # 命令行开关优先于环境变量
+    if getattr(args, 'use_api_vlm', False):
+        globals()['USE_API_VLM'] = True
+    if getattr(args, 'stage1_vlm_model', None):
+        globals()['API_VLM_MODEL'] = args.stage1_vlm_model
 
     if args.no_supplementary_detect:
         args.supplementary_detect = False
@@ -2436,6 +2764,28 @@ def main():
             extrinsics, world_points, world_points_conf, max_frames=args.max_frames
         )
 
+        # ── 索引空间转换 (VGGT 采样帧下标 → 原视频帧号) ──
+        # keyframe_indices 是 VGGT 采样帧(0..T_vggt-1)的下标, 而
+        # extract_specific_frames 要的是原视频帧号。load_video_frames 用
+        # np.linspace(0, total-1, max_frames) 抽帧, 所以必须做逆映射。
+        # 实测 weixin (300帧抽80): 下标 78 被当成原视频第 78 帧(26%处,
+        # 全是手+耳机盒特写), 而它真正对应第 292 帧(97%处, 广角能看到
+        # 2 把椅子) → VLM 从没见过椅子, JSON 里不可能有 chair。
+        _fps, _total = _get_video_info(args.input_video)
+        # 用 extrinsics 的数量取 VGGT 帧数, 比 world_points.shape 可靠
+        # (后者可能是 torch tensor, np.asarray 会抛错)。
+        try:
+            _t_vggt = len(extrinsics)
+        except Exception:
+            _t_vggt = 0
+        if _t_vggt > 1 and _total > _t_vggt:
+            _mapped = sorted({int(round(i * (_total - 1) / (_t_vggt - 1)))
+                              for i in keyframe_indices})
+            print(f"   🔁 关键帧索引空间转换: VGGT下标{keyframe_indices[:6]}... "
+                  f"→ 原视频帧号{_mapped[:6]}... (共{len(_mapped)}个, "
+                  f"VGGT {_t_vggt}帧 / 原视频 {_total} 帧)", flush=True)
+            keyframe_indices = _mapped
+
         # Step 2: 提取关键帧
         frame_paths_with_indices = extract_specific_frames(
             args.input_video, keyframe_indices, args.temp_dir
@@ -2503,7 +2853,17 @@ def main():
             return
 
         # Step 4: 射线投射 → 3D位置估计
-        object_instances = build_object_instances(all_detections, vggt_results)
+        _kf_size = None
+        try:
+            if frame_paths_with_indices:
+                from PIL import Image as _PILImage
+                with _PILImage.open(frame_paths_with_indices[0][1]) as _kf_img:
+                    _kf_size = _kf_img.size  # (W, H) 原分辨率关键帧
+        except Exception as _e:
+            print(f"   ⚠️ 读取关键帧尺寸失败 (跳过像素空间对齐): {_e}", flush=True)
+        object_instances = build_object_instances(all_detections, vggt_results,
+                                                  total_video_frames=_total,
+                                                  keyframe_size=_kf_size)
 
         if not object_instances:
             print("❌ 没有有效的物体实例", flush=True)
@@ -2535,7 +2895,8 @@ def main():
         if args.use_sam != 'no':
             try:
                 sam_results = segment_floor_and_wall_sam(
-                    frame_paths_with_indices, vggt_results
+                    frame_paths_with_indices, vggt_results,
+                    total_video_frames=_total
                 )
             except Exception as e:
                 print(f"   ⚠️  SAM分割失败: {e}，回退到VLM视觉判断", flush=True)
@@ -2545,7 +2906,8 @@ def main():
             try:
                 new_objects = supplementary_detect_from_pointcloud(
                     vggt_results, unique_objects, frame_paths_with_indices,
-                    model, processor, sam_results=sam_results
+                    model, processor, sam_results=sam_results,
+                    total_video_frames=_total
                 )
                 if new_objects:
                     for obj in new_objects:

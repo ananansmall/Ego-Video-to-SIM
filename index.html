@@ -1,0 +1,60 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>ReplicateAnyScene 结果总览</title>
+<style>body{font-family:sans-serif;background:#111;color:#eee;margin:20px}
+h1{font-size:20px} h2{font-size:16px;margin:24px 0 8px}
+a{color:#7ab8ff;margin-right:16px}
+img{max-width:48%;border:1px solid #333;margin:4px;vertical-align:top}
+</style></head><body>
+<h1>ReplicateAnyScene 场景结果总览</h1>
+<h2>① 2chair-bottle（全自动全管线, 体检 5/5）</h2>
+<img src="output_v3/2chair-fulltest/final_scene_fixed_preview.png">
+<img src="output_v3/2chair-fulltest/final_scene_fixed_camview.png">
+<a href="output_v3/2chair-fulltest/final_scene_fixed.glb" download>下载 GLB</a>
+<h2>② 3chair-bottle（21 实例房间, audit 0 问题）</h2>
+<img src="output_v3/3chair-bottle/final_scene_fixed_preview.png">
+<img src="output_v3/3chair-bottle/final_scene_fixed_camview.png">
+<a href="output_v3/3chair-bottle/final_scene_fixed.glb" download>下载 GLB</a>
+<h2>③ 微信视频 wxD（4/4 满分）</h2>
+<img src="output_v3/wxD/final_scene_fixed_preview.png">
+<img src="output_v3/wxD/final_scene_fixed_camview.png">
+<a href="output_v3/wxD/final_scene_fixed.glb" download>下载 GLB</a>
+<h2>④ HOI4D（新数据泛化, 4/5）</h2>
+<img src="output_v3/hoi4d-fulltest/final_scene_stage5_preview.png">
+<img src="output_v3/hoi4d-fulltest/final_scene_stage5_camview.png">
+<a href="output_v3/hoi4d-fulltest/final_scene_stage5.glb" download>下载 GLB</a>
+<h2>⑤ 2chair（手工精修交付版）</h2>
+<img src="output_v2/2chair-bottle_rescaled/final_scene_fixed_preview.png">
+<img src="output_v2/2chair-bottle_rescaled/final_scene_fixed_camview.png">
+<a href="output_v2/2chair-bottle_rescaled/final_scene_fixed.glb" download>下载 GLB</a>
+
+<h2>⑥ EgoFound3R 手部 × 场景点云（尺度对齐验证）</h2>
+<p style="color:#999;font-size:13px;margin:4px 0">
+米制零标定（EgoFound3R 原生 gauge）· 点云按 RGB 上色 · 橙 = 左手 side0 · 蓝 = 右手 side1
+</p>
+<h3 style="font-size:14px;color:#bbb;margin:12px 0 4px">双手场景（横屏 basic_pick_place/0.mp4）</h3>
+<img src="output_v3/egofound_verify/0/verify/turntable_ego.gif" alt="turntable two-hand">
+<img src="output_v3/egofound_verify/0/verify/overlay2d.gif" alt="overlay2d two-hand">
+<p>
+  <a href="output_v3/egofound_verify/0/viewer_ego_metric.html">3D 查看器 (HTML, 可拖拽)</a>
+  <a href="output_v3/egofound_verify/0/verify/render3d.gif">3D 同视角 GIF</a>
+  <a href="output_v3/egofound_verify/0/verify/sideview.gif">侧视 GIF</a>
+  <a href="output_v3/egofound_verify/0/assets_ego/scene_and_hand.glb" download>点云+手 GLB</a>
+  <a href="output_v3/egofound_verify/0/assets_ego/scene_pointcloud.ply" download>点云 PLY</a>
+  <a href="output_v3/egofound_verify/0/VIEW.md">VIEW.md</a>
+</p>
+
+<h3 style="font-size:14px;color:#bbb;margin:12px 0 4px">单手难例（竖屏 微信视频，含旋转 90° 对比实验）</h3>
+<img src="output_v3/egofound_verify/weixin_195833_224_h264/verify/turntable_ego.gif" alt="turntable single-hand">
+<img src="output_v3/egofound_verify/weixin_195833_224_h264/verify/compare.gif" alt="compare local vs ego overlay">
+<p>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/viewer_ego_metric.html">3D 查看器 (米制)</a>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/viewer_ras_gauge.html">3D 查看器 (RAS gauge)</a>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/verify/overlay2d.gif">2D 叠加 GIF</a>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/verify/render3d.gif">3D 同视角 GIF</a>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/assets_ego/scene_and_hand.glb" download>点云+手 GLB</a>
+  <a href="output_v3/egofound_verify/weixin_195833_224_h264/VIEW.md">VIEW.md</a>
+</p>
+<p style="color:#888;font-size:12px">
+对齐指标：双手横屏 MAD 4.8%（±10% 内 66.8%）；单手竖屏 MAD 18.4% → 旋转 90° 后 15.0%（相机内参误差 9.9% → 2.1%）。
+详情见各目录 <code>verify/metrics.json</code>。
+</p>
+</body></html>

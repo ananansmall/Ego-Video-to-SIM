@@ -595,6 +595,30 @@ def _look_at_c2w_gl(eye, target, up_world):
     return c2w @ np.diag([1.0, -1.0, -1.0, 1.0])
 
 
+def _backed_off_real_cam(w2c, center, radius, margin=2.6):
+    """保留真实相机的注视方向与横滚, 把机位沿视线退到能框住整个场景的距离.
+
+    ego 手持相机离物体只有 0.2~0.8m (贴脸拍摄), 直接用原始机位渲染出来是
+    物体内部的特写碎片 (实测 2chair stage61 frame0 整屏彩色碎片)。
+    """
+    w2c = np.asarray(w2c, dtype=np.float64)
+    c2w = np.linalg.inv(w2c)
+    z_axis = c2w[:3, 2]          # OpenCV 相机 +z = 注视方向
+    eye = c2w[:3, 3]
+    d = np.asarray(center, dtype=np.float64) - eye
+    n = float(np.linalg.norm(d))
+    if n < 1e-6:
+        d, n = z_axis / max(np.linalg.norm(z_axis), 1e-9), 1.0
+    else:
+        d /= n
+    dist = max(float(radius) * margin, n)
+    up = c2w[:3, 1]
+    if abs(float(np.dot(up, d))) > 0.99:   # up 与视线近平行时换参考轴
+        up = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    return _look_at_c2w_gl(np.asarray(center, dtype=np.float64) - d * dist,
+                           center, up)
+
+
 def _light_pose(direction):
     """DirLight 沿自身 -Z 发光; direction 为光线传播方向 (世界系)。"""
     d = np.asarray(direction, dtype=np.float64)
@@ -697,7 +721,8 @@ def pyrender_render_frames(out_dir, loaded, poses_per_frame, real_cams, K,
                 sc.set_pose(node, T)
             if real_cams:
                 ci = int(round(i * (len(real_cams) - 1) / max(n_frames - 1, 1)))
-                sc.set_pose(cam_node, _obj_c2w_gl(real_cams[ci]["w2c"]))
+                sc.set_pose(cam_node,
+                            _backed_off_real_cam(real_cams[ci]["w2c"], center, radius))
             else:
                 ang = np.radians(-125.0) + 2 * np.pi * i / n_frames
                 elev = np.radians(32.0)

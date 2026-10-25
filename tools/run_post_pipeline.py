@@ -11,7 +11,7 @@
   3. Stage 5.2: SP 空间位置精修 (纯几何)
 
 数据流:
-  final_scene.glb (Stage3产物)
+  final_scene_basic.glb (Stage3产物)
        │
        ├──→ [Stage4] ──→ final_scene_stage4.glb
        │                      │
@@ -20,12 +20,12 @@
        └──→ [Stage5] ──→ final_scene_stage5.glb
 
   GLB 命名按参与的 Stage 决定:
-    - final_scene.glb          = Stage3 (基础)
+    - final_scene_basic.glb          = Stage3 (基础)
     - final_scene_stage4.glb   = Stage4 产物
     - final_scene_stage5.glb   = 仅 Stage5 产物
     - final_scene_stage4_5.glb = Stage4+5 产物
 
-  Stage5 输入: 先找 final_scene_stage4.glb, 没有就用 final_scene.glb
+  Stage5 输入: 先找 final_scene_stage4.glb, 没有就用 final_scene_basic.glb
   重复运行时直接覆盖, 不删除旧文件
 
 坐标系约定:
@@ -137,8 +137,8 @@ def discover_scene_files(scene_dir, run_stage4=False, run_stage5=False):
     """自动发现场景目录中的所有必要文件
 
     GLB 发现策略:
-      - 运行 Stage4 时: 从 final_scene.glb (Stage3产物) 开始
-      - 仅运行 Stage5 时: 先找 final_scene_stage4.glb, 没有就用 final_scene.glb
+      - 运行 Stage4 时: 从 final_scene_basic.glb (Stage3产物) 开始
+      - 仅运行 Stage5 时: 先找 final_scene_stage4.glb, 没有就用 final_scene_basic.glb
       - 不运行任何 Stage: 使用最完整的版本
     """
     result = {'scene_id': os.path.basename(os.path.abspath(scene_dir))}
@@ -160,11 +160,11 @@ def discover_scene_files(scene_dir, run_stage4=False, run_stage5=False):
             break
 
     if run_stage4:
-        glb_priority = ['final_scene.glb']
+        glb_priority = ['final_scene_basic.glb']
     elif run_stage5:
-        glb_priority = ['final_scene_stage4.glb', 'final_scene.glb']
+        glb_priority = ['final_scene_stage4.glb', 'final_scene_basic.glb']
     else:
-        glb_priority = ['final_scene_stage4_5.glb', 'final_scene_stage5.glb', 'final_scene_stage4.glb', 'final_scene.glb']
+        glb_priority = ['final_scene_stage4_5.glb', 'final_scene_stage5.glb', 'final_scene_stage4.glb', 'final_scene_basic.glb']
 
     result['glb_path'] = None
     for glb_name in glb_priority:
@@ -267,7 +267,7 @@ def load_instances(scene_dir, prefer_stage4=False):
                 all_instances = pkl_data
             return all_instances, f"pkl: {os.path.basename(pkl_path)}"
 
-    glb_priority = ['final_scene.glb']
+    glb_priority = ['final_scene_basic.glb']
     glb_path = None
     for name in glb_priority:
         p = os.path.join(scene_dir, name)

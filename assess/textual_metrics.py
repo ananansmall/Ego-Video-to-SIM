@@ -19,7 +19,7 @@ def load_categories_from_json(json_path):
 
 
 def load_categories_from_glb_dir(output_path):
-    glb_path = os.path.join(output_path, "final_scene.glb")
+    glb_path = os.path.join(output_path, "final_scene_stage5.glb")
     if not os.path.exists(glb_path):
         return set()
 

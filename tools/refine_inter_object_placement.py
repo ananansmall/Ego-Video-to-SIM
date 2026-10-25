@@ -155,7 +155,7 @@
   命令行:
 
     python3 -m tools.refine_inter_object_placement \
-        --input_glb outputs/232/final_scene.glb \
+        --input_glb outputs/232/final_scene_basic.glb \
         --relations_json assets/json_configs/232_refined.json \
         --vlm_checkpoint /mnt/data/lza/models/Qwen3.5-9B
 
@@ -717,23 +717,24 @@ def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_off
     bottom_vertices = transformed_mesh.vertices[bottom_verts_mask]
     
     if len(bottom_vertices) > 0:
-        # 对每个底部顶点，投影到支撑物上找 (x,y) 范围内 z <= supported_bottom_z 的点
-        supporting_z_values = []
+        # 对每个底部顶点, 在支撑物上找 (x,y) 邻域内的"局部顶面"高度。
+        # 注意必须取窗口内顶点的 z 最大值 (局部顶面), 而不是"低于物体底面的
+        # 顶点 z 均值" —— 均值会把桌腿/底面/隔板的顶点也算进来, 估计值被拉到
+        # 桌面之下: 悬空物体勉强能落, 已沉入桌面的物体会被越按越深
+        # (2chair 实测: 物体在桌面时该均值 ≈0.3 vs 桌面 0.49)。
+        local_top_zs = []
         for bv in bottom_vertices:
             bx, by = bv[0], bv[1]
-            # 投影：在支撑物顶点中找 (x,y) 接近底部顶点、且 z <= supported_bottom_z 的点
             in_x = np.abs(supporter_vertices[:, 0] - bx) < supported_half_size[0]
             in_y = np.abs(supporter_vertices[:, 1] - by) < supported_half_size[1]
-            below = supporter_vertices[:, 2] <= supported_bottom_z
-            mask = in_x & in_y & below
+            mask = in_x & in_y
             matching_pts = supporter_vertices[mask]
             if len(matching_pts) > 0:
-                # 取这些点的 z 值平均（该投影点对应的支撑面高度）
-                supporting_z_values.append(np.mean(matching_pts[:, 2]))
-        
-        if supporting_z_values:
-            # 所有底部顶点对应的支撑面 z 值取平均 → 支撑面高度
-            supporter_top_z = np.mean(supporting_z_values)
+                local_top_zs.append(float(np.max(matching_pts[:, 2])))
+
+        if local_top_zs:
+            # 各底部顶点的局部顶面取中位数 (对个别悬空窗口离群鲁棒)
+            supporter_top_z = float(np.median(local_top_zs))
         else:
             # fallback: 用 bounding box 顶面
             supporter_top_z = supporter_mesh.bounds[1, 2]
@@ -1711,18 +1712,63 @@ def check_stability(all_instances, refined_relations=None, categories_and_relati
 
         rotation_fixed = False
         if theta_gravity > 1.0 and theta_gravity < 179.0:
+            # ── 扁平物体保护 ──
+            # 为什么需要: Phase1 会把物体 y 轴对齐重力方向 (为落地家具设计)。
+            # 但对**扁平物体** (桌面、床板、平板) 这是灾难 —— 一个 5cm 厚的
+            # 桌面被转 54.1° 后会竖起来, AABB 高度从 0.05m 变成 0.99m。
+            # 而 Phase4 随后会读这个被抬高的 supporter_top 去贴桌上物体,
+            # 把耳机盒推到 1 米高的空中 (实测 wxD: earbud case_0 z +0.9365m,
+            # table_0 顶面 0.050 → 0.987)。
+            # 判据是纯几何、可测量的: 若当前 AABB 已经"扁" (最薄维度 / 最大
+            # 维度 < 0.25) 且旋转后高度会显著增大, 说明该物体的"自然朝向"
+            # 就是躺着的, 不该被扶正。不依赖类别名。
+            _m0 = _get_transformed_mesh(info)
+            _e0 = _m0.bounds[1] - _m0.bounds[0]
+            _mx, _mn = float(max(_e0)), float(min(_e0))
+            _is_flat = _mx > 1e-6 and (_mn / _mx) < 0.35
+            _rot_would_raise = False
+            if _is_flat:
+                # 估算旋转后的高度: 旋转把"最薄维"之一转到 z 轴的极端情形
+                _srt = np.sort(_e0)
+                _worst_h = float(_srt[1])      # 旋转后可能的最大高度
+                if _worst_h > float(_e0[2]) * 1.5 + 0.02:
+                    _rot_would_raise = True
+            if _rot_would_raise:
+                # 只贴地, 不扶正 —— 保持物体原有的躺倒姿态
+                if abs(_m0.bounds[0, 2]) > 0.001:
+                    T[2, 3] -= float(_m0.bounds[0, 2])
+                parts = [f"扁平物体保护: 跳过扶正 (尺寸={_e0.round(3).tolist()}, "
+                         f"theta={theta_gravity:.1f}°), 仅贴地"]
+                if verbose:
+                    print(f"      🔧 Phase1 地面对齐: {category}_{idx} "
+                          f"{', '.join(parts)}", flush=True)
+                continue
             if theta_gravity < 90.0:
                 align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
             else:
-                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, -1]))
+                # 网格 y-up: theta>90° = 物体倒置, 应翻回 +z (180° 翻正)。
+                # 旧实现 align 到 -z 会把倒置物体转成"完美倒置" (wxD chair_0)。
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
             T[:3, :3] = align_matrix[:3, :3] @ T[:3, :3]
             rotation_fixed = True
 
-        # z 轴贴合: 确保底面在 z=0
+        # z 轴贴合: 确保底面在 z=0。
+        # 门限与 sp_refinement 基础精修一致: 沉地/轻微悬空正常贴合;
+        # 但 bottom_z > 0.5m 的高空物体不自动砸地 —— 那几乎总是上游
+        # 关系/位姿错误的信号 (实测 wxD: 被错误翻成 floor 的桌上物体
+        # 从 0.9m 砸到 0), 保留悬空并告警, 让问题可见。
         mesh = _get_transformed_mesh(info)
         bottom_z = mesh.bounds[0, 2]
         z_fixed = False
-        if abs(bottom_z) > 0.001:
+        if bottom_z < -0.001:
+            T[2, 3] -= bottom_z
+            z_fixed = True
+        elif bottom_z > 0.5:
+            if verbose:
+                print(f"      ⚠️ Phase1 贴地: {category}_{idx} bottom_z="
+                      f"{bottom_z:+.3f}m 离地过远 → 不自动砸地 (疑似上游错误)",
+                      flush=True)
+        elif abs(bottom_z) > 0.001:
             T[2, 3] -= bottom_z
             z_fixed = True
 
@@ -1754,7 +1800,9 @@ def check_stability(all_instances, refined_relations=None, categories_and_relati
             if theta_gravity < 90.0:
                 align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
             else:
-                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, -1]))
+                # 网格 y-up: theta>90° = 倒置, 翻回 +z。旧实现 align 到 -z,
+                # 会把半翻倒的物体主动转成"完美倒置"。
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
             T[:3, :3] = align_matrix[:3, :3] @ T[:3, :3]
             rotation_fixed = True
             if verbose:
@@ -2556,7 +2604,9 @@ def _load_instances_from_glb(glb_path):
     g = scene.graph
 
     for node_name in g.nodes_geometry:
-        if node_name == 'world':
+        if node_name == 'world' or node_name.startswith('grid'):
+            # 'world' 是根节点; 'grid_z0' 是 save_final_glb 画的地面网格线,
+            # 当实例加载会被精化并再导出 (旧实现把它当成 "grid" 类实例)。
             continue
         parts = node_name.rsplit('_', 1)
         if len(parts) != 2:
@@ -2638,13 +2688,24 @@ def main():
 
     import pickle
 
+    # pkl 回写追踪: mainv3 的 pkl 是带包装的 blob
+    # {'all_instances': ..., 'all_optimal_frame_ids': ..., ...}。
+    # 记录来源与包装结构, 精修完成后把新位姿写回同一文件 —— 否则 pkl 停留在
+    # 修复前位姿, 下游读 pkl 与 GLB 矛盾 (bug#12 的离线缺口)。
+    _pkl_blob, _pkl_path = None, None
+
     if args.input_glb:
         print(f"\n📂 从 GLB 加载: {args.input_glb}", flush=True)
         all_instances = _load_instances_from_glb(args.input_glb)
     elif args.instances_pkl and os.path.exists(args.instances_pkl):
         print(f"\n📂 从 pickle 加载: {args.instances_pkl}", flush=True)
         with open(args.instances_pkl, 'rb') as f:
-            all_instances = pickle.load(f)
+            _pkl_blob = pickle.load(f)
+        _pkl_path = args.instances_pkl
+        if isinstance(_pkl_blob, dict) and isinstance(_pkl_blob.get('all_instances'), dict):
+            all_instances = _pkl_blob['all_instances']
+        else:
+            all_instances = _pkl_blob
     else:
         print(f"\n❌ 无有效输入文件", flush=True)
         return
@@ -2671,6 +2732,19 @@ def main():
 
     _save_scene_to_glb(all_instances, output_glb)
     print(f"\n💾 保存精修后的场景: {output_glb}", flush=True)
+
+    # ── pkl 回写 (bug#12 离线缺口) ──
+    if _pkl_path is not None:
+        try:
+            if isinstance(_pkl_blob, dict) and isinstance(_pkl_blob.get('all_instances'), dict):
+                _pkl_blob['all_instances'] = all_instances
+                pickle.dump(_pkl_blob, open(_pkl_path, 'wb'))
+            else:
+                pickle.dump(all_instances, open(_pkl_path, 'wb'))
+            print(f"💾 all_instances.pkl 已回写 (与精修后位姿一致): {_pkl_path}", flush=True)
+        except Exception as _e:
+            print(f"⚠️ pkl 回写失败 (GLB 已保存): {_e}", flush=True)
+
     print(f"\n✅ 完成!", flush=True)
 
 

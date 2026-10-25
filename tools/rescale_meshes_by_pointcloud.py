@@ -115,13 +115,17 @@ def estimate_extent(world_points, entries):
     return ext, False, len(stats), n_total, z_max
 
 
-def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
+def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids,
+                          report_path=None):
     """对内存中的 all_instances 做点云尺寸校准 (供 mainv3 管线与独立脚本共用)。
 
     参数:
         output_path: 场景目录 (内含 Stage2 产出的 _pre_dedup_masks.pkl)
         all_instances: {cat: [instance_info, ...]}, instance_info 含 original_mesh/T
         all_optimal_frame_ids: {cat: [frame_id, ...]}
+        report_path: 非空时把 guard 拒绝的实例清单写到该 JSON —— 校准失败会被
+            静默降级 (k=1), 尺度漂移原样带入下游 (实测 wxD 圆凳 0.15m),
+            必须留痕。
     返回:
         校准后的 all_instances (结构不变, 仅 T 被替换; 失败实例 k=1 原样保留)
     异常:
@@ -138,7 +142,9 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
     print("-" * len(hdr))
 
     rescaled = {}
+    _rejections = []   # guard 拒绝清单: {instance, reason} (k=1 原样保留)
     all_after_ratios = []
+    all_after_names = []   # 与 all_after_ratios 配对, 用于收敛检查报出实例名
     for cat, instances in all_instances.items():
         pre_cat = pre["all_masks"].get(cat, [])
         opt_frames = all_optimal_frame_ids.get(cat, [])
@@ -258,10 +264,26 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
             # 垃圾校准 after 出现 1.7~14.8 的偏离 (curtain_6 达 14.84)。
             _K_MIN, _K_MAX = 0.5, 2.0             # 移动物体单轴缩放比合法范围
             _AFTER_MIN, _AFTER_MAX = 0.70, 1.55   # 校准后各轴比值合法范围
+            # 移动物体非最长轴的合法范围 (比静止宽, 见下方 moved 分支注释)
+            _MOVED_AFTER_MIN, _MOVED_AFTER_MAX = 0.5, 2.0
             if moved:
                 # 移动物体只信最长轴, after 在该轴恒=1 无信息量, 改查 k 本身
                 guard_ok = _K_MIN <= k_val <= _K_MAX
                 guard_why = f"移动分支 k={k_val:.2f} 超出 [{_K_MIN},{_K_MAX}]"
+                # 补查非最长轴的 after 比值。
+                # 为什么需要: 均匀缩放下最长轴的 after ≡ 1 是由 k_val 构造出来的
+                # 恒等式, 它会掩盖另外两轴的垃圾缩放 —— 只要 k 落在 [0.5,2.0],
+                # 即便 mesh 与点云在另两轴差 5 倍也照样通过。
+                # 实测 vertical_pick_place_115 bottle: k 合法, 但另两轴 after
+                # 到 4.9, 各向异性残差 3.898, 模型被拉成畸形。
+                # 界比静止物体宽 (静止 [0.70,1.55]): 移动物体只用静止段测量,
+                # 样本少噪声大, 用同样的严界会误杀正常实例。
+                if guard_ok and not is_hybrid:
+                    _lo, _hi = float(after_ratio.min()), float(after_ratio.max())
+                    if not (_MOVED_AFTER_MIN <= _lo and _hi <= _MOVED_AFTER_MAX):
+                        guard_ok = False
+                        guard_why = (f"移动分支非最长轴 after 比值 {fmt(after_ratio)} "
+                                     f"超出 [{_MOVED_AFTER_MIN},{_MOVED_AFTER_MAX}]")
             else:
                 _lo, _hi = float(after_ratio.min()), float(after_ratio.max())
                 guard_ok = (_lo >= _AFTER_MIN and _hi <= _AFTER_MAX)
@@ -275,10 +297,12 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
                     guard_why = f"混合分支 k_z={k_z:.2f} 超出 [{_KZ_MIN},{_KZ_MAX}]"
             if not guard_ok:
                 print(f"{cat}_{ii:<9}[guard] 测量不可信, 保留原始尺寸: {guard_why}")
+                _rejections.append({"instance": f"{cat}_{ii}", "reason": guard_why})
                 rescaled[cat].append({**c, "T": T.copy()})
                 continue
 
             all_after_ratios.append(after_ratio)
+            all_after_names.append(f"{cat}_{ii}")
             print(f"{cat}_{ii:<9}{tag:<6}{n_used:>3}/{n_total:<3}"
                   f"{k_val:>7.3f}  {fmt(ext_mesh / np.maximum(ext_pc, 1e-6)):>20}"
                   f"{fmt(after_ratio):>20}")
@@ -286,11 +310,39 @@ def rescale_all_instances(output_path, all_instances, all_optimal_frame_ids):
             rescaled[cat].append({**c, "T": T_new})
 
     # 校准收敛性检查
+    # 原来这里只打印一个最大偏差数字, 不指名是哪个实例 —— 排查时得回去翻
+    # 逐实例日志逐行比对。改为列出超标实例, 一眼能定位。
     if all_after_ratios:
         arr = np.array(all_after_ratios)
-        ok = bool(np.all(np.abs(arr - 1.0) < 0.10))
-        print(f"\n校准后各轴 ratio 最大偏差: {np.abs(arr - 1.0).max():.3f} "
+        dev = np.abs(arr - 1.0)
+        ok = bool(np.all(dev < 0.10))
+        print(f"\n校准后各轴 ratio 最大偏差: {dev.max():.3f} "
               f"→ {'✅ 收敛 (全部 <0.10)' if ok else '⚠️ 存在各向异性残差 >0.10'}")
+        if not ok:
+            for _nm, _row in zip(all_after_names, arr):
+                _d = np.abs(_row - 1.0)
+                if _d.max() >= 0.10:
+                    _s = "/".join(f"{x:.2f}" for x in _row)
+                    print(f"    ⚠️ {_nm}: after比值 = {_s}  "
+                          f"(最大偏差 {_d.max():.3f})")
+                    _rejections.append({"instance": _nm,
+                                        "reason": f"各向异性残差 {_s} (最大偏差 {_d.max():.3f})"})
+
+    # ── 校准报告落盘: 失败/拒绝的实例必须留痕 ──
+    if report_path:
+        try:
+            import json as _json
+            with open(report_path, "w", encoding="utf-8") as _f:
+                _json.dump({
+                    "status": "ok" if not _rejections else "partial",
+                    "n_rejected": len(_rejections),
+                    "rejected": _rejections,
+                }, _f, ensure_ascii=False, indent=1)
+            if _rejections:
+                print(f"📝 尺寸校准报告: {len(_rejections)} 个实例 guard 拒绝/残差异常 "
+                      f"→ {report_path}", flush=True)
+        except Exception as _e:
+            print(f"⚠️ 尺寸校准报告写入失败: {_e}", flush=True)
     return rescaled
 
 

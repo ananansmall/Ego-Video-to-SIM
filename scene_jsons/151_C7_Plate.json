@@ -1,0 +1,9 @@
+{
+  "table": "supported by floor",
+  "cabinet": "supported by floor",
+  "stool": "supported by floor",
+  "bowl": "supported by other objects",
+  "bottle": "supported by other objects",
+  "cup": "supported by other objects",
+  "scissors": "supported by other objects"
+}

@@ -1118,3 +1118,196 @@ Prompt 里的"例子"（小物件搭在支撑物 A 边缘实拍在 B 上 / 家�
 4. 依赖坑：pyceres 2.6 与 pycolmap 3.11.1 的 ceres 绑定冲突（ImportError: PositiveExponentialManifold），需 pyceres==2.4；PyPI utils3d 0.1.3 无 torch 子模块，需手动装 EasternJournalist/utils3d@d3a577a；moviepy 必须 1.0.3（2.x 无 moviepy.editor）。
 
 运行：`CUDA_VISIBLE_DEVICES=1 python tools/analysis/spa_track_object.py --scene_dir output_v2/7_vggt_omega --obj toy_inst1 --n_pts 600 --depth_win 1`（foundationpose env）。GIF 对比：`fp_vis/toy_inst1/combo_spa.gif` vs `combo_fp_rekey.gif`。
+
+**Q28 补充（跨场景批量对比 + 评测口径说明）**：
+
+评测口径：SAM3 mask 是**伪 GT**（分割模型输出，视频无真实位姿标注）。IoU vs SAM3 衡量"mesh 投影与分割 mask 的一致性"；path 参考轨迹（mask 质心+depth 反投影）逐帧独立、不依赖跟踪器，可作稳定参照但不能当绝对真值。
+
+**SpaTrackerV2 跨 5 场景对比**（spa_track_object.py --n_pts 600 --depth_win 1，未滤波）：
+
+| 场景 | GT path | FP path（误差） | Spa path（误差） | FP IoU | Spa IoU |
+|---|---|---|---|---|---|
+| toy_inst1 | 1.12m | 1.71m（+52%） | **1.09m（-3%）** | **0.529** | 0.479 |
+| 116 CellPhone | 0.74m | 0.72m（-3%） | 0.79m（+7%） | **0.596** | 0.470 |
+| 121 CellPhone | 0.40m | 3.84m（+848%） | 0.20m（-50%） | 0.458 | **0.524** |
+| 2chair-bottle | 1.97m | 1.84m（-7%） | **1.89m（-4%）** | **0.714** | 0.517 |
+| 3chair-bottle | 4.18m | 4.23m（+1%） | 4.37m（+5%） | **0.634** | 0.446 |
+
+**结论**：
+1. **path 稳健性 Spa 占优**：5 场景中 4 个在 ±7% 内；FP 在 toy（+52%）和 121（+848%）灾难性漂移。121 上 Spa IoU（0.524）也反超 FP（0.458）。
+2. **IoU FP 普遍更高**（+0.05~0.20）：FP 的 render-and-compare 逐帧贴合 2D 外观，Spa 的 depth 反投影逐帧噪声（~30mm）压低一致性。
+3. **121 Spa path 只有伪 GT 一半**：逐 10 帧位移对比定位到 GT 在 t=10-30、t=70-90 有快速运动爆发（99/73mm/10帧），Spa 只跟上 35/32mm——快速运动段欠跟踪（遮挡+运动模糊下 2D 轨迹滞后），非伪 GT 虚高（GT 位移分布平滑）。
+4. 3chair Spa 逐帧 step 中位 138mm 偏大（快速场景），IoU 0.446 仍可用。
+5. fp_iou_eval 跨场景评测必须传 --scene_dir（否则读默认 7_vggt_omega 的 _pre_dedup_masks.pkl 报 KeyError）。
+
+GIF：`test/fp_vis/<场景>_bottle_inst0/combo_spa.gif`（红=SAM3 伪GT、绿=Spa 跟踪、橙点=尾迹）。
+
+### Q29: SpaTrackerV2 这个模块的论文介绍一下？
+
+**回答**: 论文《SpatialTrackerV2: 3D Point Tracking Made Easy》，ICCV 2025，arXiv 2507.12462，浙大 CAD&CG + 牛津 VGG + 蚂蚁集团 + Pixelwise AI + 字节 Seed，一作 Yuxi Xiao（前作 SpatialTracker CVPR 2024 的一作）。
+
+**解决什么问题**：3D 点跟踪此前的主流做法是模块化拼接（2D 点跟踪器 + 单目深度 + 相机位姿各用现成模型组合），各模块独立训练、误差累积且速度慢。
+
+**核心方法**：把世界系 3D 运动分解为三个因子——场景几何（深度）、相机自运动（位姿）、逐像素物体运动（点轨迹），用一个前馈网络端到端统一建模。点跟踪/单目深度/相机位姿三任务联合学习，全可微，可跨异构数据（合成序列、带位姿 RGB-D 视频、无标注野生视频）大规模训练。论文口径：比现有 3D 点跟踪方法精度高约 30%，匹配 SOTA 动态 3D 重建精度但快 50 倍。
+
+**两种推理模式**：RGB 模式（模型自己估深度+位姿，内部 BA 自建世界系）；RGBD 模式（接受外部逐帧 depth+内参+w2c 外参，轨迹在外部坐标系下输出）。我们项目走 RGBD 模式，但只取 2D 轨迹输出 `track2d_pred`，用自有 depth 反投影回 VGGT 世界系——模型 RGB 模式自建的 BA 世界系与 VGGT/GT 不同系不同尺度，不能直接用。
+
+**局限（结合 5 场景实测）**：深度反投影 ~30mm/帧噪声压低投影 IoU（比 FP 低 0.05~0.20）；快速运动+遮挡段 2D 轨迹滞后（121 场景 path 只到参照 50%）；训练/评测代码未开源（TODO 中），仅 offline 推理权重。
+
+### Q30: GIF 里红色和绿色的渲染是什么？哪个场景移动比较丰富？
+
+**回答**：combo GIF（[fp_gif_2d3d.py](../tools/analysis/fp_gif_2d3d.py) 生成）图例：
+- **红色轮廓+半透明填充** = SAM3 分割 mask（伪 GT，物体在图像中的真实位置）
+- **绿色轮廓+半透明填充** = 跟踪器（SpaTrackerV2 或 FP）当前位姿把 mesh 投影回图像的位置；红绿贴合=跟踪准，红绿分离=漂移
+- **橙色点** = mesh 投影质心的历史尾迹
+- 右半 3D 面板：青色点云=mesh 当前位姿、橙色线=跟踪轨迹、绿色线=伪 GT 参考轨迹（mask 质心+depth 反投影）、灰色线=相机轨迹、红三角=当前相机
+
+移动最丰富的场景是 **3chair-bottle**（GT path 4.18m，5 场景中最大，且含快速运动段，Spa 逐帧 step 中位 138mm），其次 2chair-bottle（1.97m）。GIF：`test/fp_vis/3chair-bottle_vggt_omega_bottle_inst0/combo_spa.gif`。
+
+### Q31: 3chair-bottle 的 combo_spa.gif 里 3D 面板的世界坐标系是不是不对（不是原始 z 轴）？
+
+**回答**：用户质疑成立一半——**画的世界系确实不是 VGGT 原始轴，但所有数据源彼此一致，真正异常的是 Spa 的旋转锚定**。
+
+**世界系考证**（coordinate_alignment.json + mainv2 log 第 66 行）：
+- 该场景经 `stage1_strict` 重对齐到房间坐标系（地板法向→z 轴，log: `坐标系对齐完成: stage1_strict (R[2,2]=-0.6760)`）。VGGT 原始世界系 = 第一帧相机系（extrinsics_before_first_frame≈单位阵），R[2,2]=-0.676 说明原始 z 轴与重力差 ~132°，完全不是竖直轴。
+- GIF 3D 面板标题 "world (Z-up)" 指对齐后的房间系，非原始轴。
+- **一致性数值验证**：Spa 质心轨迹 vs GT（mask+depth 反投影）全程差 ~2cm（10 帧抽样 0.018~0.023m）；Spa vs FP 终点差 1.4cm；相机 z 0.55~0.90 全部高于物体 z 0.26~0.58。→ 平移/轨迹/相机全部同系，GIF 的空间关系是对的。
+
+**真正的问题：Spa 的 ICP 旋转锚定错误（3chair-bottle 特有）**：
+- Spa P0 相对 mesh 放置姿态旋转 149.3°；FP P0 80.8°；两者 P0 相差 168.9°≈180°（bottle 近旋转对称，必有一方翻倒/放歪）。
+- 长轴朝向三方对比（frame 0）：GT 点云长轴 [-0.29, 0.11, -0.95]（竖直，瓶子立着）；FP 长轴 [-0.04, -0.01, -1.00]，|dot|=0.96 **FP 对**；Spa 长轴 [-0.79, -0.24, 0.56]，|dot|=0.33 **Spa 锚歪 ~70°**。
+- 影响：path（质心）不受影响（对旋转不敏感）；IoU 0.446 被朝向错误压低；3D 面板青色 mesh 姿态不可信。toy_inst1 未暴露（其 ICP fitness=1.00/rmse 13.8mm 干净）。
+- 可修方向：ICP 锚定时用 mask+depth 点云 PCA 长轴约束瓶子类旋转对称物体的旋转自由度，或在多初始值中加选"与 GT 长轴方向最一致"的解。
+
+**Q31 补充（用户再质疑"没有对齐房间坐标系"的实测反驳）**：
+- `extrinsics/0.txt` 与 coordinate_alignment.json 的 `extrinsics_after_first_frame` **逐元素一致**——外参确实是对齐后落盘的
+- point_cloud.ply（2060 万点）RANSAC 最大平面：46% 内点，法向 [-0.001, 0.012, -1.000]，与 z 轴夹角 **0.7°**，平面 z≈0.011（地面在 z≈0）；全场点 z≥-0.05 无穿地，最高 0.85m
+- 可视化验证图：`test/fp_vis/3chair-bottle_vggt_omega_bottle_inst0/world_frame_check.png`（点云按原色 + 地面绿面 + z 轴箭头 + 相机/瓶子轨迹，侧视+俯视）
+- 结论：extrinsics 世界系**确已对齐房间坐标系**（z-up、地面 z≈0）。GIF 中观感"不对应"来自 Spa ICP 旋转锚定错误（mesh 斜躺），不是坐标系问题。
+
+### Q32: stage5.5 能生成新实例吗？是 VLM 分割不出来吗？
+
+**回答**: 不能。stage5.5 只对 stage5 GLB 中已有实例做 XY 平移（set_xy），不增删实例。实例的有无由上游决定：SAM3 分割（stage1-3）决定检出哪些实例，尺寸校准决定像不像，stage5 决定摆哪里。VLM（opencode agent）不做分割，只看对照图做语义摆放。实例缺失（如 141 棋子 9/32）是 SAM3 漏检/去重合并导致，属 stage1 层面问题。
+
+### Q33: output_v3 所有日志问题统计（2026-10-15）
+
+**回答**: 扫描 17 个场景共 33 份 mainv2 日志 + 17 份 stage55 日志，问题分七类：
+
+| 类别 | 场景/次数 | 说明 |
+|---|---|---|
+| A 崩溃（已重跑恢复） | 8/33 份日志 | CUDA OOM+cusolver ×4（111/66/101/11 首跑，GPU 47.4GB 被挤占）；sam3 bpe 词表 FileNotFoundError ×2（118/17，相对路径依赖 cwd）；NameError: pose_history ×1（mainv2 代码 bug）；TensorStorage ×2 |
+| B 跨类去重吞实例 | 几乎全部 | 66: 21→7（-67%）；17: 14→9；118: 11→7；46: 6→4；11: 5→3；141 棋子漏检 9/32 |
+| C 尺寸校准 | 13 处 guard 触发 | guard 拦住 141 棋子×7、68 cloth×3（5.32x!）、14×2、17×1 保留原始尺寸；但 115（残差 3.898）、135（1.067）整体校准未被拦；118 bangle/42 ball 无有效帧校准失败 |
+| D 交互检测 0 个 | 6/17 | 141/14/46/135/64/80（141 实拍明显有棋子交互但漏检） |
+| E Stage4/6 全跳过 | 17/17 | --enable_stage4/6 未开 → 无纹理无材质（顶点色），"建模没生成全"观感的直接原因之一 |
+| F placement_strategies.json 缺失 | 8/17 | on_top 重贴无法区分 inside，可能错贴支撑物顶面 |
+| G stage55 agent ok=False | 6/17 | 42 Agnes 限流；17 引用不存在的 optimal_frames 图（fish/tomato_inst0_frame47.jpg）；其余超时/轮数耗尽（但 moves 均已执行，14/17 碰撞 1/5→0 清零） |
+
+结论：效果差的三主因是 B（实例丢失）> E（无纹理）> C（校准拉爆/漏拦）；崩溃类 A 已恢复不是当前瓶颈。
+
+### Q34: Mira-Scene 与现有 RAS（ReplicateAnyScene 管线）的区别？效果如何？能直接跑吗？
+
+**回答**: Mira-Scene（HKU + VAST，arXiv:2609.23796，2026-09）是**单图输入的生成式组合场景重建**框架，核心是 Canonical Coordinate Map（CCM）：扩散 Transformer 联合预测每个物体的 mesh + 像素级 canonical 坐标图，与单目深度/点云（PCM）做鲁棒几何对齐得到物体位姿，再经重力/支撑感知摆放，最后合成环境全景图。
+
+与 RAS 的核心区别：
+
+| 维度 | RAS（现有管线） | Mira-Scene |
+|---|---|---|
+| 输入 | 多帧视频（VGGT 多视重建 + SAM3 分割） | 单张图像（生成式补全未见部分） |
+| 布局来源 | 直接从重建/交互检测测得（质心/重叠法动态判定） | CCM 稠密对应 → 几何对齐 |
+| 资产 | 观测重建 mesh（外观与实拍一致，受 VGGT 漂移/校准问题影响） | SAM3D/TRELLIS.2 生成的 mesh（细节完整但可能与真实物体有差异） |
+| 动态信息 | 有（交互检测、pick/place 帧） | 无（单图静态） |
+| 尺度 | 需点云校准（已知坑多） | 有界 canonical 空间，单目深度定尺度 |
+| 输出 | all_instances.pkl / GLB / 关系图 → SAPIEN | 场景 GLB + scene graph + 环境图，官方演示 Blender/Isaac 导入 |
+
+效果（官方评测 vs SAM3D，仅用 80k 开源数据）：3D-IoU 0.727 vs 0.520（相对提升 39.8%）、2D-IoU 0.783 vs 0.672、CD 0.021、ADD-S 0.031，布局精度显著领先；但 CD/EMD 与 SAM3D 接近（EMD 0.169 vs 0.163 略差）。
+
+能否直接跑：**代码、两阶段 checkpoint（HF: Yang-Tian/Mira-Scene）、数据集均全开源（MIT），可以跑但部署不轻量**——
+1. 各阶段 Python/PyTorch/CUDA 环境互不兼容，需建多个 conda 环境（segmentation/depth/ccm/mesh/scene）并在 local.yaml 配解释器路径；
+2. 依赖外部仓库与权重（SAM3、MoGe/MoGe-2/PPD、SAM3D 或 TRELLIS.2）；
+3. environment 阶段需图像生成 API key（可用免费方案替代或跳过该阶段）；
+4. 官方推荐先过 Web UI 交互式审核分割/scene graph 再跑后续阶段，支持断点续跑和多卡分片。
+与 RAS 定位互补：Mira-Scene 适合单图快速复现场景布局（无动态），RAS 适合视频驱动的带交互复刻；可考虑用 Mira-Scene 的 CCM 布局思想对照 RAS stage5 的摆放精度。
+
+### Q35: Mira-Scene 的尺度怎么解决？还需要像 RAS 那样做很多尺度校准吗？API key 是什么、在哪一步用？
+
+**回答**:
+
+**1. 尺度问题**：Mira-Scene 不需要 RAS 那套逐物体点云校准（k 因子、底面中心锚点、自校验 guard 等）。它的尺度链路是：
+- 场景整体尺度由**单目深度模型统一给出**（depth 阶段：PPD / MoGe-2 / DepthAnything，输出 camera-space 点云 PCM）；
+- 物体几何在**有界 canonical 空间**内预测（CCM），位姿通过 canonical↔scene 稠密对应做鲁棒几何对齐恢复，避开了 RAS 里"稀疏无界位姿回归难学"的问题，也就没有逐物体缩放这一步。
+
+但要注意 example.yaml 默认 `depth: {method: ppd, enable_metric: false}`——即默认用**相对深度**，只有相对/拓扑正确的布局；若要真实米制尺度（物理仿真必需），需开 `enable_metric: true` 或换 metric 模型，且单目深度的绝对尺度误差仍存在（这正是 RAS 校准要解决的问题，Mira 只是把它简化为"一个全局尺度"而非"每物体一个尺度"）。
+
+**2. API key**：`local.yaml` 顶部的 `api.base_url: https://lumina.tripo3d.com/v1` 是 VAST 自家的 Lumina 图像生成 API。使用位置：
+- **environment 阶段**（必需）：从单图外推生成等距柱状环境全景图，调用该图像生成 API；
+- **segmentation 阶段**（也走 API）：配置里 `vlm_model: gemini-2.5-pro`，物体描述/scene graph 由 VLM 生成，同样需要 API key。
+
+按免费方案：environment 全景图可以跳过（不影响 scene 几何输出）；segmentation 的 VLM 可换成已有的本地/免费方案或手动标注。
+
+### Q36: Mira-Scene 完全开源吗？它的 prompt 能否借鉴到现有 RAS？
+
+**回答**: 开源（MIT License，Copyright 2026 VAST-AI-Research），代码、checkpoint、数据集、**全部 prompt 文件**都随仓库公开。仓库已下载到 `/mnt/data_8THDD/lza/tmp/Mira-Scene`（约 60MB，tar 包方式）。
+
+**可直接借鉴的 prompt 资产**（位于 `infer_scripts/segmentation/`）：
+
+| 文件 | 内容 | 对应 RAS 痛点 |
+|---|---|---|
+| `automatic/prompts/list_objects_major_v5.txt` | 房间级物体列举（给 SAM3 文本 grounding 用）16 行规则：合并规则（盆栽+盆=一体、床品归入床、同墙橱柜=一套）、遮挡描述规范、禁止精确数量词、border 裁剪不列 | stage1 跨类去重吞实例（66 场景 21→7）、141 棋子 9/32 的实例列举质量 |
+| `automatic/prompts/list_objects_tabletop_v1.txt` | 桌面小物体专用模式：容器与内容物分开列（"白色笔筒"+"笔筒里的木笔"）、邻接不合并、小物体需大到能出稳定 mask | 小物体（avg_mask_area<1000 质心方法）分割，桌面密集场景 |
+| `automatic/prompts/missing_objects_major_v2.txt` | 漏检批判器：已检出物体涂 cyan 后让 VLM 找漏掉的大物体，输出 NONE 或逐实例列表 | 可直接移植为 stage1 后的漏检 critic 环节 |
+| `automatic/prompts/agent/system_prompt.txt`（242 行） | agentic SAM3 grounding 循环：segment_phrase→examine_each_mask→select_masks 多轮工具调用，含 18 条 grounding 词规则（勿用数字/OCR 词、先一般后筛选、勿重复同一 prompt 等） | stage1 agentic 分割升级方向 |
+| `interactive/scene_graph.py` L38 | scene graph 一句话 prompt：输出 JSON（name/caption/direct_supporter/relation∈{rests_on,fixed_to,hangs_from}/motion∈{fixed,dynamic}/confidence） | 与 RAS relations_scene_graph.json 结构高度相似，relation 词表可直接对齐 |
+
+**借鉴建议**：优先移植 list_objects_major_v5 的列举规则 + missing_objects critic（改动小、收益直接指向实例丢失问题）；tabletop 模式适合桌面小物体场景；242 行 agentic prompt 工程量大，作为 stage1 长期升级参考。注意这些 prompt 是为 SAM3 文本 grounding + gemini-2.5-pro 设计的，移植到 RAS 需按自有 VLM/SAM3 版本微调。
+
+### Q37: Mira-Scene 的 prompt 很大吗？RAS 目前的 prompt 问题在哪、怎么改？
+
+**回答**:
+
+**大小**：可借鉴的 prompt 都很小——missing_objects critic 2.1KB、tabletop 2.4KB、list_objects 3.1KB、scene_graph ~0.6KB，只有 agentic grounding 那份 66KB（不必搬）。单个 prompt 几 KB 对 VLM 上下文无压力。
+
+**RAS 现有 prompt 的诊断**（`tools/generate_scene_json_stage1.py`）：
+- `VLM_DETECT_PROMPT`（L149-160）只有 9 行规则，且 **"List each object type once per frame" 这条规则直接把同类别多实例合并成一条**——这正是 Q33 统计出的实例坍缩问题（66 场景 21→7、141 棋子 9/32）的 prompt 层根因。另外缺少：合并规则（盆栽+盆、床品归床）、位置限定词消歧、遮挡描述、边界裁剪处理、颜色/材质命名。
+- `_build_relationship_prompt`（L213-252）：已打 has_floor 兜底补丁，但只传物体名列表、不传逐物体高亮图，VLM 无法区分同类别多个实例；且只有 4 种关系、无 direct_supporter 指向和 confidence。
+
+**改法**：
+1. 检测 prompt 换成 Mira list_objects_major_v5 风格：每个物理实例一条 + 位置限定词，禁止数量词，加合并/遮挡/border 规则；
+2. 检测后加一道 missing_objects critic（已检出物体涂 cyan 后找漏检）；
+3. 关系 prompt 借鉴 Mira scene_graph：让 VLM 输出 direct_supporter（物体列表下标）+ relation + confidence，一次调用同时拿到支撑对象身份，减少后续 refine_other_objects_relations 的纠错压力。
+
+### Q38: SAM3 本来就会把同类所有实例都分出来（可能有重复），为什么还需要 VLM？
+
+**回答**: 需要分工看清楚（`src/object_segmentation.py` + `tools/generate_scene_json_stage1.py`）：
+- **SAM3 是条件分割器**：`set_text_prompt(类别名词)` → 分出该类别所有实例 mask 并视频跟踪（segment_and_track），floor/wall 也是文本 prompt。它**不会自己发现场景里有哪些类别**——没人给词它就不知道分什么。VLM 的不可替代职责是①类别发现（VLM_DETECT_PROMPT 列物体名）②关系判断 ③场景类型/地面参考点。
+- Mira-Scene 同样是这个分工：SAM3 的 grounding 词全部来自 VLM 列举，它的 agentic 循环本质也是 VLM 驱动的多轮 segment_phrase。所以 VLM 去不掉，只能改它的产出方式。
+- "重复分割"不是主要问题：`_deduplicate_masks`(IoU 0.5) 已处理重叠 mask。**真正吞实例的是 3D 去重层**：`CENTROID_DIST_THRESHOLD = 0.15m` 对桌面小物体是灾难——棋子间距仅 2~4cm，全帧质心聚合后 32 个棋子会全被并成 1 个聚类（141 场景 9/32 的另一半根因）。
+- 结论：VLM prompt 要改（每实例一条 + 限定词），但**去重阈值必须按场景自适应**（tabletop 场景 0.15m → 0.03~0.05m 或按物体中位尺寸缩放），两处一起改才有效果；单独改 prompt 而不动去重，实例还是会被吞。
+
+### Q39: RAS 是否已落伍？结合 2025-2026 新工作调研改进方向（重点：首帧生成路线、手部遮挡）
+
+**回答**: 用户判断基本正确——"生成式资产替换观测重建"正是 2025-2026 的主流转向。调研结论分三层：
+
+**一、此前建议汇总（prompt/去重层，低成本高确定性）**
+1. VLM_DETECT_PROMPT 重写：删掉 "List each object type once per frame"（实例坍缩根因），改为每物理实例一条 + 位置限定词消歧 + 禁止数量词 + 合并/遮挡/border 规则（照 Mira list_objects_major_v5 风格）；
+2. 加 missing_objects critic（已检出涂 cyan 后找漏检）；
+3. 关系 prompt 加 direct_supporter（下标指向）+ confidence，一次调用拿到支撑对象身份；
+4. 去重阈值自适应：CENTROID_DIST_THRESHOLD 0.15m 对桌面小物体改为 0.03~0.05m 或按物体中位尺寸缩放；
+5. scene_graph prompt 借鉴 Mira 词表（rests_on/fixed_to/hangs_from）。
+
+**二、手部遮挡 + 首帧生成路线（用户的直觉被多篇 2025-2026 工作验证）**
+- **Zero-shot In-Scene Object Manipulation Reconstruction**（arXiv 2512.19684）：未遮挡走 Hi3DGen、遮挡走 Amodal3R 生成 mesh，再 FoundationPose 逐帧对齐 6D 位姿——与 RAS 痛点完全对症，可直接抄方案；
+- **ForeHOI**（CVPR 2026，arXiv 2602.06226）：前馈"2D mask 补绘+3D 形状补全"，专治手持物体重度遮挡，比优化法快约 100 倍，代码+数据开源；
+- **SimRecon**（arXiv 2603.02133，清华+Galbot）：Perception-Generation-Simulation 三级管线，逐实例用生成补全替代纯重建——与 RAS 定位最接近的最新管线；
+- **Subsecond 3D Mesh Generation for Robot Manipulation**（arXiv 2512.24428）：分割+加速生成+FPFH/RANSAC/ICP 配准到 RGB-D 点云恢复尺度位姿，<1s，接物理仿真——对齐方案可整体移植；
+- **Scalable Real2Sim**（IROS 2025，MIT，代码开源）：alpha 透明渲染把手与物体几何分离；
+- **EgoHOS**（arXiv 2208.03826）：手物精细分割，可用于自动挑"无手干净帧"作为生成输入；
+- 资产生成后端：TRELLIS.2（MIT，16-24GB，512³ 约 3s）、SAM 3D Objects（Meta，遮挡鲁棒训练，license 商用受限待验证）、Hunyuan3D 2.x（Apache-2.0，低至 6GB 显存）。
+
+**三、其他组件级改进（可选）**
+- 交互/运动分割：Segment Any Motion（arXiv 2503.22268，代码开源）——用 VGGT 轨迹点做分割 prompt，替代质心/重叠启发式，与现有 VGGT 栈天然兼容；
+- 手物联合位姿：WHOLE（arXiv 2602.22209）、HaWoR（已用过）；
+- 跟踪漂移：TwinTrack（arXiv 2505.22882）用物理校验修正跟踪；
+- 布局对齐思想：Mira-Scene CCM（Q34）。
+
+**建议路线**：近期先做一（prompt+去重）；中期做"资产层替换"——EgoHOS 选无手帧 → TRELLIS.2/Hunyuan3D 生成 → mask+depth ICP 对齐到 VGGT 帧（抄 Subsecond 方案）→ 失败回退现有多帧重建，可同时解决手遮挡、无纹理（stage4/6）、部分尺度问题；远期再看 CCM 布局与 Segment Any Motion 交互检测。

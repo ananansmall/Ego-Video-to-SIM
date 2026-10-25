@@ -33,9 +33,10 @@ ReplicateAnyScene V2 — 完整自动化流水线
            输出: materials.json + materials_debug.json
 
 GLB 文件说明 (按启用的 Stage 决定文件名):
-  final_scene.glb          = Stage3 基础精修产物 (固定起点, 不再更改)
+  final_scene_basic.glb     = Stage3 基础精修产物 (固定起点, 供 Stage4 / run_post_pipeline 使用)
+                              注意: 这不是最终产物! 最终产物见 final_scene_stage5.glb
   final_scene_stage4.glb   = Stage4 产物 (视觉-空间对齐后)
-  final_scene_stage5.glb   = 仅 Stage5 产物 (语义精修后)
+  final_scene_stage5.glb   = 仅 Stage5 产物 (语义精修后) ← 通常这就是最终产物
   final_scene_stage4_5.glb = Stage4+5 产物 (全部后处理后)
   all_instances.pkl        = 基础精修后的实例数据 (供 run_post_pipeline.py 独立调用stage4/5)
 
@@ -125,7 +126,8 @@ GLB 文件说明 (按启用的 Stage 决定文件名):
   ────────────────────────────────────────────────────────────
   mainv2 与 run_post_pipeline 的关系:
   ────────────────────────────────────────────────────────────
-  mainv2:          Stage1 → Stage2 → Stage3 → 基础精修 → [Stage4] → [Stage5] → final_scene.glb
+  mainv2:          Stage1 → Stage2 → Stage3 → 基础精修 → [Stage4] → [Stage5] → final_scene_stage5.glb
+                                                                             (或 stage4_5)
   run_post_pipeline:                                      [Stage4] → [Stage5] → final_scene_stageX.glb
 
   mainv2 是完整流水线 (从视频到GLB)
@@ -138,7 +140,8 @@ GLB 文件说明 (按启用的 Stage 决定文件名):
   ├── scene_{scene}_stage1_refined.json  # Stage5.1: 细化后的关系JSON
   ├── final_relations.json               # 最终关系JSON
   ├── final_scene_base.glb               # 基础精修后固定起点 (不再更改)
-  ├── final_scene.glb                    # 最终场景GLB (始终为最新结果)
+  ├── final_scene_basic.glb              # 基础精修产物 (固定起点, 非最终产物!)
+  ├── final_scene_stage5.glb             # 最终场景GLB (语义精修后)
   ├── all_instances.pkl                  # 实例数据 (供后处理管线使用)
   ├── point_cloud.ply                    # 3D重建点云
   ├── intrinsic.txt                      # 相机内参
@@ -251,6 +254,10 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=12, v
         "--max_frames", str(max_frames_stage1),
         "--vggt_max_frames", str(vggt_max_frames),
     ]
+    # Stage1 检测走 opencode 视觉模型 (对纯色背景/小物体更稳, 见
+    # tools/generate_scene_json_stage1.py 里 API 模式的实测对比)
+    if getattr(args, 'use_api_vlm', False):
+        cmd.append("--use_api_vlm")
 
     print(f"   命令: {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, cwd=REPO_ROOT)
@@ -537,10 +544,97 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
     session_id = response["session_id"]
 
     # 逐类别分割跟踪 + 类内去重
+    # box 兜底: 文本提示切不出 mask 的类别 (全库 30 类) 改用 6.8 出的框重新提示。
+    # 只对"文本产出 0"的类别生效, 能切出的完全不受影响; provider 任何失败都返回
+    # 空并静默退化。用 --no_vlm_box_fallback 可整体关闭。
+    _box_provider = None
+    if _VLM_BOX_FALLBACK:
+        try:
+            from src.vlm_box_provider import VLMBoxProvider
+            _kf0 = os.path.join(output_path, 'color', '00000.png')
+            if not os.path.isfile(_kf0):
+                _cands = sorted(os.listdir(os.path.join(output_path, 'color')))
+                _kf0 = os.path.join(output_path, 'color', _cands[0]) if _cands else None
+            if _kf0:
+                _box_provider = VLMBoxProvider(_kf0, scene_dir=output_path,
+                                               verbose=True)
+                print(f"   [Stage 2] box 兜底已启用: {os.path.basename(_kf0)}", flush=True)
+        except Exception as _e:
+            print(f"   [Stage 2] box 兜底初始化失败 (不影响主流程): {_e}", flush=True)
+            _box_provider = None
+
+    # 候选播种帧: 从 Stage1 的 keyframes_metadata.json 读"每帧可见哪些类别",
+    # 作为 SAM3 多播种重试的候选。
+    # 为什么需要: SAM3 视频跟踪从播种帧开始传播, 小物体在早期会被跟丢 ——
+    # 实测 weixin 的 button 只在帧 64~79 产出 mask (物体从第 0 帧就清晰可见),
+    # 导致首帧取到 64, 拿到的是手持高度而非桌上静止位置。
+    # 这里把"VLM 在该帧看到过这个类别"的帧作为候选播种帧。
+    _frame_vis = {}
+    _meta_p = os.path.join(output_path, 'keyframes', 'keyframes_metadata.json')
+    if os.path.isfile(_meta_p):
+        try:
+            with open(_meta_p, encoding='utf-8') as _f:
+                _frame_vis = json.load(_f).get('frame_visibility', {}) or {}
+        except Exception as _e:
+            print(f"   ⚠️ 读取 keyframes_metadata.json 失败: {_e}", flush=True)
+    _seed_by_cat = {}
+    for _fi, _names in _frame_vis.items():
+        try:
+            _fi_i = int(_fi)
+        except Exception:
+            continue
+        for _nm in _names:
+            _seed_by_cat.setdefault(_nm, []).append(_fi_i)
+
+    # ── 播种帧索引空间转换 (原视频帧号 → VGGT 槽位) ──
+    # keyframes_metadata.json 的 frame_visibility 键是"原视频帧号"
+    # (Stage1 关键帧按原视频帧号落盘), 而 color/ 与 VGGT 数组按采样槽位
+    # (0..n_frames_rgb-1) 编号, load_video_frames 用 linspace(0, total-1, n)
+    # 抽帧。直接当槽位用会: ≥n_rgb 的帧号越界丢弃, <n_rgb 的错位索引
+    # (bug#1: 300帧抽80 时关键帧全落在前 26%, VLM 从没见过椅子)。
+    if _seed_by_cat and total_video_frames > n_frames_rgb > 1:
+        def _vid2slot(_vf):
+            return int(min(n_frames_rgb - 1,
+                           max(0, round(_vf * (n_frames_rgb - 1)
+                                        / max(total_video_frames - 1, 1)))))
+        _mapped_by_cat = {}
+        for _nm, _fs in _seed_by_cat.items():
+            _slots = sorted({_vid2slot(_f) for _f in _fs})
+            _mapped_by_cat[_nm] = _slots
+            print(f"   🔁 播种帧索引转换 ({_nm}): 原视频帧号{sorted(_fs)[:8]}... "
+                  f"→ VGGT槽位{_slots[:8]}... (共{len(_slots)}个)", flush=True)
+        _seed_by_cat = _mapped_by_cat
+
+    # 没有元数据 (例如用 --scene_json 跳过 Stage1) 时, 退化成按视频长度
+    # 均匀采样候选播种帧。否则 _seed_frames 为空 → 多播种重试不执行 →
+    # box 兜底只能播第 0 帧, 而实测小物体在第 0 帧常常切不出
+    # (weixin 的帧 0/4/12 全失败, 帧 31/35 才成功)。
+    if not _seed_by_cat:
+        try:
+            _n = len(os.listdir(os.path.join(output_path, 'color')))
+        except Exception:
+            _n = 0
+        if _n > 1:
+            _step = max(1, _n // 16)
+            _uni = sorted(set(list(range(0, _n, _step)) + [_n - 1]))
+            for _cat in detected_categories:
+                _seed_by_cat[_cat] = _uni
+            print(f"   ℹ️ 无关键帧元数据, 候选播种帧退化为均匀采样: {_uni}",
+                  flush=True)
+
     all_masks = {}
     for category in detected_categories:
         print(f"   分割跟踪: {category}", flush=True)
-        category_masks = segment_and_track(category, sam3_video_model, session_id)
+        segment_and_track._seed_frames = sorted(_seed_by_cat.get(category, []))
+        # box 兜底造矩形 mask 时需要 VGGT 帧尺寸 (world_points 的 H,W)。
+        # 传错尺寸会被下游按形状不匹配丢掉 (实测 wx7)。
+        _wp_shape = vggt_prediction_results['world_points'].shape
+        _frame_hw = (int(_wp_shape[-3]), int(_wp_shape[-2])) if len(_wp_shape) >= 3 else None
+        segment_and_track._frame_hw = _frame_hw
+        segment_and_track._world_points = vggt_prediction_results['world_points']
+        category_masks = segment_and_track(category, sam3_video_model, session_id,
+                                           box_provider=_box_provider)
+        segment_and_track._seed_frames = None
         deduplicated_category_masks = self_category_deduplicate(
             category_masks,
             vggt_prediction_results['world_points'],
@@ -732,14 +826,130 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
         print(f"   ⚠️ 动态检测状态落盘失败: {_e2}", flush=True)
     print(f"   ⏱️ Stage 3.7 耗时: {time.time() - _t37:.1f}s", flush=True)
 
-    # 在子进程中生成3D资产（避免CUDA内存冲突）
-    all_instances = generate_3d_asset_in_subprocess(
-        deduplicated_all_masks,
-        all_optimal_frame_ids,
-        vggt_prediction_results['colors'],
-        vggt_prediction_results['world_points'],
-        vggt_prediction_results['extrinsics'],
-    )
+    # ── 动态 / 静态实例拆分 ──
+    # 只有"被抓取或操作"的实例必须走 SAM3D (需要完整形状支撑后续位姿与仿真);
+    # 其余静态实例用 VGGT 点云直接构网 (见 src/static_mesh.py):
+    #   ① 尺度天然正确 —— 点云本身是米制世界坐标, 不需要后面的逐物体校准+guard
+    #   ② 快 2~3 个数量级 (凸包 2 万点 8ms, SAM3D 单实例 30~60s)
+    #   ③ 不占 GPU, 不再 OOM
+    # 代价: 点云构网不保证闭合/完整 (遮挡、薄壁、反光可能破面), 所以只对静态
+    # 实例启用。--all_sam3d 可关掉这条快速路径 (调试用)。
+    # 分流规则:
+    #   动态(被抓取)      → SAM3D (需要完整形状支撑位姿与仿真)
+    #   静态且是大平面     → 点云构网 (又快又准, 尺度天然正确)
+    #   静态但有结构      → SAM3D (点云构网会丢结构, 实测把带腿桌子压成平板)
+    # 注意: 不按类别名(table/desk)硬分 —— 实测那样会把有桌腿的桌子也压成平板。
+    from src.static_mesh import is_planar_pointcloud
+    _wp0 = vggt_prediction_results['world_points']
+    _dyn_idx, _pc_idx = {}, {}
+    for _cat, _masks in deduplicated_all_masks.items():
+        keep_d, keep_p = [], []
+        for _i, _imlist in enumerate(_masks):
+            _nm = f"{_cat}_inst{_i}"
+            if any(_it.get('instance_name') == _nm for _it in (_pp_interactions or [])):
+                keep_d.append(_i)
+                continue
+            # 静态: 汇总该实例所有可见帧的点云, 判是否为大平面
+            _pts = []
+            for _im in _imlist:
+                if _im['frame_id'] < len(_wp0):
+                    _p = _wp0[_im['frame_id']][_im['mask']]
+                    if _p is not None and len(_p):
+                        _pts.append(_p)
+            _pts = np.concatenate(_pts, axis=0) if _pts else np.zeros((0, 3))
+            if is_planar_pointcloud(_pts):
+                keep_p.append(_i)
+            else:
+                keep_d.append(_i)
+        _dyn_idx[_cat] = keep_d
+        _pc_idx[_cat] = keep_p
+    # ── 平面分流可见化 ──
+    # 走点云构网的实例如果是桌/柜类, 几乎必然是"桌面/侧板退化重建":
+    # 桌腿在分割或动态去除中丢失, 点云只剩顶面薄壳 (实测 wxD table_0
+    # 1.13x0.90x0.05 无腿薄板)。不改变分流决策 (几何判据仍是权威),
+    # 只把后果显式落盘, 供下游与人工检查。
+    _TABLE_LIKE = {"table", "desk", "nightstand", "bed", "shelf", "cabinet"}
+    _planar_flags = []
+    for _cat, _ids in _pc_idx.items():
+        for _i in _ids:
+            _table_like = _cat.lower() in _TABLE_LIKE
+            _planar_flags.append({
+                "instance": f"{_cat}_inst{_i}", "category": _cat,
+                "path": "pointcloud_planar",
+                "table_like": _table_like,
+                "note": ("桌/柜类走点云构网: 支撑结构(腿)大概率未重建, 产物为薄板"
+                         if _table_like else ""),
+            })
+            if _table_like:
+                print(f"   ⚠️ {_cat}_inst{_i} 是桌/柜类但点云判为大平面 → 点云构网, "
+                      f"支撑结构(腿)大概率丢失, 产物将是薄板", flush=True)
+    try:
+        with open(os.path.join(output_path, "planar_flags.json"), "w", encoding="utf-8") as _f:
+            json.dump(_planar_flags, _f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    _n_dyn = sum(len(v) for v in _dyn_idx.values())
+    _n_pc = sum(len(v) for v in _pc_idx.values())
+    _n_tot = sum(len(v) for v in deduplicated_all_masks.values())
+    if getattr(args, 'all_sam3d', False) or _n_pc == 0:
+        all_instances = generate_3d_asset_in_subprocess(
+            deduplicated_all_masks, all_optimal_frame_ids,
+            vggt_prediction_results['colors'],
+            vggt_prediction_results['world_points'],
+            vggt_prediction_results['extrinsics'])
+        print(f"   🧊 3D 资产: SAM3D 生成全部 {_n_tot} 个实例"
+              f"{' (无大平面可走点云)' if not getattr(args, 'all_sam3d', False) else ''}",
+              flush=True)
+    else:
+        print(f"   ⚡ 分流: {_n_dyn}/{_n_tot} 走 SAM3D (动态+有结构), "
+              f"{_n_pc}/{_n_tot} 是大平面改用点云构网", flush=True)
+        all_instances = generate_3d_asset_in_subprocess(
+            deduplicated_all_masks, all_optimal_frame_ids,
+            vggt_prediction_results['colors'],
+            vggt_prediction_results['world_points'],
+            vggt_prediction_results['extrinsics'],
+            only_instances=_dyn_idx)
+
+        # 静态实例: 点云构网补回。
+        # 必须按**原始索引**归位: SAM3D 只返回动态实例 (过滤后的顺序), 若把静态
+        # 实例直接 append 到末尾, all_instances[cat] 就变成"动态在前、静态在后",
+        # 与 deduplicated_all_masks[cat] (原始顺序) 错位 —— 下游
+        # zip(category_masks, all_instances[cat]) 会把 A 的 mask 配到 B 的 mesh 上。
+        # 因此这里重建一份按原始索引排列的列表。
+        from src.static_mesh import build_mesh_from_pointcloud, build_static_instance
+        _wp = vggt_prediction_results['world_points']
+        _n_static_done = _n_static_fail = 0
+        for _cat, _masks in deduplicated_all_masks.items():
+            _dyn_list = all_instances.get(_cat, []) or []
+            _full = [None] * len(_masks)
+            # 动态: SAM3D 返回值按过滤后顺序排列, 逐个放回原始下标
+            for _k, _oi in enumerate(_dyn_idx.get(_cat, [])):
+                if _k < len(_dyn_list):
+                    _full[_oi] = _dyn_list[_k]
+            # 大平面静态实例: 点云构网
+            for _i, _imlist in enumerate(_masks):
+                if _i not in set(_pc_idx.get(_cat, [])):
+                    continue
+                _pts = []
+                for _im in _imlist:
+                    _fid = _im['frame_id']
+                    if _fid >= len(_wp):
+                        continue
+                    _p = _wp[_fid][_im['mask']]
+                    if _p is not None and len(_p):
+                        _pts.append(_p)
+                _pts = np.concatenate(_pts, axis=0) if _pts else np.zeros((0, 3))
+                _tm = build_mesh_from_pointcloud(_pts)
+                if _tm is None:
+                    _n_static_fail += 1
+                    print(f"      ⚠️ {_cat}_{_i}: 点云构网失败 "
+                          f"({len(_pts)} 点), 退回 SAM3D", flush=True)
+                    continue
+                _full[_i] = build_static_instance(_tm, _cat, _i)
+                _n_static_done += 1
+            all_instances[_cat] = [x for x in _full if x is not None]
+        print(f"   ⚡ 静态实例点云构网: {_n_static_done} 成功, "
+              f"{_n_static_fail} 失败(已剔除)", flush=True)
 
     # 动态物体: 位置调整到首次可见帧 (用最大帧生成mesh, 但位置摆在每个实例初始被SAM3检测到的位置)
     traj_info = {}
@@ -780,27 +990,47 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
             if len(centroid_data) < 2:
                 continue
 
-            # ── 初始帧 = 抓取前的静止位置 ──
-            # 原实现拿 first_visible_frame_id (首次被 SAM3 检测到的帧) 当"初始位置",
-            # 但那不等价: 物体可能在视频开头就已经在动 (比如一开始手就拿着它),
-            # 那种情况下"首次可见帧"里的位置不是静止位置, 渲染出来就很奇怪。
-            # Stage 3.7 已经给出了抓取时刻 pick_frame, 所以初始帧应当取 pick 帧
-            # 之前、该实例仍然可见的最后一帧。
-            # 注意两个帧空间: pick_frame 在原始视频帧空间, 而 centroid_data 的 fid
-            # 在 RGB 帧空间, 需要除以 frame_ratio 换算。
-            initial_frame_id = first_visible_frame_id
+            # ── 初始帧选择 ──
+            # 语义: 动态物体"被操作前"的静止位置 (预抓取状态), 场景应呈现
+            # 操作开始前的状态。
+            #
+            # 首次可见帧 ≠ 抓取前: 分割经常在物体被拿起、变大、贴近相机之后
+            # 才成功 (实测 weixin button 首个 mask 在帧 64 —— 手持空中), 直接用
+            # 首帧会把物体摆在半空。这里用三级策略:
+            #   ① Stage 3.7 有该实例的 pick 事件 → 取 pick 之前 (换算到 VGGT
+            #      槽位) 局部运动最小的可见帧 (抓取前最稳的一帧);
+            #   ② pick 前没有任何可见帧 (mask 全部出现在拿起之后, 即一直在手
+            #      里) → 取最后一次 place 事件最近的可见帧 (放置后静止位置),
+            #      并显式告警 —— 初始状态在视频里根本不存在;
+            #   ③ 没有 Stage 3.7 结果 → 首次可见帧 (确定性兜底, 原行为)。
             _pp_inst = [i for i in _pp_interactions
                         if i['instance_name'] == f"{category}_inst{inst_idx}"]
+            _ratio = float((pick_place_result or {}).get('frame_ratio') or 1.0) or 1.0
+            # 每个可见帧的局部运动量 = 与前后帧质心位移之和 (越小越"静止")
+            _disp_of = {}
+            for _i in range(1, len(centroid_data)):
+                _d = float(np.linalg.norm(centroid_data[_i][1] - centroid_data[_i-1][1]))
+                _disp_of[centroid_data[_i][0]] = _disp_of.get(centroid_data[_i][0], 0.0) + _d
+                _disp_of[centroid_data[_i-1][0]] = _disp_of.get(centroid_data[_i-1][0], 0.0) + _d
+            _vis_ids = [fid for fid, _ in centroid_data]
+
+            initial_frame_id = first_visible_frame_id
+            _anchor_reason = "首次可见帧 (无 Stage3.7 结果)"
             if _pp_inst:
-                _ratio = float(pick_place_result.get('frame_ratio') or 1.0) or 1.0
-                _pick_frame_min = min(i['pick_frame'] for i in _pp_inst)
-                _pick_rgb = _pick_frame_min / _ratio
-                _before = [fid for fid, _ in centroid_data if fid <= _pick_rgb]
-                if _before:
-                    initial_frame_id = max(_before)
-                print(f"   {category}_{inst_idx}: 初始帧 = frame {initial_frame_id} "
-                      f"(pick={_pick_frame_min} / ratio={_ratio:.2f} → RGB≈{_pick_rgb:.0f}, "
-                      f"首次可见帧={first_visible_frame_id})", flush=True)
+                _first_pick_slot = min(i['pick_frame'] for i in _pp_inst) / _ratio
+                _pre = [fid for fid in _vis_ids if fid < _first_pick_slot]
+                if _pre:
+                    initial_frame_id = min(_pre, key=lambda f: _disp_of.get(f, 0.0))
+                    _anchor_reason = (f"pick 前最稳帧 (pick≈{_first_pick_slot:.0f}槽, "
+                                      f"候选{len(_pre)}帧)")
+                else:
+                    _last_place_slot = max(i['place_frame'] for i in _pp_inst) / _ratio
+                    initial_frame_id = min(_vis_ids, key=lambda f: abs(f - _last_place_slot))
+                    _anchor_reason = (f"⚠️ pick≈{_first_pick_slot:.0f}槽前无可见帧 "
+                                      f"(mask 自 {first_visible_frame_id} 起, 物体一直在手), "
+                                      f"退回 place≈{_last_place_slot:.0f}槽后最近可见帧")
+            print(f"   {category}_{inst_idx}: 初始帧 = frame {initial_frame_id} "
+                  f"({_anchor_reason})", flush=True)
 
             # ── 位移计算 + MAD 离群点剔除 ──
             disps = np.array([np.linalg.norm(centroid_data[i][1] - centroid_data[i-1][1])
@@ -1060,11 +1290,17 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
 
                         # V 的行就是主轴方向 (按方差降序排列)
                         # 旋转矩阵 R = V_init @ V_opt.T
+                        # SVD 特征向量符号有 2^3 重任意性: 先逐轴按点积对齐符号,
+                        # 再修行列式 —— 只修 det 会漏掉单轴 180° 翻转 (实测旋转
+                        # 会被转到错误朝向)。
+                        for _ai in range(3):
+                            if float(np.dot(V_init[_ai], V_opt[_ai])) < 0:
+                                V_opt[_ai] *= -1
                         R_pca = V_init @ V_opt.T
 
                         # 检查是否是合法旋转矩阵（反射矩阵行列式=-1需要修正）
                         if np.linalg.det(R_pca) < 0:
-                            V_init[:, 2] *= -1
+                            V_opt[2] *= -1
                             R_pca = V_init @ V_opt.T
 
                         # 旋转角 (用于日志)
@@ -1305,6 +1541,19 @@ def run_stage5(output_path, categories_and_relations, all_instances,
     _t51_time = time.time() - _t51
     print(f"   ⏱️ 5.1 耗时: {_t51_time:.1f}s", flush=True)
 
+    # ── 5.15: 支撑物实例纠偏 ──
+    # 5.1 让 VLM 从候选实例里挑 parent, 同类多实例时会挑错 (实测 weixin_v8:
+    # handle_0 几何上在 table_1 上, VLM 却选了 table_0 → 悬空 15.8cm)。
+    # 这里按几何校验一遍, 不成立则换成同类里最合适的实例。
+    try:
+        from src.sp_refinement import fix_supporter_instance
+        refined_relations, _n_fix_sup = fix_supporter_instance(
+            all_instances, refined_relations, verbose=True)
+        if _n_fix_sup:
+            print(f"   🔧 支撑物实例纠偏: {_n_fix_sup} 处", flush=True)
+    except Exception as _e:
+        print(f"   ⚠️ 支撑物纠偏失败 (不影响主流程): {_e}", flush=True)
+
     # ── 5.2: 几何精修 (只修改 "supported by <物体>" 的物体, 已精修的floor/wall不动) ──
     _t52 = time.time()
     has_inter_object = any(
@@ -1324,7 +1573,26 @@ def run_stage5(output_path, categories_and_relations, all_instances,
             preloaded_vlm=vlm_for_stage52,
         )
     else:
+        # 没有物体间支撑关系时也要落盘 placement_strategies.json (空字典)。
+        #
+        # 为什么需要: 原实现只在 has_inter_object=True 时才写该文件, 而 5.2 被
+        # 跳过时文件根本不存在 —— 下游无法区分「已评估, 确实没有物体间关系」
+        # 和「5.2 从未运行」这两种情况。实测 8/23 场景缺这个文件, 且全部是
+        # 100% "supported by floor" 的场景 (Stage1 prompt 兜底把所有物体标成
+        # floor, 见 generate_scene_json_stage1.py 的默认值修复)。
+        # 空字典是诚实答案: 这些场景确实没有任何 on_top/inside 关系。
+        # 下游读到空 dict 而非 None, 能正确区分"无策略"与"读取失败"。
         print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
+        try:
+            import json as _json
+            _sp = os.path.join(output_path, "placement_strategies.json")
+            if not os.path.isfile(_sp):
+                with open(_sp, "w", encoding="utf-8") as _f:
+                    _json.dump({}, _f, indent=2, ensure_ascii=False)
+                print("   💾 放置策略已保存 (0 条, 无物体间支撑关系): "
+                      f"{_sp}", flush=True)
+        except Exception as _e:
+            print(f"   ⚠️ 放置策略落盘失败 (不影响主流水线): {_e}", flush=True)
     _t52_time = time.time() - _t52
     print(f"   ⏱️ 5.2 耗时: {_t52_time:.1f}s", flush=True)
 
@@ -1334,10 +1602,54 @@ def run_stage5(output_path, categories_and_relations, all_instances,
     # 只有 3 个贴合)。这里按5.1 的实例级关系把两类摆正。
     _t525 = time.time()
     from src.sp_refinement import (ground_floating_objects, reseat_on_top_objects,
-                                   dump_placement_audit)
+                                   dump_placement_audit,
+                                   separate_object_penetrations,
+                                   recenter_edge_objects)
+    # 构造 ref_z: 每个实例在"最早可见帧"的 VGGT 点云底部 z, 作为参考高度。
+    # 用途: 区分两种高空悬停 ——
+    #   (a) 坐标系未对齐: 物体最初就在高处 (参考值也高) → 补正应跳过
+    #   (b) 被上游推高:   物体最初贴地 (参考值≈0), 但 5.2 的穿模修复把它推上去了
+    # 实测 basic_pick_place_17 toy_1: 最初 z≈0 → Stage5 变 0.8806m, toy_5 由 0 变
+    # 0.6379m; 二者都因超过 float_z_max(0.5) 被跳过, 最终渲染时飘在空中。
+    # 用"最初的点云"而不是 pose_history 作参考: 后者在 run_stage5 里并不存在
+    # (只是 _record_pose_stage 的内部参数, 且该函数未被调用)。
+    _ref_z = {}
+    try:
+        _wp = (vggt_prediction_results or {}).get("world_points")
+        if _wp is not None and deduplicated_all_masks:
+            for _cat, _inst_list in deduplicated_all_masks.items():
+                for _idx, _im_list in enumerate(_inst_list):
+                    if not _im_list:
+                        continue
+                    _im0 = min(_im_list, key=lambda x: x["frame_id"])
+                    _fid = _im0["frame_id"]
+                    _m = _im0["mask"] > 0
+                    if not _m.any():
+                        continue
+                    _pts = _wp[_fid][_m]
+                    _fin = np.all(np.isfinite(_pts), axis=-1)
+                    if not _fin.any():
+                        continue
+                    _ref_z[f"{_cat}_{_idx}"] = float(_pts[_fin][:, 2].min())
+        if _ref_z:
+            print(f"   📐 落地补正参考高度: 取 {len(_ref_z)} 个实例的最早帧点云底部 z",
+                  flush=True)
+    except Exception as _e:
+        print(f"   ⚠️ 参考高度构造失败 (不影响主流程): {_e}", flush=True)
+        _ref_z = {}
     all_instances, n_grounded = ground_floating_objects(
-        all_instances, refined_relations, verbose=True)
+        all_instances, refined_relations, verbose=True, ref_z=_ref_z)
     print(f"   🔧 落地补正: {n_grounded} 个悬空实例已压到地面", flush=True)
+    # 注意: 穿模分离**不在这里做**, 移到本段末尾 (见下方 5.25 收敛循环)。
+    # 实测 basic_pick_place_141: 分离放前面时 10 对 → 22 对 (更糟), 因为
+    # 后面的重贴/居中会把刚分开的物体又拉回支撑物上重新叠在一起。
+    # 实测: 分离放最后 = 3 对, 再迭代 2 轮 = 0 对。
+    # 原因: Stage1 prompt 的 "If unsure, default to: supported by floor" 让俯视
+    # 桌面场景的所有物体都标成 floor, 而基础精修只管单物体贴地、5.2 的穿模修复
+    # 又带 only_refine_other_objects=True 跳过 floor —— 三层都没管"物体之间"的
+    # 穿模。实测 basic_pick_place_111 lego_0/lego_1 重叠 85%、46 的 box_1/box_2
+    # 92% 与 card_0 埋进 box_1 91.6%、118 的 croissant 埋进 pillow 68%。
+    # 只推 XY 不推 Z: z 已由落地补正固定, 推 z 会破坏贴地。
     # 5.2 落盘的每实例策略 (on_top/inside/...); 缺失时reseat 退化为只看关系,
     # 此时无法区分 inside, 会在日志打印提示。
     _strategy_path = os.path.join(output_path, "placement_strategies.json")
@@ -1355,8 +1667,54 @@ def run_stage5(output_path, categories_and_relations, all_instances,
         print("   ⚠️ 未找到 placement_strategies.json, on_top 重贴无法区分 inside, "
               "可能把 inside 的物体错贴到支撑物顶面", flush=True)
     print(f"   🔧 on_top 重贴: {n_reseated} 个实例已贴回支撑物顶面", flush=True)
+    # 边沿居中: reseat 只修 z 不动水平位置, "只搭上一个角"的物体仍悬在支撑物边沿。
+    # 实测 vertical_pick_place_115 bottle_0 与 box_0 水平重叠仅 41% (59% 悬在盒外)。
+    # 放在 reseat 之后: z 先落位, xy 再居中, 两步互不干扰。
+    all_instances, n_recentered = recenter_edge_objects(
+        all_instances, refined_relations, verbose=True)
+    if n_recentered:
+        print(f"   🔧 边沿居中: {n_recentered} 次平移", flush=True)
+
+    # ── 穿模收敛循环 ──
+    # 为什么必须在最后、且要迭代:
+    #   ① 顺序: 分离若排在重贴/居中之前, 后两步会把刚分开的物体又拉回支撑物上
+    #      重新叠在一起。实测 basic_pick_place_141 分离在前 = 22 对穿模 (原始 10
+    #      对, 反而更糟); 分离放最后 = 3 对。
+    #   ② 迭代: 分离会把物体推离支撑物 (尤其桌上物体), 需再重贴 z 把它压回顶面,
+    #      而重贴又可能引入新的重叠 —— 单轮收敛不了。实测迭代 2 轮 → 0 对。
+    #   ③ 循环内不再调用 recenter: 它把物体聚拢到支撑物中心, 与分离直接冲突,
+    #      会在两者之间来回震荡。
+    # 循环结束时最后一次执行的必是"分离" (它返回 0 才退出), 因此出口保证无穿模。
+    _MAX_CONV_ITER = 3
+    _n_sep_total = 0
+    for _rnd in range(_MAX_CONV_ITER):
+        all_instances, _ns = separate_object_penetrations(
+            all_instances, refined_relations, verbose=(_rnd == 0))
+        _n_sep_total += _ns
+        if _ns == 0:
+            break
+        # 分离可能把物体推离支撑物 → 重贴 z 压回顶面 (recenter 不在此调用)
+        all_instances, _ = reseat_on_top_objects(
+            all_instances, refined_relations,
+            placement_strategies=_strategies, verbose=False)
+    if _n_sep_total:
+        print(f"   🔧 穿模分离: {_n_sep_total} 次推开 (收敛 {_rnd + 1} 轮)", flush=True)
+
+    # ── 分离后收尾落地 ──
+    # 穿模分离是"把两个物体沿连线推开", 推的方向不保证是水平的 —— 当上方物体
+    # 压着下方物体时, 推开会把下方物体往下压。而 ground_floating_objects 排在
+    # 分离之前, 压下去之后就没人再管了。
+    # 实测 wx5: chair_0 (supported by floor) 被分离推到 min_z=-0.541m,
+    # 即埋进地下 54cm, 而 audit 仍报 ok (audit 只看 gap 符号)。
+    # 这里在所有几何补正之后补一次落地, 保证 "supported by floor" 的物体
+    # 底面最终确实在 z=0。只改 T[2,3], 不动水平位置与形状。
+    all_instances, _n_reground = ground_floating_objects(
+        all_instances, refined_relations, verbose=False, ref_z={})
+    if _n_reground:
+        print(f"   🔧 分离后收尾落地: {_n_reground} 个实例压回 z=0", flush=True)
+
     # 落盘摆放审计 (每实例世界 AABB / gap / 水平重叠), 供离线验收与后续修复比对。
-    # 必须在两道补正之后 —— 记的是最终位姿。
+    # 必须在所有补正之后 —— 记的是最终位姿。
     try:
         dump_placement_audit(all_instances, refined_relations,
                              placement_strategies=_strategies,
@@ -1397,7 +1755,7 @@ def _render_glb_preview(glb_path):
         print(f"⚠️ 相机视角渲染失败 (不影响主流水线): {e}", flush=True)
 
 
-def save_final_glb(all_instances, output_path, filename="final_scene.glb"):
+def save_final_glb(all_instances, output_path, filename="final_scene_basic.glb"):
     """
     保存最终GLB文件
 
@@ -1506,8 +1864,15 @@ def main(args):
     os.makedirs(args.output_path, exist_ok=True)
     
     # 配置日志输出
+    # 日志名带场景名: 只用时间戳时, 不同场景的重跑会撞名 —— 实测
+    # basic_pick_place_17 与 118、vertical_pick_place_101 与 111 各有同名日志
+    # (如 mainv2_20261014_232716.log), 事后无法从文件名判断归属, 排查得逐个
+    # grep 视频路径。加场景名后一瞥即知, 且物理上不可能再撞。
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = os.path.join(args.output_path, f"mainv2_{timestamp}.log")
+    _scene_tag = os.path.basename(os.path.normpath(args.output_path))
+    _scene_tag = "".join(c if (c.isalnum() or c in "-_") else "_" for c in _scene_tag)
+    log_filename = os.path.join(
+        args.output_path, f"mainv2_{_scene_tag}_{timestamp}.log")
     
     # 配置日志记录器
     logger = logging.getLogger()
@@ -1566,7 +1931,20 @@ def main(args):
 
     # ── Stage 1: VGGT引导的智能物体发现 ──
     _t1 = time.time()
-    stage1_json, categories_and_relations = run_stage1(
+    if getattr(args, "scene_json", None):
+        # 手工提供正确类别 → 跳过 VLM 检测 (它在大场景上会 hallucinate:
+        # 实测 3chair-bottle 被报成 curtain x5 / router / tv / clothes rack)
+        import shutil as _sh
+        _sid = os.path.splitext(os.path.basename(args.input_video))[0]
+        stage1_json = os.path.join(args.output_path, f"scene_{_sid}_stage1.json")
+        _sh.copyfile(args.scene_json, stage1_json)
+        with open(stage1_json, encoding="utf-8") as _f:
+            categories_and_relations = json.load(_f)
+        print(f"\n   📄 使用外部场景 JSON: {args.scene_json}", flush=True)
+        print(f"      类别 ({len(categories_and_relations)}): "
+              f"{sorted(categories_and_relations)}", flush=True)
+    else:
+        stage1_json, categories_and_relations = run_stage1(
         args.input_video, args.output_path, vlm_checkpoint,
         max_frames_stage1=args.max_frames_stage1,
         vggt_max_frames=args.max_frames,
@@ -1591,14 +1969,26 @@ def main(args):
 
     # ── 尺寸校准: 点云校准 SAM3D 尺度漂移 (方案B, docs/SAM3D_SCALE_DRIFT_REPORT.md) ──
     # 必须在基础精修/all_instances.pkl 保存/Stage4/5 之前: 下游全部使用校准后尺寸
+    _scale_report_p = os.path.join(args.output_path, "scale_calibration_report.json")
     try:
         from tools.rescale_meshes_by_pointcloud import rescale_all_instances
         _t_rescale = time.time()
         all_instances = rescale_all_instances(
-            args.output_path, all_instances, all_optimal_frame_ids)
+            args.output_path, all_instances, all_optimal_frame_ids,
+            report_path=_scale_report_p)
         print(f"✅ 尺寸校准完成 ({time.time() - _t_rescale:.1f}s)", flush=True)
     except Exception as _e:
+        # 尺度校准失败会被静默降级 (k=1), 下游拿到的尺度漂移原样带入
+        # (实测 wxD 圆凳 0.15m)。traceback + 落盘清单, 让失败可见。
+        import traceback as _tb
         print(f"⚠️ 尺寸校准失败, 使用原始尺寸继续: {_e}", flush=True)
+        traceback.print_exc()
+        try:
+            with open(_scale_report_p, "w", encoding="utf-8") as _f:
+                json.dump({"status": "failed", "error": str(_e),
+                           "traceback": _tb.format_exc()}, _f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
 
     # ── 基础精修: floor/wall/embedded (始终执行，与main.py一致，在Stage4之前) ──
     _t_base = time.time()
@@ -1623,9 +2013,37 @@ def main(args):
     # 记录初始位姿
     pose_history = _record_pose_stage(all_instances, refined_relations if 'refined_relations' in dir() else categories_and_relations, "initial")
 
+    # ── floor 关系坐实 (必须在基础精修之前) ──
+    # VLM 常把桌上/托盘上的物体判成 floor; 基础精修会把 floor 物体砸到 z=0,
+    # 之后 5.15 看到"在地上"就不再改挂 (实测 egodex_32 screwdriver 躺在
+    # tray 上却被砸到地面)。这里用类别级关系构造实例级 dict 先做坐实检查,
+    # 已改挂具名支撑物的实例在下方基础精修中跳过 (交给 Stage 5 的 5.2)。
+    _floor_repaired = set()
+    try:
+        from src.sp_refinement import repair_floor_relations
+        _inst_rel = {f"{_c}_{_i}": categories_and_relations[_c]
+                     for _c, _lst in all_instances.items() for _i in range(len(_lst))}
+        _r2, _n_fr = repair_floor_relations(all_instances, _inst_rel, verbose=True)
+        if _n_fr:
+            _floor_repaired = {n for n, rr in _r2.items() if rr != _inst_rel.get(n)}
+            print(f"  🔧 floor 关系坐实: {_n_fr} 个实例改挂具名支撑物 "
+                  f"{sorted(_floor_repaired)} (基础精修跳过, 交给 5.2)", flush=True)
+    except Exception as _e:
+        print(f"  ⚠️ floor 关系坐实检查失败 (继续基础精修): {_e}", flush=True)
+
     for category, category_instances in all_instances.items():
         relationship = categories_and_relations[category]
+        # zip 截断防护: all_optimal_frame_ids 与实例数不匹配时, zip 会静默
+        # 丢弃尾部实例 (不精修、不留痕)。提前告警, 让数量不一致暴露出来。
+        _n_ids = len(all_optimal_frame_ids.get(category, []))
+        if _n_ids != len(category_instances):
+            print(f"  ⚠️ 基础精修: {category} 实例数 {len(category_instances)} != "
+                  f"optimal_frame_ids 数 {_n_ids}, 尾部 "
+                  f"{abs(len(category_instances) - _n_ids)} 个实例将被跳过精修", flush=True)
         for instance_id, (optimal_frame_id, instance_info) in enumerate(zip(all_optimal_frame_ids[category], category_instances)):
+            if f"{category}_{instance_id}" in _floor_repaired:
+                print(f"  跳过基础精修: {category}_{instance_id} → 已改挂具名支撑物 (交给 5.2)", flush=True)
+                continue
             if relationship == "supported_by_floor" or relationship == "supported by floor":
                 print(f"  基础精修: {category}_{instance_id} → supported by floor", flush=True)
                 instance_info = refine_supported_by_floor_object(instance_info)
@@ -1645,7 +2063,7 @@ def main(args):
             category_instances[instance_id] = instance_info
 
     # 保存基础精修后的结果 (GLB #2, Stage3产物, 供 run_post_pipeline.py 作为固定起点)
-    save_final_glb(all_instances, args.output_path, "final_scene.glb")
+    save_final_glb(all_instances, args.output_path, "final_scene_basic.glb")
 
     # 记录基础精修位姿变化
     pose_history = _record_pose_stage(all_instances, categories_and_relations, "basic_refinement", pose_history)
@@ -1701,10 +2119,47 @@ def main(args):
         if args.enable_stage4:
             save_final_glb(all_instances, args.output_path, "final_scene_stage4_5.glb")
         else:
+            # ── 重力可见化 + 退化桌面修复 (Stage 5 出口标准步骤) ──
+            # 薄板桌面(桌腿未入画)合成桌腿并抬到 0.75m, 支撑物跟随; 加地板基准面。
+            # 此前最终 GLB 无地板几何, 场景像漂在白空间, 无重力参考。
+            try:
+                from tools.ground_fix import add_ground_and_legs, verify_scene_ground
+                all_instances, _ground_report = add_ground_and_legs(
+                    all_instances, refined_relations, verbose=True)
+                _gr = verify_scene_ground(all_instances, refined_relations, args.output_path)
+                print(f"   🔬 出口自检: 沉地 {_gr['n_below_floor']} 悬空 {_gr['n_floating']} "
+                      f"倒置 {_gr['n_inverted']}", flush=True)
+            except Exception as _e:
+                import traceback as _tb
+                print(f"⚠️ 地板/桌腿修复失败 (跳过, 不影响主流水线): {_e}", flush=True)
+                traceback.print_exc()
             save_final_glb(all_instances, args.output_path, "final_scene_stage5.glb")
         # 记录Stage5位姿变化
         pose_history = _record_pose_stage(all_instances, refined_relations, "stage5", pose_history)
         _stage5_time = time.time() - _t5
+
+        # ── Stage 5 后重存 all_instances.pkl ──
+        # 为什么必须重存: 原实现在 Stage 5 之前 (基础精修后) 存一次 pkl, 之后
+        # Stage 4/5 改的所有位姿都不写回。下游 run_post_pipeline.py / 离线验收
+        # 读这个 pkl, 拿到的是 5.25 之前的旧位姿。
+        # 实测 wxD: pkl 里 table_0 顶面 z=0.050, 而同一次运行的
+        # placement_audit.json 里是 0.987 —— 两者相差 0.94m, 因为 audit 在
+        # Stage 5 内生成 (用的是新位姿), pkl 还是旧位姿。用 pkl 做验收会得出
+        # 完全错误的结论 (比如误判"物体已贴地")。
+        # 注意: 必须在 Stage 5 之后、任何下游消费之前。
+        try:
+            import pickle as _pk
+            with open(pkl_path, 'wb') as f:
+                _pk.dump({
+                    'all_instances': all_instances,
+                    'all_optimal_frame_ids': all_optimal_frame_ids,
+                    'categories_and_relations': categories_and_relations,
+                    'walls_info': walls_info,
+                }, f)
+            print(f"💾 all_instances.pkl 已更新 (Stage 5 后最终位姿): {pkl_path}",
+                  flush=True)
+        except Exception as _e:
+            print(f"⚠️ Stage 5 后重存 pkl 失败 (不影响 GLB 产物): {_e}", flush=True)
 
         # Stage5 内置物理仿真验证 (可选, 实验性功能)
         if args.enable_physics_validation:
@@ -1837,7 +2292,7 @@ def main(args):
     elif args.enable_physics_validation:
         glb_path = os.path.join(args.output_path, "final_scene_physics.glb")
     else:
-        glb_path = os.path.join(args.output_path, "final_scene.glb")
+        glb_path = os.path.join(args.output_path, "final_scene_basic.glb")
 
     total_time = time.time() - total_start
     print("\n" + "=" * 70, flush=True)
@@ -1894,7 +2349,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_frames_stage1", type=int, default=10,
                         help="Stage1采样关键帧数 (默认10)")
     parser.add_argument("--enable_stage4", action="store_true",
-                        help="启用Stage 4视觉-空间对齐 (默认关闭)")
+                        help="启用Stage 4视觉-空间对齐")
+    parser.add_argument("--disable_stage4", action="store_true",
+                        help="关闭Stage 4视觉-空间对齐 (默认开启: 无对齐时物体位置"
+                             "停留在单帧质心配准噪声水平, 实测偏离真实视野分米级)")
     parser.add_argument("--enable_stage5", action="store_true",
                         help="启用Stage 5语义感知场景精修 (默认关闭)")
     parser.add_argument("--stage5_method", type=str, default="scene_graph",
@@ -1906,6 +2364,21 @@ if __name__ == "__main__":
                         help="Stage4 时序邻域半径 (默认5)")
     parser.add_argument("--stage4_use_mast3r", action="store_true",
                         help="Stage4 使用MASt3R匹配 (需要GPU)")
+    parser.add_argument("--scene_json", type=str, default=None,
+                        help="直接提供 Stage1 的场景 JSON (类别→关系), 跳过 VLM 检测。"
+                             "用于 VLM 类别 hallucination 时手工修正后重跑。")
+    parser.add_argument("--no_vlm_interaction", action="store_true",
+                        help="关闭 Stage3.7 的 VLM 先行交互判断 (默认开启; "
+                             "关闭则纯用几何判据)。")
+    parser.add_argument("--no_vlm_box_fallback", action="store_true",
+                        help="关闭 Stage2 的 box 兜底 (文本提示切不出 mask 时用 6.8 "
+                             "出的框重新提示 SAM3)。默认开启; 关闭则完全走原逻辑。")
+    parser.add_argument("--use_api_vlm", action="store_true",
+                        help="Stage1 物体检测改用 opencode 的视觉模型 (默认本地 Qwen3.5-9B)。"
+                             "实测对纯色背景+小物体更稳, 不会凭空造物体。")
+    parser.add_argument("--all_sam3d", action="store_true",
+                        help="所有实例都走 SAM3D (默认: 仅被抓取/操作的实例走 SAM3D, "
+                             "静态实例改用 VGGT 点云直接构网以提速)")
     parser.add_argument("--enable_stage6", action="store_true",
                         help="启用Stage 6材质感知物理标注 (默认关闭)")
     parser.add_argument("--enable_physics_validation", action="store_true",
@@ -1914,6 +2387,18 @@ if __name__ == "__main__":
                         help="物理仿真检测步数 (默认300)")
 
     args = parser.parse_args()
+    # Stage 4 默认开启 (位置配准的管线原生解; --disable_stage4 显式关闭)。
+    # 实测 wxD: 无对齐时场景在真实相机视野外 (分米级偏移), 开启后桌面与
+    # 真实帧完全重合。此前默认关闭是位置不准的根因之一。
+    if getattr(args, "disable_stage4", False):
+        args.enable_stage4 = False
+    else:
+        args.enable_stage4 = True
+    # Stage2 box 兜底开关 (默认开)
+    globals()['_VLM_BOX_FALLBACK'] = not getattr(args, 'no_vlm_box_fallback', False)
+    # Stage3.7 的 VLM 交互判断开关 (传给 pick_place_detector)
+    import src.pick_place_detector as _ppd
+    _ppd._VLM_INTERACTION = not getattr(args, 'no_vlm_interaction', False)
 
     if args.input_images and args.input_video:
         parser.error("--input_video 和 --input_images 不能同时使用")

@@ -4,7 +4,10 @@ import re
 import numpy as np
 import tempfile
 import subprocess
-import colorcet as cc
+try:
+    import colorcet as cc
+except Exception:  # hawor 环境未装 (纯 Python 调色板, 仅可视化用)
+    cc = None
 import matplotlib.colors as mcolors
 import cv2
 
@@ -40,7 +43,13 @@ def get_glasbey_colors(n):
     '''
         load n BGR tuples for visualization
     '''
-    hex_colors = cc.glasbey[:n]
+    if cc is not None:
+        hex_colors = cc.glasbey[:n]
+    else:
+        # colorcet 缺失时用 matplotlib 的 tab20 兜底 (颜色数少但足够调试)
+        _cm = plt.get_cmap('tab20')
+        hex_colors = ['#%02x%02x%02x' % tuple(int(c * 255) for c in _cm(i % 20)[:3])
+                      for i in range(n)]
     bgr_colors = []
     for hex_val in hex_colors:
         rgb_float = mcolors.to_rgb(hex_val)

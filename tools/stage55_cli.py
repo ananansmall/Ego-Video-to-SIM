@@ -113,6 +113,9 @@ def compare(glb_path, out=None, cap=3, max_width=512):
         photo = cv2.imread(os.path.join(scene_dir, "color", f"{fid}.jpg"))
         if photo is None:
             continue
+        # render_camera_views 返回 RGB, cv2/imread 是 BGR: 统一转 BGR 再拼图,
+        # 否则 R/B 互换 (黄碗变青碗)
+        tile = cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)
         h = tile.shape[0]
         scale = h / photo.shape[0]
         photo = cv2.resize(photo, (max(1, int(photo.shape[1] * scale)), h))
@@ -126,6 +129,73 @@ def compare(glb_path, out=None, cap=3, max_width=512):
     out_png = out or os.path.splitext(glb_path)[0] + "_compare.png"
     cv2.imwrite(out_png, np.vstack(rows))
     return out_png
+
+
+def gif_cmd(scene_dir, out=None, before=None, after=None,
+            max_width=384, fps=6, max_frames=48):
+    """抓取帧段逐帧渲染 GIF: 每帧三联 BEFORE(stage5)|AFTER(stage55)|REAL
+
+    帧段来自 pick_place_frames.json 的 pick/place 窗口 (前后各扩3帧),
+    段内逐帧不跳帧; 总帧数超过 max_frames 时自动加大步长。返回 GIF 路径。
+    """
+    import cv2
+    import numpy as np
+    from render_glb_preview import render_camera_views
+    before = before or os.path.join(scene_dir, "final_scene_stage5.glb")
+    after = after or os.path.join(scene_dir, "final_scene_stage55.glb")
+    with open(os.path.join(scene_dir, "pick_place_frames.json")) as f:
+        pf = json.load(f)
+    spans = []
+    for it in pf.get("interactions", []):
+        pick = it.get("pick_frame") or it.get("pick_window", [0])[0]
+        place_w = it.get("place_window") or [it.get("place_frame") or 0]
+        place = it.get("place_frame") or place_w[-1]
+        spans.append([max(0, min(pick, place_w[0]) - 3),
+                      max(place, place_w[-1]) + 3])
+    if not spans:
+        spans = [[0, 0]]
+    spans.sort()
+    merged = [spans[0]]
+    for lo, hi in spans[1:]:
+        if lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    stride = 1
+    n_total = sum(hi - lo + 1 for lo, hi in merged)
+    while n_total // stride > max_frames:
+        stride += 1
+    fids = [f for lo, hi in merged for f in range(lo, hi + 1, stride)]
+    if fids and fids[0] > 0:
+        fids = [0] + fids  # 首帧也纳入, 便于对照视频开头
+    print(f"gif: frames {fids[0]}..{fids[-1]} stride={stride} n={len(fids)}")
+    tb, _ = render_camera_views(before, scene_dir, fids, max_width=max_width)
+    ta, _ = render_camera_views(after, scene_dir, fids, max_width=max_width)
+    frames = []
+    for fid, rb, ra in zip(fids, tb, ta):
+        real = cv2.imread(os.path.join(scene_dir, "color", f"{fid}.jpg"))
+        if real is None:
+            continue
+        # imageio.mimsave 吃 RGB: 渲染本来就是 RGB 不动, 实拍 imread 是 BGR 需转
+        real = cv2.cvtColor(real, cv2.COLOR_BGR2RGB)
+        h = rb.shape[0]
+        scale = h / real.shape[0]
+        real = cv2.resize(real, (max(1, int(real.shape[1] * scale)), h))
+        for img, tag, col in ((rb, "BEFORE", (255, 0, 0)),
+                              (ra, "AFTER", (0, 180, 0)),
+                              (real, "REAL", (0, 0, 255))):
+            cv2.putText(img, tag, (8, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(img, tag, (8, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, col, 2, cv2.LINE_AA)
+        w = min(rb.shape[1], ra.shape[1], real.shape[1])
+        frames.append(np.hstack([i[:, :w] for i in (rb, ra, real)]))
+    if not frames:
+        raise RuntimeError("无可用帧")
+    out_gif = out or os.path.join(scene_dir, "stage55_before_after_real.gif")
+    import imageio
+    imageio.mimsave(out_gif, frames, fps=fps, loop=0)
+    return out_gif
 
 
 def _log_move(glb_path, entry):
@@ -461,6 +531,14 @@ def main():
     p.add_argument("--out", default=None, help="输出 PNG 路径 (默认覆盖到 --out)")
     p = sub.add_parser("compare"); add_glb(p)
     p.add_argument("--out", default=None, help="输出 PNG 路径")
+    p = sub.add_parser("gif")
+    p.add_argument("--scene-dir", required=True, help="场景输出目录")
+    p.add_argument("--out", default=None, help="输出 GIF 路径")
+    p.add_argument("--before", default=None, help="修改前 GLB (默认 final_scene_stage5.glb)")
+    p.add_argument("--after", default=None, help="修改后 GLB (默认 final_scene_stage55.glb)")
+    p.add_argument("--max-width", type=int, default=384)
+    p.add_argument("--fps", type=int, default=6)
+    p.add_argument("--max-frames", type=int, default=48)
 
     args = ap.parse_args()
 
@@ -519,6 +597,12 @@ def main():
 
     elif args.cmd == "compare":
         out = compare(args.glb, out=args.out)
+        print(out)
+
+    elif args.cmd == "gif":
+        out = gif_cmd(args.scene_dir, out=args.out, before=args.before,
+                      after=args.after, max_width=args.max_width,
+                      fps=args.fps, max_frames=args.max_frames)
         print(out)
 
 

@@ -189,7 +189,7 @@ def prepare_test_data(replica_dir, scene_name, output_dir, max_frames,
         scene_yup.add_geometry(geom_yup, node_name=name, geom_name=name,
                                transform=T_node)
 
-    glb_path = os.path.join(output_dir, "final_scene.glb")
+    glb_path = os.path.join(output_dir, "final_scene_basic.glb")
     scene_yup.export(glb_path)
     print(f"GLB已保存: {glb_path} (GT + perturbed)")
 

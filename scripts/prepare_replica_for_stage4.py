@@ -13,7 +13,7 @@ Replica 格式:
 
 Stage 4 格式:
     <output>/
-    ├── final_scene.glb       (y-up, 多个geometry)
+    ├── final_scene_basic.glb       (y-up, 多个geometry)
     ├── intrinsic.txt         (3x3)
     ├── color/                (0.jpg, 1.jpg, ...)
     ├── depth/                (0.png, uint16 mm)
@@ -115,7 +115,7 @@ def split_mesh_into_objects(mesh_ply_path, output_dir):
         geom_name = f"object_{i:03d}"
         scene.add_geometry(geom, node_name=geom_name, geom_name=geom_name)
 
-    glb_path = os.path.join(output_dir, "final_scene.glb")
+    glb_path = os.path.join(output_dir, "final_scene_basic.glb")
     scene.export(glb_path)
     print(f"  GLB已保存: {glb_path} ({len(scene.geometry)} 个物体)")
     return glb_path

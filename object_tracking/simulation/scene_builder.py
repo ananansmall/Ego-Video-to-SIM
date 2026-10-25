@@ -8,7 +8,7 @@
       → run_simulation.py
 
 输入:
-  - final_scene.glb     静态场景 (墙壁/地面/桌面)
+  - final_scene_basic.glb     静态场景 (墙壁/地面/桌面)
   - 物体 mesh + 初始6DoF  (来自 ReplicateAnyScene + object_tracker)
   - hawor_results.npz   手部轨迹 (来自 HaWoR)
   - action_sequence.json 夹爪时序 (来自 action_semantics)

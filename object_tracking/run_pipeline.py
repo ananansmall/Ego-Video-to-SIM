@@ -230,7 +230,7 @@ def main():
     print("Step 0: GLB-Video Alignment Verification")
     print("=" * 70)
 
-    glb_path = os.path.join(args.base_dir, video_name, "final_scene.glb")
+    glb_path = os.path.join(args.base_dir, video_name, "final_scene_stage5.glb")
     extrinsics_dir = os.path.join(args.base_dir, video_name, "extrinsics")
     intrinsic_path = os.path.join(args.base_dir, video_name, "intrinsic.txt")
 

@@ -1,0 +1,13 @@
+{
+  "obj": "plate_inst0",
+  "best_pre_inst": 0,
+  "best_iou": 0.9647577092511013,
+  "candidates": [
+    {
+      "pre_inst": 0,
+      "iou": 0.9647577092511013,
+      "proj_area": 2474,
+      "mask_area": 2432
+    }
+  ]
+}

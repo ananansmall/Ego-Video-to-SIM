@@ -134,7 +134,25 @@ def generate_3d_asset_in_subprocess(
     extrinsics,
     config_file="./models/SAM3D/checkpoints/pipeline.yaml",
     compile_model=False,
+    only_instances=None,
 ):
+    """only_instances: {category: [inst_idx, ...]} 或 None。
+        None = 全部跑 SAM3D (原行为)。
+        非 None = 只对这些实例跑 SAM3D, 其余实例从 all_masks 中剔除, 由调用方
+        用点云快速路径补上 (见 src/static_mesh.py)。这是"静态物体不烧 SAM3D"
+        的提速开关 —— 实测只有 1~2 个实例被抓取的场景里, 绝大部分实例是静态的。
+    """
+    if only_instances is not None:
+        deduplicated_all_masks = {
+            cat: [m for k, m in enumerate(masks)
+                  if k in set(only_instances.get(cat, []))]
+            for cat, masks in deduplicated_all_masks.items()
+        }
+        all_optimal_frame_ids = {
+            cat: [f for k, f in enumerate(ids)
+                  if k in set(only_instances.get(cat, []))]
+            for cat, ids in all_optimal_frame_ids.items()
+        }
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     process = ctx.Process(

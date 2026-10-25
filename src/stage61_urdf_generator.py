@@ -245,6 +245,57 @@ def extract_objects_from_glb(glb_path: str, temp_dir: str) -> list[dict]:
     return objects_info
 
 
+# 各类别 mesh 的常识尺寸上限(米), 仅用于尺度合理性校验 —— 只标记, 不缩放不拒绝。
+# 上限取"家用/桌面 pick-place 场景下该类别可能出现的较大值", 不是平均值。
+# 依据 output_v3 实测: pillow_0 达 2.03m (5.8x) 是真异常; 而 ball 0.196m /
+# block 0.275m / bowl 0.306m 这类 1.2~1.8x 的其实合理, 故阈值按常识取宽, 并另设
+# SEVERE_RATIO 区分"可能异常"与"几乎肯定异常"。
+SIZE_LIMIT = {
+    "pillow": 0.35, "box": 0.45, "toy": 0.35, "fish": 0.40, "bowl": 0.30,
+    "cup": 0.18, "bottle": 0.32, "ball": 0.25, "duck": 0.25, "dice": 0.10,
+    "bangle": 0.15, "screwdriver": 0.30, "croissant": 0.25, "block": 0.30,
+    "plate": 0.32, "chair": 1.20, "table": 2.00, "cabinet": 1.80,
+    "curtains": 2.50, "clothes": 0.60, "bag": 0.60, "shoe": 0.35,
+    "book": 0.35, "phone": 0.20, "laptop": 0.45, "banana": 0.25,
+}
+
+# 超过常识上限多少倍才认定为"严重异常":
+#   < SEVERE_RATIO  -> INFO  "略超", 很可能只是这类物体本身偏大
+#   >= SEVERE_RATIO -> WARNING "尺度异常", 几乎肯定是重建失败
+# 2x 是经验分界: output_v3 里质量全部命中的物体都在 1.5x 以内, 而质量偏差
+# 9~49x 的 pillow/box 都在 1.7x 以上。
+SEVERE_RATIO = 2.0
+
+
+def _annotate_scale_check(urdf_path: str, max_extent: float,
+                          scale_anomaly: str) -> None:
+    """把尺寸校验结果写进 URDF 的 <extra_info>; 只标记, 不改几何/质量/行为。
+
+    下游 (stage61_physics_sim / 报告 / 人工排查) 可直接读这两个字段:
+      <max_extent>    mesh 最大边长(米)
+      <scale_anomaly> 空串=正常, 非空=异常描述
+    """
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    link = root.find("link")
+    if link is None:
+        return
+    extra = link.find("extra_info")
+    if extra is None:
+        extra = ET.SubElement(link, "extra_info")
+    me = extra.find("max_extent")
+    if me is None:
+        me = ET.SubElement(extra, "max_extent")
+    me.text = f"{max_extent:.6f}"
+    sa = extra.find("scale_anomaly")
+    if sa is None:
+        sa = ET.SubElement(extra, "scale_anomaly")
+    sa.text = scale_anomaly
+    tree.write(urdf_path, encoding="utf-8", xml_declaration=True)
+
+
 def _rewrite_urdf_inertia(urdf_path: str, mesh_folder: str) -> None:
     """mesh 旋转回 Z-up 后, 用旋转后的 collision mesh 重算惯量并写回 URDF。
 
@@ -363,9 +414,35 @@ def generate_urdf_for_object(
     # 关键: real_height 和 mass 从 GLB mesh 自身的真实尺寸/体积读取
     # GLB 已有真实物理尺度（由 extrinsics/intrinsic 确定），Qwen 只提供类别/描述/摩擦系数
     mesh_for_props = trimesh.load(mesh_path)
-    z_extent = np.ptp(mesh_for_props.vertices, axis=0)[2]  # GLB 是 Z-up
+    _verts_ext = np.ptp(mesh_for_props.vertices, axis=0)
+    z_extent = _verts_ext[2]  # GLB 是 Z-up
     real_height = round(z_extent, 6)
     attr_dict["real_height"] = real_height
+
+    # ---- 尺寸合理性校验 (只标记, 不改几何/质量/行为) ----
+    # SAM3D 单图重建对个别物体会产出尺度完全错误的 mesh。实测 output_v3 (27 个物体):
+    #   pillow_0 最大边长 2.033m (常识应 <0.35m, 差 5.8x) -> 算出 48.70 kg
+    #   box_0    0.698~0.728m (常识 <0.35m)              -> 算出 3.8 kg
+    # 13/27 超出常识上限; 而尺度正常的 (bowl/cup/dice/bangle/ball/duck) 质量全部合理。
+    # 该错误会被"体积×密度"放大, 并连带污染物理与渲染, 故在此显式标记。
+    max_extent = float(_verts_ext.max())
+    size_limit = SIZE_LIMIT.get(category.lower())
+    scale_anomaly = ""
+    if size_limit is not None and max_extent > size_limit:
+        _ratio = max_extent / size_limit
+        scale_anomaly = (f"{max_extent:.3f}m > {category} 常识上限 "
+                         f"{size_limit}m ({_ratio:.1f}x)")
+        if _ratio >= SEVERE_RATIO:
+            logger.warning(
+                f"    [尺度异常] mesh 最大边长 {max_extent:.3f}m 达到 {category} 常识上限 "
+                f"{size_limit}m 的 {_ratio:.1f}x -> 几乎肯定是重建失败, "
+                f"质量/物理/渲染可能严重失真"
+            )
+        else:
+            logger.info(
+                f"    [尺度略超] mesh 最大边长 {max_extent:.3f}m 为 {category} 常识上限 "
+                f"{size_limit}m 的 {_ratio:.1f}x -> 仅提示, 也可能是该类别本身偏大"
+            )
 
     # Mass 从 mesh 体积 × 密度计算
     # 关于非水密网格(实测 218 个物体里 42 个): 曾想改用包围盒体积, 但实测
@@ -451,6 +528,9 @@ def generate_urdf_for_object(
     #     mesh 此时已旋转回 Z-up, 必须用旋转后的 mesh 重算惯量并写回 URDF,
     #     否则 iyy/izz 互换 (实测 chair_1 偏差 97.6%, 会让翻滚行为失真)。
     _rewrite_urdf_inertia(urdf_path, mesh_folder)
+
+    # 3.6 尺寸校验结果写进 URDF (只标记, 见 SIZE_LIMIT 注释)
+    _annotate_scale_check(urdf_path, max_extent, scale_anomaly)
 
     logger.info(f"    URDF saved to {urdf_path}")
     return urdf_path
@@ -694,14 +774,18 @@ def run_stage61(
     output_dir: str,
     vlm_checkpoint: str,
     validate: bool = False,
+    vlm_backend: str = "qwen",
+    vlm_model: str = None,
 ):
     """Stage 6.1 完整流程。
 
     Args:
         glb_path: final_scene_stage5.glb 路径
         output_dir: 输出目录
-        vlm_checkpoint: Qwen VLM 模型路径
+        vlm_checkpoint: Qwen VLM 模型路径 (vlm_backend="qwen" 时使用)
         validate: 是否执行 SAPIEN 验证
+        vlm_backend: "qwen"(本地) 或 "sensenova"(云端 OpenAI 兼容接口)
+        vlm_model: sensenova 后端使用的模型名, 默认 sensenova-6.8-flash-lite
     """
     logger.info("=" * 60)
     logger.info("Stage 6.1: URDF Generation + SAPIEN Validation")
@@ -717,7 +801,17 @@ def run_stage61(
 
     # ── Step 0: 初始化 ──
     logger.info("\n=== Step 0: Initializing ===")
-    qwen_client = QwenClient(vlm_checkpoint=vlm_checkpoint)
+    if vlm_backend == "sensenova":
+        from tools.sensenova_client import SenseNovaClient
+        _model = vlm_model or "sensenova-6.8-flash-lite"
+        qwen_client = SenseNovaClient(model=_model)
+        logger.info(f"VLM 后端: SenseNova ({_model})")
+    else:
+        qwen_client = QwenClient(vlm_checkpoint=vlm_checkpoint)
+        logger.info(f"VLM 后端: 本地 Qwen ({vlm_checkpoint})")
+    report["vlm_backend"] = vlm_backend
+    report["vlm_model"] = (vlm_model or "sensenova-6.8-flash-lite") \
+        if vlm_backend == "sensenova" else vlm_checkpoint
     urdf_generator = URDFGenerator(
         gpt_client=qwen_client,
         render_view_num=4,
@@ -808,7 +902,12 @@ if __name__ == "__main__":
     parser.add_argument("--glb", required=True, help="Path to final_scene_stage5.glb")
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument("--vlm_checkpoint", default="/mnt/data/lza/models/Qwen3.5-9B",
-                        help="Qwen VLM model path")
+                        help="本地 Qwen VLM 模型路径 (--vlm_backend qwen 时使用)")
+    parser.add_argument("--vlm_backend", default="qwen", choices=["qwen", "sensenova"],
+                        help="VLM 后端: qwen=本地 Qwen(默认, 离线); "
+                             "sensenova=云端 SenseNova (OpenAI 兼容, 需网络与额度)")
+    parser.add_argument("--vlm_model", default=None,
+                        help="sensenova 后端模型名, 默认 sensenova-6.8-flash-lite")
     parser.add_argument("--validate", action="store_true",
                         help="Run SAPIEN validation after URDF generation")
     parser.add_argument("--no_validate", action="store_false", dest="validate",
@@ -820,4 +919,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         vlm_checkpoint=args.vlm_checkpoint,
         validate=args.validate,
+        vlm_backend=args.vlm_backend,
+        vlm_model=args.vlm_model,
     )

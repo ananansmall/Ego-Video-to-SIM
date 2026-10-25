@@ -1,0 +1,49 @@
+{
+  "obj": "toy_inst1",
+  "best_pre_inst": 1,
+  "best_iou": 0.6867364746945899,
+  "candidates": [
+    {
+      "pre_inst": 1,
+      "iou": 0.6867364746945899,
+      "proj_area": 1035,
+      "mask_area": 898
+    },
+    {
+      "pre_inst": 2,
+      "iou": 0.5972477064220183,
+      "proj_area": 992,
+      "mask_area": 749
+    },
+    {
+      "pre_inst": 5,
+      "iou": 0.5873382624768947,
+      "proj_area": 1338,
+      "mask_area": 2097
+    },
+    {
+      "pre_inst": 4,
+      "iou": 0.5080213903743316,
+      "proj_area": 414,
+      "mask_area": 714
+    },
+    {
+      "pre_inst": 0,
+      "iou": 0.48739495798319327,
+      "proj_area": 474,
+      "mask_area": 234
+    },
+    {
+      "pre_inst": 3,
+      "iou": 0.4764705882352941,
+      "proj_area": 505,
+      "mask_area": 248
+    },
+    {
+      "pre_inst": 6,
+      "iou": 0.0374414976599064,
+      "proj_area": 1282,
+      "mask_area": 48
+    }
+  ]
+}

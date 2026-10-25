@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FoundationPose 批量跟踪 — 7_vggt_omega</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f6f7f9;color:#1f2429;font:15px/1.65 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:28px 16px 64px}
+.wrap{max-width:1240px;margin:0 auto}
+header h1{font-size:22px;margin-bottom:4px}
+header .sub{color:#6b7280;font-size:13px;font-family:ui-monospace,Consolas,monospace}
+.note{background:#fdf6ec;border-left:3px solid #b45309;color:#b45309;padding:12px 16px;
+      border-radius:0 8px 8px 0;margin:18px 0;font-size:13.5px}
+.legend{display:flex;gap:18px;flex-wrap:wrap;margin:14px 0;font-size:13px;color:#6b7280}
+.dot{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:18px}
+.card{background:#fff;border:1px solid #e4e7ec;border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.card>img{width:100%;display:block;background:#000;aspect-ratio:688/384;object-fit:cover}
+.body{padding:12px 14px;display:flex;flex-direction:column;gap:8px;flex:1}
+.title{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.title b{font-size:15px;font-family:ui-monospace,Consolas,monospace}
+.tag{font-size:11px;padding:1px 7px;border-radius:99px;background:#e7f3ec;color:#16703c}
+.tag.mid{background:#fef3e2;color:#b45309}
+.tag.low{background:#fdeaea;color:#b42318}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:3px 6px;border-bottom:1px solid #e4e7ec}
+th{color:#6b7280;font-weight:600;font-size:11px}
+td.num{font-family:ui-monospace,Consolas,monospace;text-align:right}
+.links{display:flex;gap:8px;margin-top:auto;padding-top:6px;flex-wrap:wrap}
+.links a{font-size:12px;color:#16703c;text-decoration:none;border:1px solid #e4e7ec;
+         border-radius:6px;padding:4px 9px}
+.links a:hover{background:#e7f3ec}
+details{margin-top:6px}
+summary{font-size:12px;color:#6b7280;cursor:pointer}
+details img{width:100%;margin-top:6px;border:1px solid #e4e7ec;border-radius:8px}
+</style></head><body><div class="wrap">
+<header>
+  <h1>FoundationPose 批量跟踪 · 7_vggt_omega</h1>
+  <div class="sub">8 个去重后实例 · mask 全部由 register IoU 自动匹配</div>
+</header>
+<div class="note">
+  <b>怎么读这张图</b>：绿色轮廓 = FoundationPose 位姿下 mesh 的投影；
+  <b>红色轮廓 = SAM3 真值 mask</b>。两者重合得好= 跟得准。<br>
+  <b>结论</b>：register（首帧）IoU 0.40~0.97 都准，但 <b>track 阶段会在静止物体上累积抖动</b>
+  （路径 3~7m，真实运动只有 0.002~0.34m）。多数 GIF 表现为「前几帧贴合、随后逐渐漂移」。
+</div>
+<div class="legend">
+  <span><i class="dot" style="background:#00dc00"></i>FP 投影</span>
+  <span><i class="dot" style="background:#ff0000"></i>SAM3 GT mask</span>
+  <span><i class="dot" style="background:#ff8c00"></i>历史轨迹尾迹</span>
+</div>
+<div class="grid">
+<div class="card">
+  <img src="plate_inst0/small.gif" alt="plate_inst0" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>plate_inst0</b><span class="tag ok">优 0.965</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">250 x 251 x 25 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.965</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.887</td></tr><tr><th>GT mask</th><td class="num">2432 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.109 m</td></tr><tr><th>FP 路径长度</th><td class="num">1.920 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">15 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="plate_inst0/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="plate_inst0/traj.png" target="_blank">轨迹图</a>
+      <a href="json/plate_inst0.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="toy_inst2/small.gif" alt="toy_inst2" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>toy_inst2</b><span class="tag ok">优 0.824</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">83 x 121 x 54 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.824</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.146</td></tr><tr><th>GT mask</th><td class="num">749 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.620 m</td></tr><tr><th>FP 路径长度</th><td class="num">4.569 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">28 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="toy_inst2/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="toy_inst2/traj.png" target="_blank">轨迹图</a>
+      <a href="json/toy_inst2.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="toy_inst0/small.gif" alt="toy_inst0" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>toy_inst0</b><span class="tag ok">优 0.752</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">90 x 112 x 79 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.752</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.653</td></tr><tr><th>GT mask</th><td class="num">898 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">1.109 m</td></tr><tr><th>FP 路径长度</th><td class="num">5.214 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">37 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="toy_inst0/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="toy_inst0/traj.png" target="_blank">轨迹图</a>
+      <a href="json/toy_inst0.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="block_inst2/small.gif" alt="block_inst2" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>block_inst2</b><span class="tag ok">优 0.696</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">67 x 68 x 35 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.696</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.467</td></tr><tr><th>GT mask</th><td class="num">234 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.606 m</td></tr><tr><th>FP 路径长度</th><td class="num">5.608 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">38 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="block_inst2/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="block_inst2/traj.png" target="_blank">轨迹图</a>
+      <a href="json/block_inst2.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="toy_inst1/small.gif" alt="toy_inst1" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>toy_inst1</b><span class="tag ok">优 0.687</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">69 x 99 x 83 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.687</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.318</td></tr><tr><th>GT mask</th><td class="num">898 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.980 m</td></tr><tr><th>FP 路径长度</th><td class="num">7.105 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">53 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="toy_inst1/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="toy_inst1/traj.png" target="_blank">轨迹图</a>
+      <a href="json/toy_inst1.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="block_inst0/small.gif" alt="block_inst0" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>block_inst0</b><span class="tag ok">优 0.649</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">82 x 87 x 21 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.649</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.263</td></tr><tr><th>GT mask</th><td class="num">748 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.243 m</td></tr><tr><th>FP 路径长度</th><td class="num">3.129 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">26 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="block_inst0/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="block_inst0/traj.png" target="_blank">轨迹图</a>
+      <a href="json/block_inst0.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="block_inst1/small.gif" alt="block_inst1" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>block_inst1</b><span class="tag ok">优 0.644</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">93 x 77 x 50 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.644</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.162</td></tr><tr><th>GT mask</th><td class="num">748 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.724 m</td></tr><tr><th>FP 路径长度</th><td class="num">5.037 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">38 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="block_inst1/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="block_inst1/traj.png" target="_blank">轨迹图</a>
+      <a href="json/block_inst1.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div><div class="card">
+  <img src="toy_inst3/small.gif" alt="toy_inst3" loading="lazy" width="344" height="192">
+  <div class="body">
+    <div class="title"><b>toy_inst3</b><span class="tag mid">中 0.397</span></div>
+    <table><tr><th>mesh 尺寸</th><td class="num">18 x 37 x 36 mm</td></tr><tr><th>register IoU (帧0)</th><td class="num">0.397</td></tr><tr><th>全帧 IoU 均值</th><td class="num">0.107</td></tr><tr><th>GT mask</th><td class="num">234 px / 113 帧</td></tr><tr><th>FP 净位移</th><td class="num">0.611 m</td></tr><tr><th>FP 路径长度</th><td class="num">3.867 m</td></tr><tr><th>逐帧 step 中位</th><td class="num">21 mm</td></tr></table>
+    <details><summary>轨迹图</summary><img src="toy_inst3/traj.png" alt="traj" loading="lazy"></details>
+    <div class="links">
+      <a href="toy_inst3/traj.png" target="_blank">轨迹图</a>
+      <a href="json/toy_inst3.json" target="_blank">IoU JSON</a>
+    </div>
+  </div>
+</div>
+</div>
+</div></body></html>

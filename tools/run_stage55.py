@@ -40,7 +40,7 @@ OPENCODE_BIN = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/o
 def find_input_glb(scene_dir, override=None):
     if override:
         return override
-    for name in ("final_scene_stage5.glb", "final_scene_stage4_5.glb", "final_scene.glb"):
+    for name in ("final_scene_stage5.glb", "final_scene_stage4_5.glb", "final_scene_basic.glb"):
         p = os.path.join(scene_dir, name)
         if os.path.isfile(p):
             return p
@@ -55,7 +55,11 @@ def build_agent_prompt(scene_dir, work_glb, max_rounds):
     if os.path.isdir(ref):
         frames = sorted(f for f in os.listdir(ref) if f.endswith((".jpg", ".png")))
         if frames:
-            ref_note = f"\n实拍参考帧 (真实场景照片, 用于判断物体语义位置): {os.path.join(ref, frames[0])} 等"
+            ref_note = (f"\n实拍参考帧 (真实场景照片, 用于判断物体语义位置): "
+                        f"{os.path.join(ref, frames[0])} 等\n"
+                        f"可用的参考图只有: {', '.join(frames)}\n"
+                        f"严禁读取不存在的其他图片文件 (不要按 instance_visibility 的帧号"
+                        f"自行拼图片路径); 读取失败就跳过该图, 继续下一步")
     return f"""你是场景布局精修 agent (stage5.5)。任务: 只调整物体位置, 消除碰撞并把物体放稳。
 
 场景目录: {scene_dir}
@@ -152,7 +156,7 @@ def main():
     ap.add_argument("--input_glb", default=None, help="覆盖输入 GLB (默认 final_scene_stage5.glb)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="opencode 模型")
     ap.add_argument("--max-agent-rounds", type=int, default=8)
-    ap.add_argument("--agent-timeout", type=int, default=1800)
+    ap.add_argument("--agent-timeout", type=int, default=3600)
     ap.add_argument("--skip-agent", action="store_true", help="只跑确定性流程 (调试用)")
     ap.add_argument("--no-nudge", action="store_true", help="跳过确定性碰撞兜底")
     args = ap.parse_args()

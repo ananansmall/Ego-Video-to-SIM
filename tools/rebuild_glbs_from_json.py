@@ -10,7 +10,7 @@
 
 GLB 命名与 mainv2.py 完全一致:
   initial          → final_scene_initial.glb
-  basic_refinement → final_scene.glb
+  basic_refinement → final_scene_basic.glb
   stage4           → final_scene_stage4.glb
   stage5           → final_scene_stage5.glb (无stage4时)
                    或 final_scene_stage4_5.glb (有stage4时)
@@ -45,7 +45,7 @@ ZUP_TO_YUP = np.array([
 # 阶段名 → mainv2.py 中的 GLB 文件名映射
 STAGE_TO_GLB = {
     "initial": "final_scene_initial.glb",
-    "basic_refinement": "final_scene.glb",
+    "basic_refinement": "final_scene_basic.glb",
     "stage4": "final_scene_stage4.glb",
     # stage5 的文件名取决于是否有 stage4, 在 main() 中动态决定
 }

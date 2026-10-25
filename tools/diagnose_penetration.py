@@ -50,7 +50,7 @@ def load_instances(scene_dir):
             return pkl_data, f"pkl: {os.path.basename(pkl_path)}"
 
     # Fallback: GLB
-    for glb_name in ["final_scene_stage4.glb", "final_scene_stage5.glb", "final_scene.glb"]:
+    for glb_name in ["final_scene_stage4.glb", "final_scene_stage5.glb", "final_scene_basic.glb"]:
         glb_path = os.path.join(scene_dir, glb_name)
         if os.path.isfile(glb_path):
             scene = trimesh.load_scene(glb_path)

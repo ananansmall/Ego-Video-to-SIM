@@ -50,7 +50,7 @@ apply_pose_changes.py — 根据位姿变化JSON对GLB应用变换
 
 注意事项:
     - 输入GLB建议使用 final_scene_initial.glb (初始位姿)，
-      而非 final_scene.glb (可能已包含后续阶段的变换)
+      而非 final_scene_basic.glb (可能已包含后续阶段的变换)
     - 如果物体在跨类去重中被合并(如chair被合并到toy)，
       该物体不会出现在pose_changes.json中，输出时保持原样
 """

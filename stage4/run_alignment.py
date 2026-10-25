@@ -10,7 +10,7 @@ It only requires the output directory produced by Stages 1-3.
 
 Required input directory layout:
     <input_path>/
-    ├── final_scene.glb       # Scene GLB from Stage 3
+    ├── final_scene_basic.glb       # Scene GLB from Stage 3
     ├── intrinsic.txt         # (3,3) camera intrinsic matrix
     ├── color/                # RGB images   (0.jpg, 1.jpg, ...)
     ├── depth/                # Depth maps   (0.png, ...) in mm uint16
@@ -117,10 +117,10 @@ def reconstruct_world_points(depths, extrinsics, intrinsic):
 
 
 def load_scene_instances(input_path):
-    """Load the final_scene.glb and extract per-object meshes."""
-    glb_path = os.path.join(input_path, 'final_scene.glb')
+    """Load the final_scene_basic.glb and extract per-object meshes."""
+    glb_path = os.path.join(input_path, 'final_scene_basic.glb')
     if not os.path.exists(glb_path):
-        raise FileNotFoundError(f"final_scene.glb not found in {input_path}")
+        raise FileNotFoundError(f"final_scene_basic.glb not found in {input_path}")
 
     scene = trimesh.load(glb_path)
 
@@ -263,11 +263,11 @@ def copy_input_data_to_output(input_path, output_dir):
             shutil.copy2(src, dst)
             print(f"  Copied: {fname}")
 
-    src_glb = os.path.join(input_path, 'final_scene.glb')
-    dst_glb = os.path.join(output_dir, 'final_scene.glb')
+    src_glb = os.path.join(input_path, 'final_scene_basic.glb')
+    dst_glb = os.path.join(output_dir, 'final_scene_basic.glb')
     if os.path.exists(src_glb) and not os.path.exists(dst_glb):
         shutil.copy2(src_glb, dst_glb)
-        print(f"  Copied: final_scene.glb")
+        print(f"  Copied: final_scene_basic.glb")
 
 
 def main():
@@ -298,7 +298,7 @@ Examples:
       --with_scale
         """)
     parser.add_argument('--input_path', type=str, required=True,
-                        help='Input directory with final_scene.glb + VGGT data (color/, depth/, extrinsics/, intrinsic.txt)')
+                        help='Input directory with final_scene_basic.glb + VGGT data (color/, depth/, extrinsics/, intrinsic.txt)')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory for aligned GLB (default: same as input_path)')
     parser.add_argument('--num_iterations', type=int, default=8,

@@ -3,7 +3,34 @@ import cv2
 import numpy as np
 import torch
 import trimesh
-import open3d as o3d
+try:
+    import open3d as o3d
+except Exception:  # hawor 环境未装 open3d; 用 numpy/scipy 兜底
+    o3d = None
+
+
+def _overlap_ratio_numpy(source_pts, target_pts, dist_thresh=None):
+    """get_overlap_ratio 的 numpy 兜底实现 (无 open3d 时)。
+
+    与 open3d 版逻辑一致:
+      1. bbox 不相交 → 0
+      2. overlap = source 中到 target 最近点距离 < 固定阈值 的比例
+    用 scipy 的 KDTree 算最近邻, 复杂度 O((N+M) log M), 比 open3d 的
+    compute_point_cloud_distance 慢一些但结果等价。
+    """
+    if dist_thresh is None:
+        dist_thresh = OVERLAP_DIST_THRESH
+    src = np.asarray(source_pts, dtype=np.float64)
+    tgt = np.asarray(target_pts, dtype=np.float64)
+    if len(src) == 0 or len(tgt) == 0:
+        return 0.0
+    s_min, s_max = src.min(axis=0), src.max(axis=0)
+    t_min, t_max = tgt.min(axis=0), tgt.max(axis=0)
+    if (s_max < t_min).any() or (s_min > t_max).any():
+        return 0.0
+    from scipy.spatial import cKDTree
+    d, _ = cKDTree(tgt).query(src, k=1)
+    return float(np.sum(d < dist_thresh) / len(src))
 
 class UnionFind:
     def __init__(self, elements):
@@ -20,15 +47,33 @@ class UnionFind:
         if rootX != rootY:
             self.parent[rootX] = rootY
 
-def get_overlap_ratio(source_pts, target_pts):
+# 重叠判据的固定距离阈值 (米)。
+# 为什么不能用"3 × 平均最近邻距离": 那个阈值随点云密度自缩放 —— 点越密,
+# 最近邻距离越小, 阈值越小。两个不同帧的 mask 即使罩着同一个物体, VGGT 的
+# 帧间重建漂移 (厘米级) 也会让几乎所有点落在那个被压到毫米级的阈值之外。
+# 实测 weixin_v10: button[0] 与 stone[0] 的 3D 中心只差 5cm、尺寸相当,
+# 明显是同一物体被 VLM 用两个名字各报一次, 但密度缩放阈值只算出
+# ov=0.042/0.011 → 跨类去重没合并, 于是一个物体变成两个实例。
+# 30mm 是实测选值: 该阈值下 button/stone 为 44%/95% (正确合并), 而
+# "物体已移动"(button[0] vs button[1]) 仍是 0%/0% (正确不合并),
+# "大云包住小物体"(stone vs device) 仍是 100%/11% 不对称 (and 规则挡住)。
+OVERLAP_DIST_THRESH = 0.03
+
+
+def get_overlap_ratio(source_pts, target_pts, dist_thresh=None):
     """
     Compute overlap ratio of source in target.
     Args:
         source_pts: numpy array of shape (N1, 3)
         target_pts: numpy array of shape (N2, 3)
+        dist_thresh: 判定"靠近"的距离阈值 (米)。None 用 OVERLAP_DIST_THRESH。
     Returns:
         Overlap_ratio of source pcd in target pcd
     """
+    if dist_thresh is None:
+        dist_thresh = OVERLAP_DIST_THRESH
+    if o3d is None:
+        return _overlap_ratio_numpy(source_pts, target_pts, dist_thresh)
     source_pcd = o3d.geometry.PointCloud()
     source_pcd.points = o3d.utility.Vector3dVector(source_pts)
     
@@ -49,13 +94,11 @@ def get_overlap_ratio(source_pts, target_pts):
         s_max[2] < t_min[2] or s_min[2] > t_max[2]):   # Z
         return 0.0
     
-    # Further computation
-    threshold = np.mean(source_pcd.compute_nearest_neighbor_distance()) * 3.0
-    
+    # 用固定物理阈值, 不用"3 × 平均最近邻距离" (密度自缩放, 见上方常量注释)
     dists = source_pcd.compute_point_cloud_distance(target_pcd)
     dists = np.asarray(dists)
 
-    overlap_count = np.sum(dists < threshold)
+    overlap_count = np.sum(dists < dist_thresh)
     return overlap_count / len(source_pcd.points)
 
 def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, category_name=""):
@@ -324,7 +367,17 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
 
             ov1, ov2 = overlap_matrix[key]
 
-            if ov1 >= overlap_thre or ov2 >= overlap_thre:
+            # 必须双向都超阈值才算"同一物体被检出成两个类别"。
+            #
+            # 为什么从 or 改成 and: 单向成立会误吞真实的相邻物体。
+            # 小物体叠在大物体上时, 小物体点云有很大比例落在大物体附近
+            # (ov_small→big 很高), 但反过来大物体只有很小比例靠近小物体
+            # (ov_big→small 很低) —— 用 or 就会把两个不同的物体合并掉。
+            # 实测 basic_pick_place_66: duck_0 + toy_2 的 ov1=0.113 / ov2=0.784,
+            # 靠 or 被合并, 而真实情况是两个独立物体。
+            # 真重复的特征是双向都接近 1: 同场景 block_0+cube_0 是 1.000/0.999,
+            # bowl_0+cup_0 是 0.936/0.967, 改为 and 后这些仍会正确合并。
+            if ov1 >= overlap_thre and ov2 >= overlap_thre:
                 uf.union(i, j)
                 cross_merge_details.append(
                     f"    {ci['category']}_{ci['inst_idx']} + {cj['category']}_{cj['inst_idx']} ← "
@@ -403,7 +456,12 @@ def merge_dynamic_splits_all(all_masks, world_points, world_points_conf, conf_k=
             label_j = f"{cj['category']}_{cj['inst_idx']}"
 
             # ===== 1. 静态重叠 =====
-            if ov1 >= overlap_thre or ov2 >= overlap_thre:
+            # 同 cross_category_deduplicate: 改 or → and。
+            # 单向成立会把"小物体叠在大物体上"误判成同一物体。
+            # 非对称的情形交给下面的规则 2 (静态遮挡) 处理 —— 那里用
+            # max_ov >= subset_thre AND min_ov < overlap_thre 并附加存活时长证据,
+            # 比单纯的 or 判据可靠。
+            if ov1 >= overlap_thre and ov2 >= overlap_thre:
                 uf.union(i, j)
                 merge_details.append(f"    {label_i} + {label_j} ← static_overlap: ov1={ov1:.3f}, ov2={ov2:.3f}")
                 continue

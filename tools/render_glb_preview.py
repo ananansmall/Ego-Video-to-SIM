@@ -2,7 +2,7 @@
 """Render a GLB scene to a multi-view preview PNG (headless EGL, no display needed).
 
 Usage:
-    python tools/render_glb_preview.py output_v2/xxx/final_scene.glb
+    python tools/render_glb_preview.py output_v2/xxx/final_scene_basic.glb
     python tools/render_glb_preview.py a.glb b.glb --output preview.png --views front,iso
 
 Outputs a 2x2 grid (front / side / top / iso) with vertex colors or textures,
@@ -194,16 +194,38 @@ def render_camera_views(glb_path, scene_dir, frame_ids, max_width=1024):
     light = pyrender.DirectionalLight(intensity=3.0)
     renderer = pyrender.OffscreenRenderer(fw, fh)
 
+    # ── 自动取景: 沿原始注视方向后退 ──
+    # ego 手持相机的原始机位离物体只有 0.2~0.8m (贴脸拍摄), 直接用原始
+    # 外参渲染出来是物体内部的特写碎片 (实测 2chair camview 整屏木纹)。
+    # 保留每帧的注视方向与横滚, 把机位沿视线退到能框住整个场景的距离。
+    _sb = np.asarray(scene.bounds, dtype=np.float64)
+    _sc_center = _sb.mean(axis=0)
+    _sc_radius = max(float(np.linalg.norm(_sb[1] - _sb[0])) / 2, 0.15)
+    _cam_dist = max(_sc_radius * 2.6, 0.6)
+
+    def _backed_off_pose(w2c):
+        c2w = np.asarray(w2c, dtype=np.float64)
+        eye = c2w[:3, 3]
+        d = _sc_center - eye
+        n = float(np.linalg.norm(d))
+        if n < 1e-6:
+            return w2c_to_pyrender_pose(c2w)
+        d /= n
+        up = c2w[:3, 1]
+        if abs(float(np.dot(up, d))) > 0.99:
+            up = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        return look_at(_sc_center - d * _cam_dist, _sc_center, up=up)
+
     tiles = []
     try:
-        first_pose = w2c_to_pyrender_pose(extrinsics[frame_ids[0]])
+        first_pose = _backed_off_pose(extrinsics[frame_ids[0]])
         cam_node = scene.add(cam, pose=first_pose, name="camview_cam")
         light_node = scene.add(light, pose=first_pose, name="camview_light")
         for fid in frame_ids:
             if fid not in extrinsics:
                 print(f"⚠️ 缺少 extrinsics/{fid}.txt, 跳过")
                 continue
-            pose = w2c_to_pyrender_pose(extrinsics[fid])
+            pose = _backed_off_pose(extrinsics[fid])
             scene.set_pose(cam_node, pose)
             scene.set_pose(light_node, pose)
             img, _ = renderer.render(scene)

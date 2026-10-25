@@ -73,9 +73,29 @@ def pca_init_rots(pts):
     return rots
 
 
-def icp_mesh_to_cloud(mesh, cloud, init_rots=None, thr=0.05):
+def axis_align_inits(v_m, a_gt):
+    """mesh 长轴 v_m 对到 ±GT 长轴 a_gt 的旋转, 再绕 a_gt 加 0/90/180/270 自转
+    (旋转对称物体的自转不可观, 全部枚举为 ICP 初始值)。"""
+    from scipy.spatial.transform import Rotation
+    v = np.asarray(v_m, float)
+    v /= np.linalg.norm(v)
+    a = np.asarray(a_gt, float)
+    a /= np.linalg.norm(a)
+    inits = []
+    for s in (1.0, -1.0):
+        R0 = Rotation.align_vectors([s * a], [v])[0].as_matrix()
+        for k in range(4):
+            Rspin = Rotation.from_rotvec(a * np.pi * k / 2).as_matrix()
+            inits.append(Rspin @ R0)
+    return inits
+
+
+def icp_mesh_to_cloud(mesh, cloud, init_rots=None, thr=0.05, axis_pair=None):
     """open3d ICP: point-to-point 粗 + point-to-plane 精, 多初始值取最优。
-    mesh 原点可能离物体质心很远 (toy 0.62m), 先质心平移对齐再 ICP。"""
+    mesh 原点可能离物体质心很远 (toy 0.62m), 先质心平移对齐再 ICP。
+    axis_pair=(v_m, a_gt): 长轴朝向约束 —— bottle 等近旋转对称物体 ICP 会锚歪
+    ~70° 的错误局部极小 (3chair-bottle 实测 P0 偏 149°), 先按
+    |R@v_m · a_gt| >= 0.90 过滤候选再选 rmse 最小, 无候选过轴才回退全局最优。"""
     import open3d as o3d
     src = o3d.geometry.PointCloud()
     src.points = o3d.utility.Vector3dVector(mesh)
@@ -84,9 +104,11 @@ def icp_mesh_to_cloud(mesh, cloud, init_rots=None, thr=0.05):
     dst.estimate_normals()
 
     c_dst = cloud.mean(0)
-    best = None
+    results = []
     # mesh 可能本身就是世界系摆放的 (真值变换≈单位阵), 单位阵必须参与尝试
     inits = [np.eye(3)] + (init_rots or [])
+    if axis_pair is not None:
+        inits += axis_align_inits(*axis_pair)
     for R0 in inits:
         T = np.eye(4)
         T[:3, :3] = R0
@@ -104,9 +126,18 @@ def icp_mesh_to_cloud(mesh, cloud, init_rots=None, thr=0.05):
                 best1 = (reg2.inlier_rmse, reg2.fitness, reg2.transformation)
         except Exception:
             pass
-        if best is None or best1[0] < best[0]:
-            best = best1
-    return best[2], best[0], best[1]  # P0(mesh->world), rmse, fitness
+        results.append(best1)
+
+    def _adot(r):
+        av = r[2][:3, :3] @ np.asarray(axis_pair[0], float)
+        return abs(float(av @ axis_pair[1]) / np.linalg.norm(av))
+
+    if axis_pair is not None:
+        good = [r for r in results if _adot(r) >= 0.90]
+        best = min(good or results, key=lambda r: r[0])
+        return best[2], best[0], best[1], _adot(best)
+    best = min(results, key=lambda r: r[0])
+    return best[2], best[0], best[1], None
 
 
 def kabsch(src, dst, w):
@@ -251,8 +282,12 @@ def main():
     ok0 = np.isfinite(z0)
     pc0 = backproject_uv(xx[ok0].astype(float), yy[ok0].astype(float), z0[ok0], Ks[q_t])
     Xc0 = (c2w[q_t] @ np.column_stack([pc0, np.ones(len(pc0))]).T).T[:, :3]
-    P0, rmse, fit = icp_mesh_to_cloud(ms, Xc0, pca_init_rots(ms))
-    print(f'ICP: rmse={rmse * 1000:.1f}mm fitness={fit:.2f} '
+    # 长轴朝向约束: GT 点云与 mesh 各自的 PCA 主轴 (bottle 等旋转对称物体的 ICP 朝向锚)
+    _, _, vt_c = np.linalg.svd(Xc0 - Xc0.mean(0), full_matrices=False)
+    _, _, vt_m = np.linalg.svd(ms - ms.mean(0), full_matrices=False)
+    P0, rmse, fit, adot = icp_mesh_to_cloud(ms, Xc0, pca_init_rots(ms),
+                                            axis_pair=(vt_m[0], vt_c[0]))
+    print(f'ICP: rmse={rmse * 1000:.1f}mm fitness={fit:.2f} axis_dot={adot:.2f} '
           f'(mesh {len(mesh.vertices)}v, cloud {len(Xc0)}pts)')
 
     x_loc = (np.linalg.inv(P0) @ np.column_stack(
