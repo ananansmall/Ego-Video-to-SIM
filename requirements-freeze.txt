@@ -12,7 +12,7 @@ anyio==4.13.0
 argon2-cffi==25.1.0
 argon2-cffi-bindings==25.1.0
 arrow==1.4.0
-asmk @ file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/mast3r/asmk
+# asmk: 本地 editable 安装（mast3r/），需单独 git clone + pip install -e
 astor==0.8.1
 asttokens==3.0.1
 async-lru==2.3.0
@@ -261,7 +261,7 @@ optimum==1.18.1
 optree==0.14.1
 orjson==3.10.0
 overrides==7.7.0
-packaging @ file:///home/conda/feedstock_root/build_artifacts/packaging_1733203243479/work
+# packaging: conda 构建产物路径，请用 `pip install packaging` 按需装
 Panda3D==1.10.16
 panda3d-gltf==1.2.1
 panda3d-simplepbr==0.13.1
@@ -363,9 +363,9 @@ safehttpx==0.1.7
 safetensors==0.7.0
 sagemaker==2.242.0
 sagemaker-core==1.0.78
-sam3 @ file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/sam3
+# sam3: 本地 editable 安装（ReplicateAnyScene/），需单独 git clone + pip install -e
 ## !! Could not determine repository location
--e /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/sam-3d-objects
+# sam-3d-objects: 本地 editable 安装（-e sam-3d-objects/），需单独获取源码
 sapien==3.0.3
 schema==0.7.8
 scikit-image==0.23.1
@@ -441,7 +441,7 @@ usort==1.0.8.post1
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900
 uvicorn==0.46.0
 ## !! Could not determine repository location
--e /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/vggt
+# vggt: 本地 editable 安装（-e vggt/），需单独获取源码
 -e git+https://github.com/facebookresearch/vggt-omega.git@399d4d62935deb71cedb1e1c35b7a90413a6bee4#egg=vggt_omega
 viser==1.0.29
 vtk==9.6.1
