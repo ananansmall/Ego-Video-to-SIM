@@ -633,6 +633,23 @@ def _box_fallback_segment(category, video_predictor, session_id, box_provider,
                     _best_score, _best_mask = _score, _m
             if _best_mask is None:
                 continue
+            # ── 矩形收缩 ──
+            # VLM 给的框是"外接框", 比物体本身大一圈; 直接栅格化会把框内的
+            # **背景点**也包进来。小物体坐在大平面上时后果严重: 实测 wx7 的
+            # earbud case 兜底矩形面积 3762px (真实物体约 1500px), 框内包含
+            # 桌面点 → 与 table 点云重叠率达 0.604, 超过官方跨类 OR@0.5 阈值
+            # → 耳机盒被并进桌子, 整个物体消失。
+            # 这里把矩形向中心收缩 25% (保留中心 75%), 排除框边缘的背景。
+            _ys, _xs = np.where(_best_mask)
+            if len(_ys) > 8:
+                _cy0, _cy1 = _ys.min(), _ys.max()
+                _cx0, _cx1 = _xs.min(), _xs.max()
+                _ky = int((_cy1 - _cy0) * 0.125)
+                _kx = int((_cx1 - _cx0) * 0.125)
+                _tight = np.zeros_like(_best_mask)
+                _tight[_cy0 + _ky:_cy1 - _ky + 1, _cx0 + _kx:_cx1 - _kx + 1] = True
+                if _tight.sum() > 8:
+                    _best_mask = _tight
             _mask = _best_mask
             # 注意结构: _split_instances 返回的是"实例列表", 每项是"帧字典列表"。
             # 这里必须同样返回 [[{frame_id,mask}, ...]] (一个实例, 多帧),

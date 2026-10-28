@@ -18,8 +18,6 @@ def _overlap_ratio_numpy(source_pts, target_pts, dist_thresh=None):
     用 scipy 的 KDTree 算最近邻, 复杂度 O((N+M) log M), 比 open3d 的
     compute_point_cloud_distance 慢一些但结果等价。
     """
-    if dist_thresh is None:
-        dist_thresh = OVERLAP_DIST_THRESH
     src = np.asarray(source_pts, dtype=np.float64)
     tgt = np.asarray(target_pts, dtype=np.float64)
     if len(src) == 0 or len(tgt) == 0:
@@ -29,8 +27,15 @@ def _overlap_ratio_numpy(source_pts, target_pts, dist_thresh=None):
     if (s_max < t_min).any() or (s_min > t_max).any():
         return 0.0
     from scipy.spatial import cKDTree
+    # 与 open3d 路径一致: 阈值 = source 平均最近邻距离 × 3 (尺度无关)
+    if len(src) > 1:
+        d_nn, _ = cKDTree(src).query(src, k=2)
+        threshold = float(np.mean(d_nn[:, 1])) * 3.0
+    else:
+        d0, _ = cKDTree(tgt).query(src, k=1)
+        threshold = float(d0[0]) * 3.0 if d0[0] > 0 else 1e-6
     d, _ = cKDTree(tgt).query(src, k=1)
-    return float(np.sum(d < dist_thresh) / len(src))
+    return float(np.sum(d < threshold) / len(src))
 
 class UnionFind:
     def __init__(self, elements):
@@ -58,6 +63,23 @@ class UnionFind:
 # "物体已移动"(button[0] vs button[1]) 仍是 0%/0% (正确不合并),
 # "大云包住小物体"(stone vs device) 仍是 100%/11% 不对称 (and 规则挡住)。
 OVERLAP_DIST_THRESH = 0.03
+
+# 类内去重是否启用"AABB 中心互含"判据 (默认开)。关掉可回到纯点重叠行为,
+# 用于 A/B 对比与出问题时的快速回退。
+# 实测结论: 默认关闭。原因 —— 紧密摆放的同类小物体 (basic_pick_place_17 的
+# 9 个 toy 挤在 0.3m 范围内) 会因"中心互相包含"被全部合成 1~2 个, 属于严重
+# 误合并。而它想解决的"同一物体被切成不同面"(112 的 cabinet) 与"相邻两个
+# 真实物体"在纯几何上无法区分 —— 前者合并比不合并更危险, 因此默认关闭。
+SELF_DEDUP_BBOX_MERGE = False
+
+# 类内去重是否启用"碎片合并"判据 (默认开)。
+# 与上面的 BBOX_MERGE(中心互含) 不同: 这条只对**体积悬殊**的碎片生效,
+# 因此不会误合并并排的同尺寸物体。
+# 实测结论: 默认关闭。它想解决的 wx7 椅子两段, 在**点云层体积相当**
+# (0.484 vs 0.395, 比 0.82), 不是"碎片 vs 主体", 规则不适用; 而在
+# basic_pick_place_17/66 上它误合并了真实物体 (toy 6→5、fish/bowl/dice 消失)。
+# 真正的瓶口在 SAM3D 单帧重建与视频本身只拍到椅面特写, 不是去重能修的。
+SELF_DEDUP_FRAGMENT_MERGE = False
 
 
 def get_overlap_ratio(source_pts, target_pts, dist_thresh=None):
@@ -94,14 +116,18 @@ def get_overlap_ratio(source_pts, target_pts, dist_thresh=None):
         s_max[2] < t_min[2] or s_min[2] > t_max[2]):   # Z
         return 0.0
     
-    # 用固定物理阈值, 不用"3 × 平均最近邻距离" (密度自缩放, 见上方常量注释)
+    # 官方原版: 阈值随点云密度自缩放 (尺度无关)。
+    # VGGT 输出的是**相对尺度**, 不是米制 —— 点云可能是真实尺寸的 0.1 倍或
+    # 10 倍。固定 30mm 在这种坐标系里没有意义; "平均最近邻距离 × 3" 与绝对
+    # 尺度无关, 才是正确设计 (见 xiac20/ReplicateAnyScene 原版)。
+    threshold = float(np.mean(source_pcd.compute_nearest_neighbor_distance())) * 3.0
     dists = source_pcd.compute_point_cloud_distance(target_pcd)
     dists = np.asarray(dists)
 
-    overlap_count = np.sum(dists < dist_thresh)
+    overlap_count = np.sum(dists < threshold)
     return overlap_count / len(source_pcd.points)
 
-def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, category_name=""):
+def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=50, overlap_thre=0.3, category_name=""):
     '''
     Deduplication inside a single category (only 3D point cloud overlap_ratio)
     Args:
@@ -184,13 +210,69 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
             ov1 = get_overlap_ratio(instance_point_arrays[i], instance_point_arrays[j])
             ov2 = get_overlap_ratio(instance_point_arrays[j], instance_point_arrays[i])
 
-            if ov1 >= overlap_thre or ov2 >= overlap_thre:
+            # ── 追加判据: AABB 中心互含 + 体积可比 ──
+            # 为什么点重叠不够: SAM3 会把同一个物体按"可见面"切成多个 fragment
+            # (实测 112 的 cabinet: 一个柜子的正面和侧面各成一个 instance)。
+            # 两个 fragment 的点云落在**相邻平面**上, 30mm 阈值下几乎不重叠
+            # (实测 ov=0.064), 但它们的 AABB 高度重叠、且一方中心落在另一方
+            # AABB 内 —— 这是"同一个物体的不同部分"的强信号。
+            #
+            # 只加"中心互含"而不只加 bbox IoU 的原因: 相邻的两件同类物体
+            # (并排的两个柜子) bbox 会重叠但中心互不包含, 不会被误合。
+            # 体积比 > 0.15 兜底: 防止一个大物体把恰好落在它 bbox 内的小物体
+            # (同类别, 比如大箱子边上的小盒子) 吞掉。
+            _bbox_merged = False
+            _frag_merged = False
+            _frag_reason = ""
+            _bbox_reason = ""
+            _bbox_merged_note = False
+            try:
+                pa, pb = instance_point_arrays[i], instance_point_arrays[j]
+                ba = np.array([pa.min(0), pa.max(0)], dtype=float)
+                bb = np.array([pb.min(0), pb.max(0)], dtype=float)
+                ca = (ba[0] + ba[1]) / 2.0
+                cb = (bb[0] + bb[1]) / 2.0
+                in_a = bool(np.all((cb >= ba[0]) & (cb <= ba[1])))
+                in_b = bool(np.all((ca >= bb[0]) & (ca <= bb[1])))
+                va = float(np.prod(np.maximum(ba[1] - ba[0], 1e-6)))
+                vb = float(np.prod(np.maximum(bb[1] - bb[0], 1e-6)))
+                vol_ratio = min(va, vb) / max(va, vb)
+                if SELF_DEDUP_BBOX_MERGE and (in_a or in_b) and vol_ratio > 0.15:
+                    _bbox_merged = True
+                    _bbox_reason = (f"bbox中心互含(in_a={in_a},in_b={in_b}), "
+                                    f"体积比={vol_ratio:.2f}")
+
+                # ── 碎片合并: AABB 相接 + 体积悬殊 ──
+                # 实测 wx7: 一把灰椅被 SAM3 切成"椅面主体"(1.30x1.13x0.93) 和
+                # "左边缘靠背碎片"(0.65x0.65x0.23)。两者在 2D 上既不重叠也不
+                # 相邻(相隔 >20px), 3D 点云重叠只有 0.06 —— 但 AABB 在 y 方向
+                # 正好相接(0.71 / 0.70), 体积比 0.071。
+                # 判据: 同类 + AABB 间隙 < 大物体对角线的 5% + 体积比 < 0.15。
+                # 只对"体积悬殊"生效 —— 并排的同尺寸物体(如 9 个玩具, 体积比
+                # 通常 >0.3) 不会被误合, 这是与 BBOX_MERGE 的关键区别。
+                _diag = float(np.linalg.norm(ba[1] - ba[0]))
+                _gap = float(np.max(np.maximum(ba[0], bb[0]) - np.minimum(ba[1], bb[1])))
+                if (SELF_DEDUP_FRAGMENT_MERGE and _gap < 0.05 * max(_diag, 1e-6)
+                        and vol_ratio < 0.15):
+                    _frag_merged = True
+                    _frag_reason = (f"碎片合并(gap={_gap:.4f}m, "
+                                    f"体积比={vol_ratio:.3f})")
+            except Exception:
+                _bbox_merged = False
+
+            _bbox_merged = _bbox_merged or _frag_merged
+            if _frag_merged and not _bbox_merged_note:
+                _bbox_reason = _frag_reason
+
+            if ov1 >= overlap_thre or ov2 >= overlap_thre or _bbox_merged:
                 uf.union(i, j)
                 reason = []
                 if ov1 >= overlap_thre:
                     reason.append(f"ov1={ov1:.3f}>={overlap_thre}")
                 if ov2 >= overlap_thre:
                     reason.append(f"ov2={ov2:.3f}>={overlap_thre}")
+                if _bbox_merged:
+                    reason.append(_bbox_reason)
                 merge_details.append(f"    inst_{valid_indices[i]} + inst_{valid_indices[j]} ← {', '.join(reason)}")
                 
     groups = {}
@@ -229,7 +311,7 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
     return deduplicated_category_masks
 
 
-def _build_candidates(all_masks, world_points, world_points_conf, conf_k=30):
+def _build_candidates(all_masks, world_points, world_points_conf, conf_k=50):
     """从 all_masks 构建 candidate 列表，每个 candidate 包含 3D 点云、时间信息等。"""
     all_candidates = []
     for cat_name, instances_list in all_masks.items():
@@ -286,8 +368,21 @@ def _merge_candidates_to_masks(all_candidates, uf, N):
 
     deduplicated_all_masks = {}
     for group_indices in final_groups.values():
-        # 选择长寿命实例的 category
-        target_idx = max(group_indices, key=lambda x: all_candidates[x]['time_total'])
+        # 选择"证据最多"的实例的 category, 三级判据:
+        #   ① 帧数 time_total —— 跟踪时长
+        #   ② 3D 点数 len(points) —— 覆盖面积/采样量
+        #   ③ 类别名排序 —— 只在完全平手时保证确定性
+        #
+        # 为什么不能只比帧数: 实测 output_v3/wxD 里 table[1] 和 chair[1] 都是
+        # 34 帧, `max()` 平手返回**先遍历到的那个** —— 而候选列表里 table 排在
+        # chair 前面, 于是同一把椅子被命名为 table, 用户看到"多出来一把椅子"。
+        # 实测 3D 点数 chair=2998154 > table=2992762, 用点数能正确分出胜负
+        # (证据更多的一方代表该物体)。
+        _ordered = sorted(group_indices,
+                          key=lambda x: (all_candidates[x]["category"], x))
+        target_idx = max(_ordered,
+                         key=lambda x: (all_candidates[x]["time_total"],
+                                        len(all_candidates[x]["points"])))
         cat = all_candidates[target_idx]["category"]
 
         merged_masks_dict = {}
@@ -312,7 +407,7 @@ def _merge_candidates_to_masks(all_candidates, uf, N):
     return deduplicated_all_masks
 
 
-def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, **kwargs):
+def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=50, overlap_thre=0.5, **kwargs):
     '''
     Cross-category deduplication (only different categories, only 3D overlap_ratio).
     Same-category pairs are skipped — they are handled by self_category_deduplicate.
@@ -377,7 +472,37 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
             # 靠 or 被合并, 而真实情况是两个独立物体。
             # 真重复的特征是双向都接近 1: 同场景 block_0+cube_0 是 1.000/0.999,
             # bowl_0+cup_0 是 0.936/0.967, 改为 and 后这些仍会正确合并。
-            if ov1 >= overlap_thre and ov2 >= overlap_thre:
+            # 官方原版: OR @ 0.5 (任一向重叠过半即合并)。
+            # 一个物体被切成"整体 + 局部"时, 局部→整体接近 1.0 而整体→局部很低,
+            # 用 AND 会漏合 (实测 duck_0+toy_2: ov1=0.113, ov2=0.784 → 官方会合并,
+            # 而 0.784 的点重合足以说明它们是同一物体)。
+            #
+            # ── 体积悬殊保护 ──
+            # OR 规则的固有问题: **小物体放在大物体表面上**时, 小物体的点绝大多数
+            # 都落在大物体的范围内 → ov(小→大) 很高 → 被并进大物体, 小物体消失。
+            # 实测 wx7: earbud case (0.1m) 与 table (1.05×0.97×0.75) 的
+            # ov2=0.604 ≥ 0.5 → 耳机盒被并进桌子, 整个物体没了。
+            # 但两者体积比是 1:10^4 —— 无论重叠多少, 都只可能是"桌上放了个小东西",
+            # 不可能是同一个物体。用 AABB 体积比做门禁, 与类别无关。
+            _vol_ok = True
+            try:
+                _bi = ci["points"]
+                _bj = cj["points"]
+                _ei = _bi.max(0) - _bi.min(0)
+                _ej = _bj.max(0) - _bj.min(0)
+                _vi = float(np.prod(np.maximum(_ei, 1e-6)))
+                _vj = float(np.prod(np.maximum(_ej, 1e-6)))
+                _vr = min(_vi, _vj) / max(_vi, _vj)
+                _vol_ok = _vr >= 0.10
+            except Exception:
+                _vol_ok = True
+            if (ov1 >= overlap_thre or ov2 >= overlap_thre) and not _vol_ok:
+                cross_merge_details.append(
+                    f"    {ci['category']}_{ci['inst_idx']} + {cj['category']}_{cj['inst_idx']} ← "
+                    f"SKIP 体积悬殊 (ov={ov1:.3f}/{ov2:.3f}, 体积比={_vr:.3f}<0.10)"
+                )
+                continue
+            if ov1 >= overlap_thre or ov2 >= overlap_thre:
                 uf.union(i, j)
                 cross_merge_details.append(
                     f"    {ci['category']}_{ci['inst_idx']} + {cj['category']}_{cj['inst_idx']} ← "
@@ -395,7 +520,7 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
     return deduplicated_all_masks
 
 
-def merge_dynamic_splits_all(all_masks, world_points, world_points_conf, conf_k=30,
+def merge_dynamic_splits_all(all_masks, world_points, world_points_conf, conf_k=50,
                               overlap_thre=0.3, subset_thre=0.5, dynamic_ov_thre=0.2,
                               lifespan_thre=0.5, gap_thre=10):
     '''

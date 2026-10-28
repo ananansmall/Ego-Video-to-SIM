@@ -607,6 +607,113 @@ def repair_floor_relations(all_instances, refined_relations, verbose=True,
     return refined_relations, n_fixed
 
 
+def resolve_orphan_wall_relations(all_instances, refined_relations, verbose=True,
+                                  flat_thre=0.20, drop_flat_fragments=True):
+    """处理"关系是挂墙、但场景里没有墙"的孤儿实例。
+
+    为什么需要: Stage1 的 VLM 常把**墙面本身**报成 curtain (3chair 场景报了 7 个
+    curtain, 关系全是 attached to wall), 但 Stage3 并不会生成 wall 实例 —— 于是
+    这些实例没有任何参照面, 既不会被落地补正 (它不属于 floor), 也不会被 reseat
+    (它没有支撑物), 最终停在 VGGT 的原始位置: 有的悬在半空 (curtain_0 底 z=+0.317),
+    有的陷进地下 (curtain_5 -0.139 / curtain_6 -0.108)。
+
+    分治判据 (纯几何, 不依赖类别名):
+      · 扁平度 = min(ext)/max(ext) < 0.20 → 极薄片, 是墙面/隔板被切成"物体"的
+        碎片, 不是实体物件 → 直接剔除 (它本来就不该出现在场景里)
+      · 其余 → 是块状实体, 只是关系标错 → 回退 supported by floor, 交给落地补正
+        (这样它会贴到 z=0, 不再是悬空/陷地的白片)
+
+    Args:
+        all_instances: {category: [instance_info, ...]}, 原地修改 (可能删元素)
+        refined_relations: {实例名: 关系}, 原地修改
+        flat_thre: 扁平度阈值
+        drop_flat_fragments: 是否剔除极薄片 (False 则也回退 floor)
+    Returns:
+        (all_instances, refined_relations, n_dropped, n_refallback)
+    """
+    import numpy as _np
+
+    # 场景里有没有墙? (类别名含 wall, 或者类别本身就叫 wall)
+    has_wall = any("wall" in str(c).lower() for c in all_instances)
+    # 统计有多少实例声明"挂墙"
+    orphans = [n for n, r in refined_relations.items()
+               if "attach" in str(r).lower() and "wall" in str(r).lower()]
+    if not orphans:
+        return all_instances, refined_relations, 0, 0
+    if has_wall:
+        return all_instances, refined_relations, 0, 0
+
+    # 建 名→(cat,idx) 索引
+    index = {}
+    for _c, _lst in all_instances.items():
+        for _i in range(len(_lst)):
+            index[f"{_c}_{_i}"] = (_c, _i)
+
+    drop_keys = []
+    refallback = 0
+    for name in orphans:
+        if name not in index:
+            continue
+        _c, _i = index[name]
+        _info = all_instances[_c][_i]
+        try:
+            _m = _info["original_mesh"].copy()
+            _m.apply_transform(_np.asarray(_info["T"], dtype=float))
+            _e = _m.bounds[1] - _m.bounds[0]
+            _flat = float(min(_e) / max(max(_e), 1e-9))
+        except Exception:
+            _flat = 1.0
+        if drop_flat_fragments and _flat < flat_thre:
+            drop_keys.append(name)
+            if verbose:
+                print(f"      [挂墙孤儿] {name}: 极薄片 (扁平度 {_flat:.3f} < "
+                      f"{flat_thre}) → 剔除 (墙面碎片, 非实物)", flush=True)
+        else:
+            refined_relations[name] = "supported by floor"
+            refallback += 1
+            if verbose:
+                print(f"      [挂墙孤儿] {name}: 块状实物 (扁平度 {_flat:.3f}) → "
+                      f"回退 supported by floor", flush=True)
+
+    # ── 剔除 + 索引重映射 ──
+    # 删掉同一类别中间的元素会让后面的序号前移 (curtain_3 → curtain_2),
+    # 所以要先按"旧下标"分区、建立 旧→新 名字映射, 再重建 all_instances
+    # 和 refined_relations, 避免关系名与实例错位。
+    if drop_keys:
+        _by_cat = {}
+        for _n in drop_keys:
+            _c, _i = index[_n]
+            _by_cat.setdefault(_c, set()).add(_i)
+
+        _new_instances = {}
+        _old2new = {}          # (cat, old_idx) -> new_name
+        for _c, _lst in all_instances.items():
+            _keep = [j for j in range(len(_lst)) if j not in _by_cat.get(_c, set())]
+            if not _keep:
+                continue
+            _new_instances[_c] = [_lst[j] for j in _keep]
+            for _new_i, _old_i in enumerate(_keep):
+                _old2new[(_c, _old_i)] = f"{_c}_{_new_i}"
+
+        _new_rel = {}
+        for _n, _r in refined_relations.items():
+            _hit = None
+            for (_c, _i), _new_name in _old2new.items():
+                if _n == f"{_c}_{_i}":
+                    _hit = _new_name
+                    break
+            if _hit is not None:
+                _new_rel[_hit] = _r
+            elif _n in _new_instances:      # 类别级关系 (键是类别名)
+                _new_rel[_n] = _r
+            # 其余 (被剔除的实例名) 丢弃
+
+        all_instances = _new_instances
+        refined_relations = _new_rel
+
+    return all_instances, refined_relations, len(drop_keys), refallback
+
+
 def fix_supporter_instance(all_instances, refined_relations, verbose=True,
                            min_overlap=0.30, z_tol=0.20, floor_fallback=True):
     """校验 5.1 选出的支撑物实例是否几何成立, 不成立则换成同类里最合适的。

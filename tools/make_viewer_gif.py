@@ -29,9 +29,11 @@ DEFAULT_EGO_ROOT = MV.DEFAULT_EGO_ROOT
 SIDE_COLORS_BGR = [(0, 165, 255), (255, 128, 0)]   # side0 橙, side1 蓝 (BGR)
 
 
-def turntable_gif(P, C, hands, out_path, n_frames=36, size=720, fps=14, pitch_deg=18.0):
+def turntable_gif(P, C, hands, out_path, n_frames=36, size=720, fps=14, pitch_deg=18.0,
+                  mp4_path=None):
     """正交投影 turntable: 点云 + 手部绕竖直轴(Y)旋转一周."""
     from PIL import Image
+    bgr_frames = []
 
     # 固定视口范围 (所有帧一致)
     lo = np.percentile(P, 1, axis=0)
@@ -40,7 +42,10 @@ def turntable_gif(P, C, hands, out_path, n_frames=36, size=720, fps=14, pitch_de
         V = np.asarray(h["vw"])
         lo = np.minimum(lo, V.min(axis=0)); hi = np.maximum(hi, V.max(axis=0))
     ctr = (hi + lo) / 2.0
-    span = max(float(np.max(hi - lo)), 1e-6) * 1.08   # 最大边长 (np.ptp 会算成跨轴范围)
+    ext = hi - lo
+    # 用水平面对角线保证任意 yaw 不裁切 (只取最大边长会在 45 度时溢出)
+    span = max(float(np.hypot(ext[0], ext[2])), float(ext[1]), 1e-6) * 1.05
+    Pc = P - ctr          # 先居中, 旋转后自然居中
 
     # 预处理手部 (转到统一数组)
     Hs = []
@@ -67,7 +72,7 @@ def turntable_gif(P, C, hands, out_path, n_frames=36, size=720, fps=14, pitch_de
             return px, py, depth
 
         img = np.zeros((size, size, 3), np.uint8)
-        px, py, dep = proj(P)
+        px, py, dep = proj(Pc)
         ok = (px >= 0) & (px < size - 2) & (py >= 0) & (py < size - 2) & np.isfinite(dep)
         order = np.argsort(-dep[ok])          # 远 -> 近
         po, qo = px[ok][order], py[ok][order]
@@ -77,26 +82,51 @@ def turntable_gif(P, C, hands, out_path, n_frames=36, size=720, fps=14, pitch_de
                 img[qo + dy, po + dx] = cols
 
         # 手部 (画家算法: 按面深度排序)
+        def rot3(Q):
+            x = cy * Q[:, 0] + sy * Q[:, 2]
+            z = -sy * Q[:, 0] + cy * Q[:, 2]
+            y = Q[:, 1]
+            return np.stack([x, cp * y - sp * z, sp * y + cp * z], 1)
+
+        light = np.array([0.35, -0.55, -0.76]); light /= np.linalg.norm(light)
         tris = []
         for H in Hs:
-            hpx, hpy, hdep = proj(H["V"])
+            Q = H["V"] - ctr
+            hpx, hpy, hdep = proj(Q)
+            Q3 = rot3(Q)
             for f in H["F"]:
                 if not (np.isfinite(hdep[f]).all()):
                     continue
                 tri = np.stack([hpx[f], hpy[f]], 1)
-                if (tri[:, 0] > -size).all() and (tri[:, 0] < 2 * size).all() and \
-                   (tri[:, 1] > -size).all() and (tri[:, 1] < 2 * size).all():
-                    tris.append((float(hdep[f].mean()), tri, H["col"]))
+                if not ((tri[:, 0] > -size).all() and (tri[:, 0] < 2 * size).all() and
+                        (tri[:, 1] > -size).all() and (tri[:, 1] < 2 * size).all()):
+                    continue
+                # 逐面法线光照 (让 195 顶点低模手看起来有立体感)
+                p0, p1, p2 = Q3[f[0]], Q3[f[1]], Q3[f[2]]
+                n = np.cross(p1 - p0, p2 - p0)
+                ln = np.linalg.norm(n)
+                shade = 0.45 + 0.55 * abs(float(n @ light) / ln) if ln > 1e-12 else 0.8
+                col = [min(255, int(c * shade)) for c in H["col"]]
+                tris.append((float(hdep[f].mean()), tri, col))
         for _, tri, col in sorted(tris, key=lambda t: -t[0]):
             cv2.fillPoly(img, [tri.astype(np.int32)], col, cv2.LINE_AA)
 
         cv2.putText(img, f"yaw {np.rad2deg(yaw):.0f} deg | {len(P)} pts | {len(Hs)} hands",
                     (10, size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        bgr_frames.append(img.copy())
         frames.append(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("P", palette=Image.ADAPTIVE))
 
     frames[0].save(out_path, save_all=True, append_images=frames[1:],
                    duration=int(1000 / fps), loop=0, optimize=True)
     print(f"[GIF] {out_path}  ({n_frames} 帧, {out_path.stat().st_size/1e6:.1f} MB)")
+    if mp4_path is not None:
+        vw = cv2.VideoWriter(str(mp4_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (size, size))
+        for im in bgr_frames:
+            vw.write(im)
+        vw.release()
+        print(f"[MP4] {mp4_path}  ({len(bgr_frames)} 帧 @ {fps}fps, "
+              f"{mp4_path.stat().st_size/1e6:.1f} MB)")
 
 
 def seq_gif(paths, out_path, width=400, fps=10, max_frames=30):
@@ -185,6 +215,7 @@ def main():
     ap.add_argument("--turntable", type=int, default=36, help="turntable 帧数")
     ap.add_argument("--size", type=int, default=720)
     ap.add_argument("--seq", action="store_true", help="同时把 2D 序列压成 GIF")
+    ap.add_argument("--mp4", action="store_true", help="turntable 同时输出 MP4")
     args = ap.parse_args()
 
     scene_dir = args.scene_dir
@@ -196,7 +227,8 @@ def main():
                                                       args.max_points)
         print(f"[GIF] gauge={gauge}  点云={len(P)}  手={len(hands)} ({[h['name'] for h in hands]})")
         turntable_gif(P, C, hands, verify / f"turntable_{gauge}.gif",
-                      n_frames=args.turntable, size=args.size)
+                      n_frames=args.turntable, size=args.size,
+                      mp4_path=(verify / f"turntable_{gauge}.mp4") if args.mp4 else None)
 
     if args.seq:
         for name in ("overlay2d", "render3d", "sideview"):

@@ -68,18 +68,23 @@ def verify_scene(D):
         mx = float(np.max(ext))
         if prior and not (SCALE_LO * prior <= mx <= SCALE_HI * prior):
             flags.append(f"尺度{mx:.2f}m(先验{prior})")
-        # 穿模 (对, 两两 AABB 交)
+        # 穿模: AABB 交集体积 / 较小物体 AABB 体积 > 15% 才算
+        # (椅子推近桌边是物理正常的薄层相交, 旧的"三轴各>2cm即报"会误报)
+        vol_a = float((b[1][0]-b[0][0])*(b[1][1]-b[0][1])*(b[1][2]-b[0][2]))
         for name2, d2 in infos.items():
             if name2 <= name:
                 continue
             b2 = d2["bounds"]
-            oz = min(b[1][2], b2[1][2]) - max(b[0][2], b2[0][2])
-            if oz <= 0.02:
-                continue
             ox = min(b[1][0], b2[1][0]) - max(b[0][0], b2[0][0])
             oy = min(b[1][1], b2[1][1]) - max(b[0][1], b2[0][1])
-            if ox > 0.02 and oy > 0.02:
-                flags.append(f"与{name2}穿模")
+            oz = min(b[1][2], b2[1][2]) - max(b[0][2], b2[0][2])
+            if ox <= 0.02 or oy <= 0.02 or oz <= 0.02:
+                continue
+            vol_i = ox * oy * oz
+            vol_b = float((b2[1][0]-b2[0][0])*(b2[1][1]-b2[0][1])*(b2[1][2]-b2[0][2]))
+            ratio = vol_i / max(min(vol_a, vol_b), 1e-9)
+            if ratio > 0.15:
+                flags.append(f"与{name2}穿模({ratio*100:.0f}%)")
         rows.append({"instance": name, "up": round(d["up"], 2),
                      "z": [round(float(b[0][2]), 3), round(float(b[1][2]), 3)],
                      "max_ext": round(mx, 2), "relation": r,

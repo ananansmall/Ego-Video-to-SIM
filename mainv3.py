@@ -363,7 +363,12 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         vggt_prediction_results = vggt_predict(frames, vggt_model)
     elif vggt_model_type == "vggt_omega":
         from src.vggt_omega_predict import load_vggt_omega_frames
-        frames = load_vggt_omega_frames(input_video, max_frames).to(device)
+        # --vggt_resolution: 官方 loader 的 image_resolution 参数 (默认 512=
+        # 官方 balanced 预处理)。调高可提升小物体的 token 分辨率, 代价是
+        # 显存 ~1.6x/2.4x(attention)。
+        frames = load_vggt_omega_frames(
+            input_video, max_frames,
+            image_resolution=getattr(args, "vggt_resolution", 512) or 512).to(device)
         vggt_model = load_vggt_omega_model().to(device)
         vggt_prediction_results = vggt_omega_predict(frames, vggt_model)
     elif vggt_model_type == "vggt4d":
@@ -1554,6 +1559,24 @@ def run_stage5(output_path, categories_and_relations, all_instances,
     except Exception as _e:
         print(f"   ⚠️ 支撑物纠偏失败 (不影响主流程): {_e}", flush=True)
 
+    # ── 5.16: 孤儿挂墙关系处理 ──
+    # Stage1 的 VLM 常把"墙面本身"报成 curtain/wall 类物体, 关系标 attached to
+    # wall, 但 Stage3 并不会生成 wall 实例 → 这些实例没有任何参照面: 落地补正
+    # 不管它 (不属于 floor), reseat 也不管它 (没有支撑物), 于是停在 VGGT 原始
+    # 位置 —— 有的悬空 (实测 3chair: curtain_0 底 z=+0.317), 有的陷地
+    # (curtain_5 -0.139 / curtain_6 -0.108)。
+    # 分治: 极薄片 (扁平度<0.20) 剔除; 块状实物回退 supported by floor。
+    try:
+        from src.sp_refinement import resolve_orphan_wall_relations
+        all_instances, refined_relations, _n_drop, _n_re = \
+            resolve_orphan_wall_relations(all_instances, refined_relations,
+                                          verbose=True)
+        if _n_drop or _n_re:
+            print(f"   🔧 孤儿挂墙处理: 剔除 {_n_drop} 个薄片, "
+                  f"{_n_re} 个回退 supported by floor", flush=True)
+    except Exception as _e:
+        print(f"   ⚠️ 孤儿挂墙处理失败 (不影响主流程): {_e}", flush=True)
+
     # ── 5.2: 几何精修 (只修改 "supported by <物体>" 的物体, 已精修的floor/wall不动) ──
     _t52 = time.time()
     has_inter_object = any(
@@ -2116,23 +2139,26 @@ def main(args):
             stage5_method=getattr(args, 'stage5_method', 'scene_graph'),
         )
 
+        # ── 重力可见化 + 退化桌面修复 (Stage 5 出口标准步骤, Stage4 开关不影响) ──
+        # 薄板桌面(桌腿未入画)合成桌腿并抬到 0.75m, 支撑物跟随; 加地板基准面。
+        # 此前最终 GLB 无地板几何, 场景像漂在白空间, 无重力参考。
+        # 注意: 必须在 if/else 两个分支之外 —— 修复后曾放在 else 分支, 导致
+        # 开 Stage 4 的运行全部跳过地板/桌腿 (实测 2chair-v04/3chair-v04)。
+        try:
+            from tools.ground_fix import add_ground_and_legs, verify_scene_ground
+            all_instances, _ground_report = add_ground_and_legs(
+                all_instances, refined_relations, verbose=True)
+            _gr = verify_scene_ground(all_instances, refined_relations, args.output_path)
+            print(f"   🔬 出口自检: 沉地 {_gr['n_below_floor']} 悬空 {_gr['n_floating']} "
+                  f"倒置 {_gr['n_inverted']}", flush=True)
+        except Exception as _e:
+            import traceback as _tb
+            print(f"⚠️ 地板/桌腿修复失败 (跳过, 不影响主流水线): {_e}", flush=True)
+            traceback.print_exc()
+
         if args.enable_stage4:
             save_final_glb(all_instances, args.output_path, "final_scene_stage4_5.glb")
         else:
-            # ── 重力可见化 + 退化桌面修复 (Stage 5 出口标准步骤) ──
-            # 薄板桌面(桌腿未入画)合成桌腿并抬到 0.75m, 支撑物跟随; 加地板基准面。
-            # 此前最终 GLB 无地板几何, 场景像漂在白空间, 无重力参考。
-            try:
-                from tools.ground_fix import add_ground_and_legs, verify_scene_ground
-                all_instances, _ground_report = add_ground_and_legs(
-                    all_instances, refined_relations, verbose=True)
-                _gr = verify_scene_ground(all_instances, refined_relations, args.output_path)
-                print(f"   🔬 出口自检: 沉地 {_gr['n_below_floor']} 悬空 {_gr['n_floating']} "
-                      f"倒置 {_gr['n_inverted']}", flush=True)
-            except Exception as _e:
-                import traceback as _tb
-                print(f"⚠️ 地板/桌腿修复失败 (跳过, 不影响主流水线): {_e}", flush=True)
-                traceback.print_exc()
             save_final_glb(all_instances, args.output_path, "final_scene_stage5.glb")
         # 记录Stage5位姿变化
         pose_history = _record_pose_stage(all_instances, refined_relations, "stage5", pose_history)
@@ -2343,6 +2369,9 @@ if __name__ == "__main__":
                         help="VLM模型路径 (默认: /mnt/data/lza/models/Qwen3.5-9B)")
     parser.add_argument("--max_frames", type=int, default=160,
                         help="VGGT最大帧数 (Stage 2, 默认160)")
+    parser.add_argument("--vggt_resolution", type=int, default=512,
+                        help="VGGT-omega 输入分辨率 (官方默认 512, balanced 模式)"
+                             "; 调高(如 640)可提升小物体识别, 显存相应增加")
     parser.add_argument("--vggt_model", type=str, default="vggt",
                         choices=["vggt", "vggt_omega", "vggt4d"],
                         help="3D重建模型选择: vggt(默认), vggt_omega, vggt4d")
@@ -2387,13 +2416,9 @@ if __name__ == "__main__":
                         help="物理仿真检测步数 (默认300)")
 
     args = parser.parse_args()
-    # Stage 4 默认开启 (位置配准的管线原生解; --disable_stage4 显式关闭)。
-    # 实测 wxD: 无对齐时场景在真实相机视野外 (分米级偏移), 开启后桌面与
-    # 真实帧完全重合。此前默认关闭是位置不准的根因之一。
-    if getattr(args, "disable_stage4", False):
-        args.enable_stage4 = False
-    else:
-        args.enable_stage4 = True
+    # Stage 4 保持默认关闭: 实测收益不稳定 —— wxD 场景对齐后桌面与真实帧
+    # 重合 (IoU 0.49), 但 2chair 场景 IoU 仅 0.32 且相机位姿落进桌体内部。
+    # 需要位置对齐时显式传 --enable_stage4, 并用真值叠加验收。
     # Stage2 box 兜底开关 (默认开)
     globals()['_VLM_BOX_FALLBACK'] = not getattr(args, 'no_vlm_box_fallback', False)
     # Stage3.7 的 VLM 交互判断开关 (传给 pick_place_detector)

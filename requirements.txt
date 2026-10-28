@@ -1,0 +1,53 @@
+# ReplicateAnyScene 核心依赖
+#
+# 说明: 这是"最小可运行"依赖集, 已在本仓库实测通过的版本上钉死。
+#   实测环境: Python 3.11.0 / CUDA 12.1 / 4x RTX A6000 (48GB) / Driver 580.105.08
+#   完整 469 个包的快照见 requirements-freeze.txt (仅供极端复现)
+#
+# 安装:
+#   conda create -n ReplicateAnyScene python=3.11 -y
+#   conda activate ReplicateAnyScene
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# 注意 1: torch 必须 >=2.0 —— VGGT 用到 scaled_dot_product_attention
+#         (torch 1.13 会直接报 AttributeError; hawor 自带环境就是这个坑)
+# 注意 2: pyrender 离屏渲染必须设 EGL, 否则报 NoSuchDisplayException:
+#         os.environ["PYOPENGL_PLATFORM"] = "egl"
+
+# ── 深度学习框架 ──
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+transformers==5.6.2
+
+# ── 几何 / 3D ──
+numpy==1.26.4
+scipy==1.17.1
+trimesh==4.11.5
+open3d==0.18.0
+pyrender==0.1.45
+PyOpenGL==3.1.0
+shapely==2.1.2
+numba==0.65.0
+pytorch3d==0.7.8
+
+# ── 图像 / 视频 ──
+opencv-python==4.13.0
+pillow==9.5.0
+
+# ── 配置 / 工具 ──
+tqdm==4.67.3
+pyyaml==6.0.3
+omegaconf==2.3.0
+hydra-core==1.3.2
+einops==0.8.2
+requests==2.33.1
+
+# ── 可视化 / 分析 ──
+matplotlib==3.10.8
+colorcet==3.1.0
+scikit-learn==1.8.0
+
+# ── 物理仿真 (Stage 5.5 / SAPIEN 导出) ──
+sapien==3.0.3
+spconv==2.3.8

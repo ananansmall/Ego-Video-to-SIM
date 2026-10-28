@@ -1,0 +1,10 @@
+{
+  "chair": "supported by floor",
+  "table": "supported by floor",
+  "cabinet": "supported by floor",
+  "tv": "supported by cabinet",
+  "router": "supported by cabinet",
+  "curtain": "attached to wall",
+  "bottle": "supported by other objects",
+  "bag": "supported by other objects"
+}
