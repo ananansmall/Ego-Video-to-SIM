@@ -154,8 +154,16 @@ def eval_scene(D, verbose=True):
             out["M6_mean_frames"] = round(
                 float(np.mean([v["n_frames"] for v in cov.values()])), 1)
 
-    # ── M3 mesh/点云 尺寸比（类别级）──
+    # world_points 只在 _pre_dedup_masks.pkl 里, M3/M2 分层诊断共用, 只载入一次
+    wp = None
     if pre_am:
+        try:
+            wp = pickle.load(open(pre, "rb")).get("world_points")
+        except Exception:
+            wp = None
+
+    # ── M3 mesh/点云 尺寸比（类别级）──
+    if pre_am and wp is not None:
         ratios = {}
         for c, lst in inst.items():
             try:
@@ -165,8 +173,6 @@ def eval_scene(D, verbose=True):
                 for tr in pre_am.get(c, []):
                     for m in tr:
                         pts.append(int(m["mask"].sum()))
-                # 点云 AABB 需要 world_points；若 pkl 里没有就跳过
-                wp = pickle.load(open(pre, "rb")).get("world_points")
                 if wp is None:
                     continue
                 P = []
@@ -189,47 +195,89 @@ def eval_scene(D, verbose=True):
 
     # ── M2 类别级 silhouette IoU ──
     try:
-        out["M2_silhouette"] = _silhouette_iou(D, inst, pre_am, opt_frames)
+        out["M2_silhouette"], out["M2_layered"] = _silhouette_iou(
+            D, inst, pre_am, opt_frames, wp=wp)
     except Exception as e:
         out["M2_err"] = f"{type(e).__name__}: {str(e)[:60]}"
 
     return out
 
 
-def _silhouette_iou(D, inst, pre_am, opt_frames):
+def _iou(m_ren, mr):
+    u = (m_ren | mr).sum()
+    return float((m_ren & mr).sum() / u) if u > 0 else 0.0
+
+
+def _attribution(iou_raw, iou_trans, iou_ts):
+    """把 (1 - IoU_raw) 的总误差分解成 位置/尺度/形状 三份。
+
+      位置误差 = 平移对齐带来的 IoU 增益
+      尺度误差 = 在平移对齐之上再做尺度对齐带来的增益
+      形状误差 = 尺度对齐后仍补不回来的残差
+    三者之和恒等于总误差 (1 - IoU_raw), 是精确分解而非估计。
+    """
+    total = 1.0 - iou_raw
+    if total <= 1e-6:
+        return {"pos_pct": 0.0, "scale_pct": 0.0, "shape_pct": 0.0}
+    return {
+        "pos_pct": round(100.0 * (iou_trans - iou_raw) / total, 1),
+        "scale_pct": round(100.0 * (iou_ts - iou_trans) / total, 1),
+        "shape_pct": round(100.0 * (1.0 - iou_ts) / total, 1),
+    }
+
+
+def _silhouette_iou(D, inst, pre_am, opt_frames, wp=None):
     """类别级：该类所有 mesh 在最优帧渲染并集 vs 真实 mask 并集。
 
     为什么用类别级而不是实例级: 去重会合并实例（cabinet[1]+table[0]），
     实例与 pre-dedup mask 的对应关系不可靠；类别级没有这个歧义。
+
+    T7 分层诊断: 在原有 raw IoU 之外, 对每个实例再算两种对齐后 IoU:
+      ② 平移对齐   —— 把 mesh 世界系质心平移到候选 mask 点云质心 (消除位置误差)
+      ③ 平移+尺度 —— 再按包围盒最大边之比均匀缩放 (消除尺度误差)
+    对齐矩阵在世界系构造, 以 A @ T 传入原渲染路径 (render_mesh 先应用 T)。
+    每个变体仍取"该帧同类别 mask 中 IoU 最大者", 与 raw 的 best-mask 口径一致。
+    返回 (raw 结果 [与旧版完全同格式], 分层结果 dict)。
     """
     if not pre_am:
-        return None
+        return None, None
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     from stage4.run_alignment import load_vggt_results
     from stage4.renderer import MeshRenderer
 
     v = load_vggt_results(D)
     if v is None:
-        return None
+        return None, None
     K = np.asarray(v["intrinsic"], float)
     exts = np.asarray(v["extrinsics"], float)
     H, W = np.asarray(v["depths"])[0].shape
     ren = MeshRenderer(K, W, H)
 
     res = {}
+    layered = {"raw": {}, "trans": {}, "trans_scale": {}, "attribution": {}}
     for c, lst in inst.items():
         frames = opt_frames.get(c) or []
         if not frames:
             continue
-        ious = []
+        ious, ious_t, iou_s = [], [], []
         for i, x in enumerate(lst):
             # 每个实例用它自己的最优帧 (all_optimal_frame_ids 与实例顺序对齐)
             f = frames[i] if i < len(frames) else frames[0]
             if f >= len(exts):
                 continue
+            # 该帧同类别的候选真实 mask (与 raw best-mask 搜索范围一致)
+            cands = []
+            for tr in pre_am.get(c, []):
+                for m in tr:
+                    if m["frame_id"] != f:
+                        continue
+                    mr = np.asarray(m["mask"])
+                    if mr.shape[:2] != (H, W):
+                        continue
+                    cands.append(mr > 0)
             try:
-                _, _, mk = ren.render_mesh(x["original_mesh"],
-                                           np.asarray(x["T"], float), exts[f])
+                T = np.asarray(x["T"], float)
+                _, _, mk = ren.render_mesh(x["original_mesh"], T, exts[f])
             except Exception:
                 continue
             m_ren = np.asarray(mk) > 0
@@ -239,25 +287,65 @@ def _silhouette_iou(D, inst, pre_am, opt_frames):
             # 用 max 而非并集: 去重会把多个 pre-dedup mask 合成一个实例,
             # 实例与 mask 的对应不可靠; "能否匹配到某块真实区域"是无歧义的下界,
             # 同时避免把该帧不可见的其它实例算进并集而稀释分数。
-            best = 0.0
-            for tr in pre_am.get(c, []):
-                for m in tr:
-                    if m["frame_id"] != f:
-                        continue
-                    mr = np.asarray(m["mask"])
-                    if mr.shape[:2] != (H, W):
-                        continue
-                    mr = mr > 0
-                    u = (m_ren | mr).sum()
-                    if u > 0:
-                        best = max(best, float((m_ren & mr).sum() / u))
+            best = max((_iou(m_ren, mr) for mr in cands), default=0.0)
             ious.append(best)
+            ious_t.append(0.0)
+            iou_s.append(0.0)
+            if not cands:
+                continue
+
+            # ── 对齐变体: mesh 先落到世界系, 再按候选 mask 点云做平移/缩放 ──
+            mw = x["original_mesh"].copy()
+            mw.apply_transform(T)
+            mesh_c = mw.vertices.mean(axis=0)
+            mesh_ext = float(np.max(mw.bounds[1] - mw.bounds[0]))
+            for use_scale, acc in ((False, ious_t), (True, iou_s)):
+                best_l = 0.0
+                for mr in cands:
+                    try:
+                        p = wp[f][mr]
+                    except Exception:
+                        continue
+                    p = p[np.all(np.isfinite(p), axis=-1)]
+                    if len(p) < 10:
+                        continue
+                    pc_c = p.mean(axis=0)
+                    pc_ext = float(np.max(p.max(axis=0) - p.min(axis=0)))
+                    A = np.eye(4)
+                    if use_scale and mesh_ext > 1e-9 and pc_ext > 1e-9:
+                        s = pc_ext / mesh_ext
+                        A[:3, :3] = np.eye(3) * s
+                        A[:3, 3] = pc_c - s * mesh_c
+                    else:
+                        A[:3, 3] = pc_c - mesh_c
+                    try:
+                        _, _, mk2 = ren.render_mesh(
+                            x["original_mesh"], A @ T, exts[f])
+                    except Exception:
+                        continue
+                    m2 = np.asarray(mk2) > 0
+                    if m2.sum() == 0:
+                        continue
+                    best_l = max(best_l, _iou(m2, mr))
+                acc[-1] = best_l
         if ious:
             res[c] = round(float(np.mean(ious)), 3)
+            layered["raw"][c] = res[c]
+            layered["trans"][c] = round(float(np.mean(ious_t)), 3)
+            layered["trans_scale"][c] = round(float(np.mean(iou_s)), 3)
+            layered["attribution"][c] = _attribution(
+                float(np.mean(ious)), float(np.mean(ious_t)),
+                float(np.mean(iou_s)))
     if not res:
-        return None
-    res["_mean"] = round(float(np.mean([x for x in res.values() if isinstance(x, float)])), 3)
-    return res
+        return None, None
+    for k in ("raw", "trans", "trans_scale"):
+        vals = [x for x in layered[k].values() if isinstance(x, float)]
+        layered[k]["_mean"] = round(float(np.mean(vals)), 3) if vals else None
+    att = layered["attribution"]
+    layered["attribution"]["_mean"] = {
+        k: round(float(np.mean([v[k] for v in att.values()])), 1)
+        for k in ("pos_pct", "scale_pct", "shape_pct")} if att else {}
+    return res, layered
 
 
 def main():
@@ -266,6 +354,8 @@ def main():
     ap.add_argument("--pattern", default="output_v3/*s4")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--t7-out", default=None,
+                    help="T7 分层诊断落盘路径 (如 /tmp/t7_diagnosis.json)")
     args = ap.parse_args()
 
     dirs = []
@@ -299,6 +389,25 @@ def main():
             print(f"   M2 silhouette IoU: {m2}")
         else:
             print(f"   M2 silhouette IoU: N/A {r.get('M2_err','')}")
+        lay = r.get("M2_layered")
+        if isinstance(lay, dict) and lay.get("attribution"):
+            print("   T7 分层诊断 (raw → +平移 → +平移+尺度 | 位置/尺度/形状占比):")
+            att = lay["attribution"]
+            for c in lay["raw"]:
+                if c == "_mean" or c not in att:
+                    continue
+                a = att[c]
+                print(f"      {c}: {lay['raw'][c]} → {lay['trans'][c]} → "
+                      f"{lay['trans_scale'][c]}"
+                      f"   (位置 {a['pos_pct']}% | 尺度 {a['scale_pct']}% | "
+                      f"形状 {a['shape_pct']}%)")
+            m = att.get("_mean", {})
+            if m:
+                print(f"      ⊕ 均值: raw={lay['raw'].get('_mean')} → "
+                      f"+平移={lay['trans'].get('_mean')} → "
+                      f"+尺度={lay['trans_scale'].get('_mean')}"
+                      f"   (位置 {m.get('pos_pct')}% | 尺度 {m.get('scale_pct')}% | "
+                      f"形状 {m.get('shape_pct')}%)")
         print(f"   M3 mesh/点云 尺寸比: {r.get('M3_size_ratio','N/A')}")
         print(f"   M4 摆放: {r.get('M4_by_status','N/A')} ok率={r.get('M4_ok_rate','N/A')}")
         print(f"   M5 穿模: {r.get('M5_n_penetration','N/A')} {r.get('M5_pairs','')}")
@@ -307,6 +416,37 @@ def main():
     if args.json:
         json.dump(rows, open(args.json, "w"), ensure_ascii=False, indent=2, default=str)
         print(f"\n已写出 {args.json}")
+
+    if args.t7_out:
+        # T7 分层诊断汇总: 逐场景逐类别三层 IoU + 归因, 末尾附跨场景均值
+        t7 = {"scenes": [], "summary": None}
+        agg = {"pos_pct": [], "scale_pct": [], "shape_pct": []}
+        for r in rows:
+            lay = r.get("M2_layered")
+            if not isinstance(lay, dict) or not lay.get("attribution"):
+                continue
+            att = dict(lay["attribution"])
+            att.pop("_mean", None)
+            t7["scenes"].append({
+                "scene": r["scene"],
+                "raw": {k: v for k, v in lay["raw"].items() if k != "_mean"},
+                "trans": {k: v for k, v in lay["trans"].items() if k != "_mean"},
+                "trans_scale": {k: v for k, v in lay["trans_scale"].items() if k != "_mean"},
+                "attribution": att,
+            })
+            for a in att.values():
+                for k in agg:
+                    agg[k].append(a[k])
+        if t7["scenes"]:
+            t7["summary"] = {k: round(float(np.mean(v)), 1)
+                             for k, v in agg.items() if v}
+        json.dump(t7, open(args.t7_out, "w"), ensure_ascii=False, indent=2)
+        if t7["summary"]:
+            s = t7["summary"]
+            print(f"\n[T7 总体归因] 位置误差占 {s['pos_pct']}% | "
+                  f"尺度误差占 {s['scale_pct']}% | 形状误差占 {s['shape_pct']}%"
+                  f"  (共 {len(t7['scenes'])} 个场景)")
+        print(f"已写出 {args.t7_out}")
     return 0
 
 

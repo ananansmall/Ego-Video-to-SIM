@@ -223,7 +223,27 @@ def compute_dynamic_info(all_masks, world_points, frame_ratio=1.0):
     # 时长阈值按时长自适应 (短视频缩小、长视频不变, 见 _effective_duration 的说明)
     _n_rgb = int(world_points.shape[0]) if world_points is not None else 0
     min_dur = _effective_duration(_n_rgb, MIN_MOTION_DURATION)
-    for key, d in _extract_instance_points(all_masks, world_points).items():
+
+    # ── 第一遍: 收集尺寸/质心 + 世界漂移基线 ──
+    # 第一人称相机的世界系有重建漂移: 静止家具的质心也会"位移"几厘米~十几厘米。
+    # 被 too_large/大物体判据抑制的实例 (柜/床/桌——物理上不可能被拿起) 的
+    # 质心净位移中位数 = 漂移基线, 从小物体的净位移中扣除。
+    # 实测 HOI4D: 真 mug 的净位移 0.031m 被绝对阈值 0.08m 淹没, 而同一场景
+    # 静态柜的表观位移 0.05~0.07m —— 扣除漂移后 mug 的净相对位移才会显出来。
+    all_items = _extract_instance_points(all_masks, world_points).items()
+    drift_nets = []
+    pre = []
+    for key, d in all_items:
+        cent = _centroid_features(d['centroids'])
+        _ext = _instance_3d_extent(d['pts_list'])
+        pre.append((key, d, cent, _ext))
+        if _ext > MANIPULABLE_MAX_EXTENT:
+            drift_nets.append(cent['net'])
+        elif d['avg_area'] >= SMALL_AREA_THRESH:
+            drift_nets.append(cent['net'])
+    drift_base = float(np.median(drift_nets)) if drift_nets else 0.0
+
+    for key, d, cent, _ext in pre:
         # 无论走哪套判据, 都先算质心特征 —— 大物体路径要用它排除"相机移动
         # 导致可见表面变化"造成的假动态。
         cent = _centroid_features(d['centroids'])
@@ -252,10 +272,28 @@ def compute_dynamic_info(all_masks, world_points, frame_ratio=1.0):
             continue
         if d['avg_area'] < SMALL_AREA_THRESH:
             feats = cent
-            is_dyn = (feats['path'] > CENTROID_PATH_THRESH
-                      and feats['net'] > CENTROID_NET_THRESH
-                      and feats['pnet'] < CENTROID_PNET_THRESH
-                      and feats['max_run'] * frame_ratio >= min_dur)
+            # ── 尺寸归一化通道 ──
+            # 绝对米制阈值对小物体失明: 10cm 物体被搬 7cm (净位移 0.7 倍物体
+            # 尺寸) 过不了 0.08m 绝对阈值 (实测 HOI4D 4/4 场景全漏)。
+            # path_rel = 总路程/物体尺寸; net_rel = 扣漂移后的净位移/物体尺寸。
+            # 真实的拿起-放下: path_rel >= 1.2 (路程超过物体本身), net_rel >= 0.3。
+            _eref = max(_ext, 0.02)
+            _net_corr = max(0.0, cent['net'] - drift_base)
+            path_rel = feats['path'] / _eref
+            net_rel = _net_corr / _eref
+            is_dyn_norm = (path_rel > 1.2 and net_rel > 0.3
+                           and feats['pnet'] < CENTROID_PNET_THRESH * 3
+                           and feats['max_run'] * frame_ratio >= min_dur)
+            feats = dict(feats)
+            feats.update({'drift_base': round(drift_base, 4),
+                          'path_rel': round(path_rel, 2),
+                          'net_rel': round(net_rel, 2),
+                          'net_corr': round(_net_corr, 4)})
+            is_dyn = ((feats['path'] > CENTROID_PATH_THRESH
+                       and feats['net'] > CENTROID_NET_THRESH
+                       and feats['pnet'] < CENTROID_PNET_THRESH
+                       and feats['max_run'] * frame_ratio >= min_dur)
+                      or is_dyn_norm)
         else:
             feats = _overlap_features(d['pts_list'])
             is_dyn = (feats['min_match'] < MATCH_LOW_THRESH
