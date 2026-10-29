@@ -1748,6 +1748,19 @@ def run_stage5(output_path, categories_and_relations, all_instances,
     if _n_reground:
         print(f"   🔧 分离后收尾落地: {_n_reground} 个实例压回 z=0", flush=True)
 
+    # ── 孤儿实例处理 (T5) ──
+    # 具名支撑但 xy 距离 3~5m 的实例横向夹回; floor 关系但远超场景范围的
+    # 幽灵 (VGGT 相对定位错) 剔除并记录。必须在审计之前 —— 审计记的是结果。
+    try:
+        from src.sp_refinement import fix_orphan_instances
+        all_instances, refined_relations, _orp = fix_orphan_instances(
+            all_instances, refined_relations, verbose=True)
+        if _orp.get("orphans") or _orp.get("reclamped"):
+            print(f"   🔧 孤儿处理: 剔除 {len(_orp.get('orphans', []))}, "
+                  f"夹回 {len(_orp.get('reclamped', []))}", flush=True)
+    except Exception as _e:
+        print(f"   ⚠️ 孤儿实例处理失败 (跳过): {_e}", flush=True)
+
     # 落盘摆放审计 (每实例世界 AABB / gap / 水平重叠), 供离线验收与后续修复比对。
     # 必须在所有补正之后 —— 记的是最终位姿。
     try:
