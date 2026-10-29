@@ -27,9 +27,28 @@ Input Video
     ├── Stage 1: VGGT 3D Prediction + SAM3 Segmentation
     ├── Stage 2: Object Deduplication + Instance Generation
     ├── Stage 3: Spatial Refinement + Scene Composition
-    ├── Stage 4: Coordinate Alignment (optional)
+    ├── Stage 4: Coordinate Alignment  ⛔ 已废弃, 永久禁用, 不要使用
     └── Stage 5: Relation Inference + Geometry Refinement (optional)
 ```
+
+> ⛔ **Stage 4 (ICP 视觉-空间对齐) 已永久禁用，不要使用。**
+>
+> `mainv3.py` 的 `main()` 里会强制 `args.enable_stage4 = False`，
+> 即使命令行传了 `--enable_stage4` 也会被忽略并打印提示。
+>
+> 禁用原因（均有实测依据）：
+>
+> 1. **ICP 阈值是绝对米制**（`stage4/icp_optimization.py`: `0.25 → 0.075 m`）。
+>    对一个 3cm 的耳机盒，最终阈值是物体自身的 2.5 倍 —— 桌面上所有点都会
+>    被判成"对应点"，迭代在数学上等于没做（全部平凡内点）。
+> 2. **VGGT 输出是相对尺度**，不是米制。绝对阈值在这个坐标系里没有物理意义。
+> 3. **收益不稳定且会反向破坏**：`wxD` 对齐后桌面与真实帧 IoU 0.49，
+>    但 `2chair` 场景只有 0.32，且相机位姿落进桌体内部。
+> 4. 它在 Stage 5 之前改位姿，而 Stage 5 的摆放链并不假设这种改动，
+>    叠加后反而更难收敛。
+>
+> 若将来要做对齐，应改为"物体尺寸相对制阈值"并单独用真值验收，
+> 而不是重新启用这里的实现。
 
 ## Quick Start
 

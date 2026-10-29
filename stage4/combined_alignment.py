@@ -80,10 +80,13 @@ def _mast3r_phase_a(mesh, current_T, world_points, world_points_conf,
     eval_frames = np.linspace(0, num_frames - 1, min(8, num_frames), dtype=int)
 
     best_T = current_T.copy()
-    best_score = compute_depth_accuracy(mesh, current_T, depths, extrinsics, renderer, eval_frames)
+    _msz = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    _tol_acc = min(max(0.3 * _msz, 0.02), 0.10)
+    _tol_iou = min(max(0.3 * _msz, 0.02), 0.15)
+    best_score = compute_depth_accuracy(mesh, current_T, depths, extrinsics, renderer, eval_frames, tol=_tol_acc)
 
     s_init, _, _ = decompose_similarity_transform(current_T)
-    init_iou = compute_depth_iou(mesh, current_T, depths, extrinsics, renderer, eval_frames)
+    init_iou = compute_depth_iou(mesh, current_T, depths, extrinsics, renderer, eval_frames, tol=_tol_iou)
     print(f"{progress_prefix} MASt3R Phase A Initial: Acc={best_score:.4f}, IoU={init_iou:.4f}, scale={s_init:.3f}")
 
     mast3r_matcher = MASt3RMatcher(device=device)
@@ -164,8 +167,8 @@ def _mast3r_phase_a(mesh, current_T, world_points, world_points_conf,
                 )
 
             T_candidate = T_delta @ current_T
-            cand_score = compute_depth_accuracy(mesh, T_candidate, depths, extrinsics, renderer, eval_frames)
-            cand_iou = compute_depth_iou(mesh, T_candidate, depths, extrinsics, renderer, eval_frames)
+            cand_score = compute_depth_accuracy(mesh, T_candidate, depths, extrinsics, renderer, eval_frames, tol=_tol_acc)
+            cand_iou = compute_depth_iou(mesh, T_candidate, depths, extrinsics, renderer, eval_frames, tol=_tol_iou)
 
             inlier_ratio = inliers.sum() / len(inliers) if len(inliers) > 0 else 0
             print(f", inliers={inliers.sum()} ({inlier_ratio:.1%}), "
@@ -183,7 +186,7 @@ def _mast3r_phase_a(mesh, current_T, world_points, world_points_conf,
     finally:
         mast3r_matcher.delete()
 
-    final_iou = compute_depth_iou(mesh, best_T, depths, extrinsics, renderer, eval_frames)
+    final_iou = compute_depth_iou(mesh, best_T, depths, extrinsics, renderer, eval_frames, tol=_tol_iou)
     return best_T, best_score, final_iou
 
 
@@ -324,8 +327,20 @@ def refine_single_instance_combined(
     sample_eval = np.linspace(0, num_frames - 1, min(8, num_frames), dtype=int)
     sample_align = np.linspace(0, num_frames - 1, min(6, num_frames), dtype=int)
 
-    initial_iou = compute_depth_iou(mesh, current_T, depths, extrinsics, renderer, sample_eval)
-    initial_acc = compute_depth_accuracy(mesh, current_T, depths, extrinsics, renderer, sample_eval)
+    # ── 尺寸相对容差 ──
+    # 绝对容差 (depth_tol=0.15 / iou_tol=0.10) 对 3cm 小物体无分辨力
+    # (整个物体都在容差内, 指标恒定, accept/reject 退化为噪声)。
+    # 按物体对角线缩放, 大物体夹回旧值 (向后兼容)。
+    _wm = mesh.copy(); _wm.apply_transform(current_T)
+    _msz = float(np.max(_wm.bounds[1] - _wm.bounds[0]))   # 世界空间最大轴跨
+    _tol_iou = min(max(0.3 * _msz, 0.02), 0.15)
+    _tol_acc = min(max(0.3 * _msz, 0.02), 0.10)
+    _tol_phaseA = min(max(0.5 * _msz, 0.05), 0.15)
+    print(f"    [{instance_index+1}/{total_instances}] size_ref={_msz:.3f} "
+          f"tol(iou/acc/phaseA)={_tol_iou:.3f}/{_tol_acc:.3f}/{_tol_phaseA:.3f}")
+
+    initial_iou = compute_depth_iou(mesh, current_T, depths, extrinsics, renderer, sample_eval, tol=_tol_iou)
+    initial_acc = compute_depth_accuracy(mesh, current_T, depths, extrinsics, renderer, sample_eval, tol=_tol_acc)
     s_init, _, t_init = decompose_similarity_transform(current_T)
     print(f"    [{instance_index+1}/{total_instances}] Initial: IoU={initial_iou:.4f}, acc={initial_acc:.4f}, scale={s_init:.3f}")
 
@@ -355,10 +370,10 @@ def refine_single_instance_combined(
             num_iterations=num_icp_iterations,
             with_scale=True,
             inlier_threshold=0.04,
-            depth_tolerance=0.15,
+            depth_tolerance=_tol_phaseA,
             progress_prefix=f"    [{instance_index+1}/{total_instances}] Phase A",
         )
-        pa_acc = compute_depth_accuracy(mesh, pa_T, depths, extrinsics, renderer, sample_eval)
+        pa_acc = compute_depth_accuracy(mesh, pa_T, depths, extrinsics, renderer, sample_eval, tol=_tol_acc)
 
     s_pa, _, _ = decompose_similarity_transform(pa_T)
     print(f"    [{instance_index+1}/{total_instances}] Phase A result: Acc={pa_acc:.4f}, IoU={pa_iou:.4f}, scale={s_pa:.3f}")

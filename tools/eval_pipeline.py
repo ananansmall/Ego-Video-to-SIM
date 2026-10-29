@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""管线结果量化评价 —— 输出 6 项可复现指标，取代"看渲染图猜"。
+
+设计原则:
+  1. 每项指标都能在不依赖人工判断的前提下算出
+  2. 尽量以**真实视频帧的 mask** 作参照 (而非另一次重建)，因为那是唯一的一手观测
+  3. 明确标注哪些指标是"有真值对照"、哪些只是"自洽性检查"
+
+指标:
+  M1 交互检出数        视频里真实有几处操作 vs 检出几个
+                      HOI4D / Egodex 的 pick-place 视频期望 >=1
+  M2 类别级 silhouette IoU
+                     某类别所有 mesh 在该实例"最优帧"上渲染的并集
+                     vs 该帧真实 SAM3 mask 并集。这是最接近真值的几何指标。
+  M3 mesh/点云 尺寸比  该类别 mesh 并集 AABB / 点云 AABB。
+                     显著偏离 1 说明 SAM3D 建大/建小了。
+  M4 摆放到位率        audit 里 ok 的占比 + 各异常计数
+  M5 穿模对数          两两 AABB 交叠超过小物体体积 10% 的对数
+  M6 采样帧覆盖率      mask 覆盖帧数 / 该实例可见帧数。低 = 只被拍到几帧。
+
+用法:
+  python tools/eval_pipeline.py --scenes 112_C5_CellPhone-s4 151_C7_Plate-s4
+  python tools/eval_pipeline.py --all --pattern "output_v3/*s4"
+  python tools/eval_pipeline.py --scenes 112_C5_CellPhone-s4 --json out.json
+"""
+import argparse
+import glob
+import json
+import os
+import pickle
+import sys
+
+import numpy as np
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+
+def _resolve(name):
+    """把 '112_C5_...' 解析成实际目录。"""
+    if os.path.isdir(name):
+        return name
+    for base in ("output_v3", "output_v2"):
+        p = os.path.join(REPO, base, name)
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _world_bounds(info):
+    m = info["original_mesh"].copy()
+    m.apply_transform(np.asarray(info["T"], dtype=float))
+    return m.bounds
+
+
+def _penetration_pairs(inst, rel_names=None, vol_frac=0.10):
+    """两两 AABB 交叠超过较小体积 10% 视为穿模。"""
+    names, bounds, vols = [], [], []
+    for c, lst in inst.items():
+        for i, x in enumerate(lst):
+            b = _world_bounds(x)
+            names.append(f"{c}_{i}")
+            bounds.append(b)
+            vols.append(float(np.prod(np.maximum(b[1] - b[0], 1e-9))))
+    n = 0
+    pairs = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            lo = np.maximum(bounds[i][0], bounds[j][0])
+            hi = np.minimum(bounds[i][1], bounds[j][1])
+            inter = float(np.prod(np.clip(hi - lo, 0, None)))
+            if inter > vol_frac * min(vols[i], vols[j]):
+                n += 1
+                pairs.append(f"{names[i]}/{names[j]}")
+    return n, pairs
+
+
+def eval_scene(D, verbose=True):
+    """返回该场景的指标 dict。任何一项算不出都记为 None 并写明原因。"""
+    out = {"scene": os.path.basename(D), "dir": D}
+
+    # ── 载入 ──
+    pkl = os.path.join(D, "all_instances.pkl")
+    if not os.path.isfile(pkl):
+        out["error"] = "no all_instances.pkl"
+        return out
+    o = pickle.load(open(pkl, "rb"))
+    inst = o.get("all_instances", o)
+    opt_frames = o.get("all_optimal_frame_ids", {})
+
+    rel = {}
+    rp = os.path.join(D, "final_relations.json")
+    if os.path.isfile(rp):
+        rel = json.load(open(rp))
+
+    out["n_instances"] = sum(len(v) for v in inst.values())
+    out["categories"] = {k: len(v) for k, v in sorted(inst.items())}
+
+    # ── M1 交互检出 ──
+    pf = os.path.join(D, "pick_place_frames.json")
+    if os.path.isfile(pf):
+        try:
+            j = json.load(open(pf))
+            out["M1_n_interactions"] = len(j.get("interactions", []))
+            out["M1_names"] = [it.get("instance_name") for it in j.get("interactions", [])]
+        except Exception as e:
+            out["M1_n_interactions"] = None
+            out["M1_err"] = f"{type(e).__name__}"
+    else:
+        out["M1_n_interactions"] = None
+        out["M1_err"] = "no pick_place_frames.json"
+
+    # ── M4 摆放审计 ──
+    ap = os.path.join(D, "placement_audit.json")
+    if os.path.isfile(ap):
+        try:
+            a = json.load(open(ap))
+            st = a.get("n_by_status", {})
+            tot = sum(st.values()) or 1
+            out["M4_by_status"] = st
+            out["M4_ok_rate"] = round(st.get("ok", 0) / tot, 3)
+        except Exception as e:
+            out["M4_err"] = f"{type(e).__name__}"
+    else:
+        out["M4_err"] = "no placement_audit.json"
+
+    # ── M5 穿模 ──
+    try:
+        n, pairs = _penetration_pairs(inst)
+        out["M5_n_penetration"] = n
+        out["M5_pairs"] = pairs[:8]
+    except Exception as e:
+        out["M5_err"] = f"{type(e).__name__}"
+
+    # ── M6 采样帧覆盖率（需要 _pre_dedup_masks.pkl）──
+    pre = os.path.join(D, "_pre_dedup_masks.pkl")
+    pre_am = None
+    if os.path.isfile(pre):
+        try:
+            pre_am = pickle.load(open(pre, "rb"))["all_masks"]
+        except Exception:
+            pre_am = None
+    if pre_am:
+        cov = {}
+        for c, lst in pre_am.items():
+            for i, tr in enumerate(lst):
+                if not tr:
+                    continue
+                f = sorted(m["frame_id"] for m in tr)
+                cov[f"{c}_{i}"] = {"n_frames": len(f), "f0": f[0], "f_last": f[-1]}
+        out["M6_coverage"] = cov
+        if cov:
+            out["M6_min_frames"] = min(v["n_frames"] for v in cov.values())
+            out["M6_mean_frames"] = round(
+                float(np.mean([v["n_frames"] for v in cov.values()])), 1)
+
+    # ── M3 mesh/点云 尺寸比（类别级）──
+    if pre_am:
+        ratios = {}
+        for c, lst in inst.items():
+            try:
+                mb = np.array([_world_bounds(x) for x in lst])
+                mext = np.max(mb[:, 1], axis=0) - np.min(mb[:, 0], axis=0)
+                pts = []
+                for tr in pre_am.get(c, []):
+                    for m in tr:
+                        pts.append(int(m["mask"].sum()))
+                # 点云 AABB 需要 world_points；若 pkl 里没有就跳过
+                wp = pickle.load(open(pre, "rb")).get("world_points")
+                if wp is None:
+                    continue
+                P = []
+                for tr in pre_am.get(c, []):
+                    for m in tr:
+                        p = wp[m["frame_id"]][m["mask"] > 0]
+                        p = p[np.all(np.isfinite(p), axis=-1)]
+                        if len(p):
+                            P.append(p)
+                if not P:
+                    continue
+                P = np.concatenate(P, axis=0)
+                pext = P.max(0) - P.min(0)
+                r = float(np.max(mext) / max(float(np.max(pext)), 1e-9))
+                ratios[c] = round(r, 2)
+            except Exception:
+                continue
+        if ratios:
+            out["M3_size_ratio"] = ratios
+
+    # ── M2 类别级 silhouette IoU ──
+    try:
+        out["M2_silhouette"] = _silhouette_iou(D, inst, pre_am, opt_frames)
+    except Exception as e:
+        out["M2_err"] = f"{type(e).__name__}: {str(e)[:60]}"
+
+    return out
+
+
+def _silhouette_iou(D, inst, pre_am, opt_frames):
+    """类别级：该类所有 mesh 在最优帧渲染并集 vs 真实 mask 并集。
+
+    为什么用类别级而不是实例级: 去重会合并实例（cabinet[1]+table[0]），
+    实例与 pre-dedup mask 的对应关系不可靠；类别级没有这个歧义。
+    """
+    if not pre_am:
+        return None
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    from stage4.run_alignment import load_vggt_results
+    from stage4.renderer import MeshRenderer
+
+    v = load_vggt_results(D)
+    if v is None:
+        return None
+    K = np.asarray(v["intrinsic"], float)
+    exts = np.asarray(v["extrinsics"], float)
+    H, W = np.asarray(v["depths"])[0].shape
+    ren = MeshRenderer(K, W, H)
+
+    res = {}
+    for c, lst in inst.items():
+        frames = opt_frames.get(c) or []
+        if not frames:
+            continue
+        ious = []
+        for i, x in enumerate(lst):
+            # 每个实例用它自己的最优帧 (all_optimal_frame_ids 与实例顺序对齐)
+            f = frames[i] if i < len(frames) else frames[0]
+            if f >= len(exts):
+                continue
+            try:
+                _, _, mk = ren.render_mesh(x["original_mesh"],
+                                           np.asarray(x["T"], float), exts[f])
+            except Exception:
+                continue
+            m_ren = np.asarray(mk) > 0
+            if m_ren.sum() == 0:
+                continue
+            # 取该帧同类别真实 mask 中与渲染最匹配的那个。
+            # 用 max 而非并集: 去重会把多个 pre-dedup mask 合成一个实例,
+            # 实例与 mask 的对应不可靠; "能否匹配到某块真实区域"是无歧义的下界,
+            # 同时避免把该帧不可见的其它实例算进并集而稀释分数。
+            best = 0.0
+            for tr in pre_am.get(c, []):
+                for m in tr:
+                    if m["frame_id"] != f:
+                        continue
+                    mr = np.asarray(m["mask"])
+                    if mr.shape[:2] != (H, W):
+                        continue
+                    mr = mr > 0
+                    u = (m_ren | mr).sum()
+                    if u > 0:
+                        best = max(best, float((m_ren & mr).sum() / u))
+            ious.append(best)
+        if ious:
+            res[c] = round(float(np.mean(ious)), 3)
+    if not res:
+        return None
+    res["_mean"] = round(float(np.mean([x for x in res.values() if isinstance(x, float)])), 3)
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scenes", nargs="*", default=None)
+    ap.add_argument("--pattern", default="output_v3/*s4")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--json", default=None)
+    args = ap.parse_args()
+
+    dirs = []
+    if args.scenes:
+        for s in args.scenes:
+            p = _resolve(s)
+            if p:
+                dirs.append(p)
+            else:
+                print(f"  ⚠️ 找不到 {s}")
+    if args.all:
+        dirs += sorted(glob.glob(os.path.join(REPO, args.pattern)))
+        dirs += sorted(glob.glob(os.path.join(REPO, "output_v2/*rescaled")))
+        dirs = sorted(set(dirs))
+
+    rows = []
+    for d in dirs:
+        r = eval_scene(d)
+        rows.append(r)
+        print(f"\n=== {r['scene']}")
+        if "error" in r:
+            print(f"   ❌ {r['error']}")
+            continue
+        print(f"   实例 {r['n_instances']}: {r['categories']}")
+        m1 = r.get("M1_n_interactions")
+        print(f"   M1 交互检出: {m1 if m1 is not None else 'N/A ' + str(r.get('M1_err',''))}")
+        m2 = r.get("M2_silhouette")
+        if isinstance(m2, dict):
+            mean = m2.pop("_mean", None)
+            m2["MEAN"] = mean
+            print(f"   M2 silhouette IoU: {m2}")
+        else:
+            print(f"   M2 silhouette IoU: N/A {r.get('M2_err','')}")
+        print(f"   M3 mesh/点云 尺寸比: {r.get('M3_size_ratio','N/A')}")
+        print(f"   M4 摆放: {r.get('M4_by_status','N/A')} ok率={r.get('M4_ok_rate','N/A')}")
+        print(f"   M5 穿模: {r.get('M5_n_penetration','N/A')} {r.get('M5_pairs','')}")
+        print(f"   M6 采样帧: 最少 {r.get('M6_min_frames','N/A')} 帧, 平均 {r.get('M6_mean_frames','N/A')} 帧")
+
+    if args.json:
+        json.dump(rows, open(args.json, "w"), ensure_ascii=False, indent=2, default=str)
+        print(f"\n已写出 {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -144,9 +144,12 @@ python mainv3.py \
     --disable_stage4
 ```
 
-> `--scene_json` 用手写类别绕过 VLM 检测（VLM 在大场景会 hallucinate）；
-> `--disable_stage4` 跳过 ICP（对 3cm 级小物体，其绝对距离阈值 0.075m
-> 大于物体本身，迭代数学上无效，实测无收益）。
+> `--scene_json` 用手写类别绕过 VLM 检测（VLM 在大场景会 hallucinate）。
+>
+> ⛔ **不要传 `--enable_stage4`** —— Stage 4（ICP 视觉-空间对齐）已**永久禁用**，
+> 传了也会被 `main()` 强制忽略。详见 README 的禁用说明，核心原因：其 ICP
+> 阈值是绝对米制（`0.25→0.075 m`），对 3cm 级小物体而言阈值大于物体本身，
+> 所有点都成为平凡内点，迭代在数学上无效；且 VGGT 是相对尺度，绝对阈值无意义。
 
 ---
 

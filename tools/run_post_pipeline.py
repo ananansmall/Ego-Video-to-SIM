@@ -376,6 +376,9 @@ def _print_position_diff(before, after, stage_name):
                   f"({b['centroid'].round(4)} → {a['centroid'].round(4)})", flush=True)
 
 
+# ⛔ 已废弃 (DEPRECATED): Stage 4 视觉-空间对齐**不要使用**。
+# 原因: ICP 绝对米制阈值对相对尺度的 VGGT 输出无意义, 对小物体迭代无效;
+# 实测收益不稳定且会反向破坏 (2chair 场景相机位姿落进桌体)。
 def run_stage4(scene_dir, vggt_data, all_instances, args, categories_and_relations=None):
     """Stage 4: 视觉-空间对齐 (ICP + MASt3R)
 
@@ -580,7 +583,12 @@ def main(args):
 
     log_filename = setup_logging(scene_dir, "post_pipeline")
 
-    do_stage4 = args.stage4
+    # ⛔ Stage 4 永久禁用 (不要使用)。即使 --stage4 传了也强制关掉。
+    # 原因见 mainv3.run_stage4 的废弃说明: ICP 绝对米制阈值对相对尺度的
+    # VGGT 输出无意义, 对小物体迭代无效且会反向破坏。
+    if getattr(args, "stage4", False):
+        print("   ⛔ --stage4 已废弃并被忽略 (Stage 4 永久禁用)", flush=True)
+    do_stage4 = False
     do_stage5 = args.stage5 or args.only_refine_relations or args.only_sp_refinement
 
     print("=" * 70, flush=True)

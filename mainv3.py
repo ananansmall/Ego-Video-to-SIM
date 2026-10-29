@@ -20,7 +20,8 @@ ReplicateAnyScene V2 — 完整自动化流水线
   基础精修: floor/wall/embedded 精修 (始终执行，与main.py一致)
            输出: final_scene_base.glb
 
-  Stage 4: 迭代视觉-空间对齐 (stage4/, 默认关闭，--enable_stage4 启用)
+  Stage 4: 迭代视觉-空间对齐 —— ⛔ 已废弃, 永久禁用, 不要使用
+           (ICP 用绝对米制阈值, 对相对尺度的 VGGT 输出无意义; 小物体迭代无效)
            输入: GLB+3D数据 → 输出: 对齐后的GLB
            原main.py未实现此阶段
 
@@ -71,7 +72,7 @@ GLB 文件说明 (按启用的 Stage 决定文件名):
   python mainv2.py --input_video ./232.mp4 --vggt_model vggt4d
 
   # VGGT4D + 全部高级阶段
-  python mainv2.py --input_video ./232.mp4 --vggt_model vggt4d --enable_stage4 --enable_stage5
+  python mainv3.py --input_video ./232.mp4 --vggt_model vggt_omega --enable_stage5
 
   # VGGT4D + Stage5 使用逐物体推断 (旧方式)
   python mainv2.py --input_video ./232.mp4 --vggt_model vggt4d --enable_stage5 --stage5_method per_object
@@ -83,7 +84,7 @@ GLB 文件说明 (按启用的 Stage 决定文件名):
   python mainv2.py --input_video ./hallway.mp4 --output_path ./my_output
 
   # 启用 Stage 4 (视觉-空间对齐)
-  python mainv2.py --input_video ./hallway.mp4 --enable_stage4
+  python mainv3.py --input_video ./hallway.mp4 --enable_stage5
 
   # 启用 Stage 5 (高级语义精修)
   python mainv2.py --input_video ./hallway.mp4 --enable_stage5
@@ -1373,7 +1374,18 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
                categories_and_relations=None, walls_info=None,
                deduplicated_all_masks=None):
     """
-    Stage 4: 迭代视觉-空间对齐 (可选，默认关闭)
+    Stage 4: 迭代视觉-空间对齐 —— ⛔ 已废弃 (DEPRECATED), **不要使用**
+
+    mainv3.main() 里已强制 args.enable_stage4=False, 本函数不会再被调用。
+    仅作历史保留, 便于将来重新设计时参考。禁用原因:
+      1) ICP 阈值是绝对米制 (icp_optimization.py: 0.25→0.075m)。对 3cm
+         的耳机盒, 最终阈值是物体自身的 2.5 倍 —— 所有桌面点都被判成
+         "对应点", 迭代在数学上无效 (全部平凡内点)。
+      2) VGGT 输出是相对尺度, 绝对米制阈值在该坐标系里没有物理意义。
+      3) 实测收益不稳定且会反向破坏: wxD 对齐后桌面 IoU 0.49, 但 2chair
+         场景只有 0.32 且相机位姿落进桌体内部。
+      4) 它在 Stage 5 之前改位姿, 而 Stage 5 的摆放链不假设这种改动。
+    若将来要做对齐, 应改成"物体尺寸相对制阈值"并单独验收。
 
     流程 (对齐论文 Section 3.4):
       1. 使用VGGT世界点云 + 置信度
@@ -2124,7 +2136,7 @@ def main(args):
         print(f"💾 all_instances_stage4.pkl 已保存", flush=True)
         _stage4_time = time.time() - _t4
     else:
-        print("\n⏭️  Stage 4 已跳过 (使用 --enable_stage4 启用)", flush=True)
+        print("\n⏭️  Stage 4 已永久禁用 (不要使用; 详见 main() 里的禁用说明)", flush=True)
 
     # ── Stage 5: 高级语义精修 (可选，默认关闭) ──
     _stage5_time = 0
@@ -2378,10 +2390,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_frames_stage1", type=int, default=10,
                         help="Stage1采样关键帧数 (默认10)")
     parser.add_argument("--enable_stage4", action="store_true",
-                        help="启用Stage 4视觉-空间对齐")
+                        help="⛔ [已废弃, 传了也会被忽略] Stage 4 视觉-空间对齐已永久禁"
+                             "用, 见 main() 里的禁用说明")
     parser.add_argument("--disable_stage4", action="store_true",
-                        help="关闭Stage 4视觉-空间对齐 (默认开启: 无对齐时物体位置"
-                             "停留在单帧质心配准噪声水平, 实测偏离真实视野分米级)")
+                        help="[无效, 保留兼容] Stage 4 已永久禁用, 无需再关")
     parser.add_argument("--enable_stage5", action="store_true",
                         help="启用Stage 5语义感知场景精修 (默认关闭)")
     parser.add_argument("--stage5_method", type=str, default="scene_graph",
@@ -2416,9 +2428,28 @@ if __name__ == "__main__":
                         help="物理仿真检测步数 (默认300)")
 
     args = parser.parse_args()
-    # Stage 4 保持默认关闭: 实测收益不稳定 —— wxD 场景对齐后桌面与真实帧
-    # 重合 (IoU 0.49), 但 2chair 场景 IoU 仅 0.32 且相机位姿落进桌体内部。
-    # 需要位置对齐时显式传 --enable_stage4, 并用真值叠加验收。
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Stage 4 (ICP 视觉-空间对齐) —— 永久禁用, 不要使用
+    # ══════════════════════════════════════════════════════════════════════
+    # 这里直接强制关掉, 无论命令行传什么。保留 --enable_stage4 参数只为兼容
+    # 旧脚本 (否则会 argparse 报错), 但它已经不起任何作用。
+    #
+    # 禁用的理由 (全部有实测依据):
+    #   1) ICP 阈值是**绝对米制** (icp_optimization.py: 0.25→0.075m)。
+    #      对 3cm 的耳机盒, 最终阈值是物体自身的 2.5 倍 —— 所有桌面上都被
+    #      判成"对应点", 迭代在数学上无效 (全部平凡内点)。
+    #   2) VGGT 输出是**相对尺度**, 绝对米制阈值在这个坐标系里没有物理意义。
+    #   3) 实测收益不稳定且会反向破坏: wxD 对齐后桌面与真实帧 IoU 0.49,
+    #      但 2chair 场景 IoU 仅 0.32 且相机位姿落进桌体内部。
+    #   4) 它会在 Stage 5 之前改动位姿, 而 Stage 5 的摆放链并不假设这种改动,
+    #      叠加后反而更难收敛。
+    # 若将来要做对齐, 应改成"物体尺寸相对制阈值"并单独验收, 而不是启用这里。
+    if getattr(args, "enable_stage4", False):
+        print("   ⛔ --enable_stage4 已废弃并被忽略 (Stage 4 永久禁用, 见代码注释)",
+              flush=True)
+    args.enable_stage4 = False
+
     # Stage2 box 兜底开关 (默认开)
     globals()['_VLM_BOX_FALLBACK'] = not getattr(args, 'no_vlm_box_fallback', False)
     # Stage3.7 的 VLM 交互判断开关 (传给 pick_place_detector)

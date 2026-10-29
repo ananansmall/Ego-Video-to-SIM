@@ -320,13 +320,37 @@ def add_ground_and_legs(all_instances, refined_relations, verbose=True):
         sx = max(ux1 - ux0 + FLOOR_MARGIN, 3.0)
         sy = max(uy1 - uy0 + FLOOR_MARGIN, 3.0)
         import trimesh
-        floor = trimesh.creation.box(extents=[sx, sy, 0.02])
-        floor.apply_translation([cx, cy, -0.009])
-        all_instances.setdefault("floor", []).append({"original_mesh": floor, "T": np.eye(4)})
-        report["floor"] = {"size": [round(sx, 1), round(sy, 1)],
-                           "center": [round(float(cx), 2), round(float(cy), 2)]}
-        if verbose:
-            print(f"   ⬜ 地板基准面: {sx:.1f}x{sy:.1f}m @ ({cx:.2f},{cy:.2f})", flush=True)
+        # ── 避免双地板 ──
+        # 地板有两个来源: (a) Stage2.5 的 floor 分割实例, (b) 这里生成的基准面。
+        # 两者都 append 到 all_instances["floor"] → 场景里出现 floor_0 + floor_1,
+        # 完全重叠 100%。实测 121/151/002 三个场景都有这个问题, 并且会让
+        # placement_audit 把它们算成穿模对。
+        # 处理: 已有分割地板时, 只把它压到 z=0 作为基准(保留真实几何),
+        # 不再追加合成平面; 没有地板时才生成。
+        _existing = all_instances.get("floor") or []
+        if _existing:
+            for _fi in _existing:
+                _b = _wb(_fi)
+                if abs(float(_b[0][2])) > 1e-3:
+                    _fi["T"] = np.asarray(_fi["T"], float).copy()
+                    _fi["T"][2, 3] -= float(_b[0][2])
+            report["floor"] = {"source": "segmented",
+                               "n": len(_existing),
+                               "note": "已有分割地板, 跳过生成合成基准面"}
+            if verbose:
+                print(f"   ⬜ 地板: 复用已有分割地板 {len(_existing)} 个"
+                      f" (已对齐 z=0), 不再追加合成面", flush=True)
+        else:
+            floor = trimesh.creation.box(extents=[sx, sy, 0.02])
+            floor.apply_translation([cx, cy, -0.009])
+            all_instances.setdefault("floor", []).append(
+                {"original_mesh": floor, "T": np.eye(4)})
+            report["floor"] = {"source": "synthetic",
+                               "size": [round(sx, 1), round(sy, 1)],
+                               "center": [round(float(cx), 2), round(float(cy), 2)]}
+            if verbose:
+                print(f"   ⬜ 地板基准面(合成): {sx:.1f}x{sy:.1f}m "
+                      f"@ ({cx:.2f},{cy:.2f})", flush=True)
     return all_instances, report
 
 

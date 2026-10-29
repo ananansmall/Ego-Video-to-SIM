@@ -266,7 +266,7 @@ def _infer_supporter(name, b_obj, bounds, min_overlap=0.30, max_drop=0.60):
 
 
 def separate_object_penetrations(all_instances, refined_relations, verbose=True,
-                                 pen_thresh=0.02, push_step=0.015, max_iter=40,
+                                 pen_thresh=0.10, push_step=0.015, max_iter=40,
                                  gap_tol=0.005):
     """把互相穿模的物体沿 XY 推开 (只改水平位置, 不动 z / 旋转 / 尺寸)。
 
@@ -308,27 +308,73 @@ def separate_object_penetrations(all_instances, refined_relations, verbose=True,
         m.apply_transform(np.asarray(info["T"], dtype=float))
         return m.bounds
 
-    def _penetration(a_info, b_info):
-        """a 的顶点落入 b AABB 的比例 (取双向最大值)。
-        AABB 每侧收缩 _CONTACT_EPS: reseat 后物体与支撑面精确贴合 (gap≈0),
-        闭区间判定会把"贴合"当成"穿模", 触发无意义的 XY 推离 (2chair 实测:
-        bag/bottle 被推出桌面足迹后落到地上)。"""
-        ma = a_info["original_mesh"].copy()
-        ma.apply_transform(np.asarray(a_info["T"], dtype=float))
-        mb = b_info["original_mesh"].copy()
-        mb.apply_transform(np.asarray(b_info["T"], dtype=float))
-        pa = np.asarray(ma.vertices)
-        pb = np.asarray(mb.vertices)
+
+    def _penetration(ia, ib):
+        """第 ia 个实例的顶点落入第 ib 个 AABB 的比例 (取双向最大值)。
+
+        贴合 vs 真穿模的区分: 不收缩对方 AABB, 而是把**测试顶点沿自身中心
+        缩 2%**。
+          · 贴合面接触 → 顶点缩离对方 → 不算穿模 ✅
+          · 真互穿     → 顶点仍在对方内部 → 算穿模 ✅
+          · 盒子/薄片/任意网格都成立, 不依赖网格是否水密
+        旧实现是把对方 AABB 每侧收缩 3mm, 对 box 型 mesh 致命: 盒子所有
+        顶点都在边界上, 收缩后一个都进不去 → 穿模恒为 0 → 对盒子类物体
+        完全失效 (实测两个 0.1m 立方体 100% 重合时 n=0)。
+        """
+        pa = _verts[ia]
+        pb = _verts[ib]
         if len(pa) == 0 or len(pb) == 0:
             return 0.0
-        _CONTACT_EPS = 0.003
-        lo, hi = mb.bounds[0] + _CONTACT_EPS, mb.bounds[1] - _CONTACT_EPS
-        ra = float(np.all((pa >= lo) & (pa <= hi), axis=-1).mean())
-        lo, hi = ma.bounds[0] + _CONTACT_EPS, ma.bounds[1] - _CONTACT_EPS
-        rb = float(np.all((pb >= lo) & (pb <= hi), axis=-1).mean())
+        # ── 与 dump_placement_audit 完全一致的判据 ──
+        # 必须一致, 否则两边结论矛盾: 实测 002 里 audit 报 0 处穿模, 分离函数
+        # 却推了 40 次 (它只用 AABB, 把"枕头压在被子上"也判穿模)。乱推会破坏
+        # 本来正确的堆叠 —— 这是"越改越差"的另一个来源。
+        # 判据: AABB 交叠 / 较小者体积 > 10%  且  mesh contains 比例 > 10%。
+        _lo = np.maximum(_bb[ia][0], _bb[ib][0])
+        _hi = np.minimum(_bb[ia][1], _bb[ib][1])
+        _inter = float(np.prod(np.clip(_hi - _lo, 0.0, None)))
+        if _inter <= 1e-7:
+            return 0.0
+        _va = float(np.prod(np.maximum(_bb[ia][1] - _bb[ia][0], 1e-9)))
+        _vb = float(np.prod(np.maximum(_bb[ib][1] - _bb[ib][0], 1e-9)))
+        if _inter / max(min(_va, _vb), 1e-9) <= 0.10:
+            return 0.0
+        _ERODE = 0.005
+        # 再用 mesh 级 contains 验证, 与 dump_placement_audit 的判据保持一致。
+        # 为什么必须一致: 分离函数原来只用 AABB, 而 audit 用 contains ——
+        # 结果是分离函数对"枕头压在被子上"这类正常堆叠也判穿模, 疯狂推 40 次
+        # 而 audit 的穿模对一个都没减少 (实测 002: 0 → 0 却推了 40 次;
+        # 151: 2 → 2 也推了 40 次)。乱推会破坏本来正确的摆放。
+        def _frac(_src_v, _src_c, _dst):
+            _e = _src_v + (_src_c - _src_v) * _ERODE
+            if len(_e) > 600:
+                _e = _e[np.linspace(0, len(_e) - 1, 600).astype(int)]
+            try:
+                return float(np.mean(_dst.contains(_e)))
+            except Exception:
+                lo, hi = _dst.bounds[0], _dst.bounds[1]
+                return float(np.all((_e >= lo) & (_e <= hi), axis=-1).mean())
+        ra = _frac(pa, _ctr[ia], _meshes[ib])
+        rb = _frac(pb, _ctr[ib], _meshes[ia])
         return max(ra, rb)
 
     items = _items()
+    # ── 顶点缓存 ──
+    # 为什么要缓存: 旧实现对每一对、每一轮迭代都 copy+transform 两个 mesh。
+    # 25 个实例 = 300 对, 40 轮 = 12000 次 mesh 变换 → 实测超时 (>900s)。
+    # 顶点只需在世界坐标系里算一次, 之后每次推开只做一次平移即可。
+    _meshes = []         # 世界坐标 mesh (contains 用)
+    _verts = []          # 世界坐标顶点 (np.ndarray)
+    _bb = []             # 世界 AABB
+    _ctr = []            # 顶点质心 (用于收缩)
+    for _n, _c, _i, _info in items:
+        _m = _info["original_mesh"].copy()
+        _m.apply_transform(np.asarray(_info["T"], dtype=float))
+        _v = np.asarray(_m.vertices, dtype=float)
+        _verts.append(_v)
+        _bb.append(_m.bounds)
+        _meshes.append(_m)
+        _ctr.append(_v.mean(axis=0) if len(_v) else np.zeros(3))
 
     # relations 里的具名堆叠对: "A supported by B" 且 B 是具体实例。
     # 这类对穿模时沿 z 抬升解决, 严禁 XY 推离 —— XY 推离会把贴合堆叠的
@@ -363,7 +409,14 @@ def separate_object_penetrations(all_instances, refined_relations, verbose=True,
                     continue
                 na, ca, ia, xa = items[i]
                 nb, cb, ib, xb = items[j]
-                r = _penetration(xa, xb)
+                # 跳过 floor: 物体陷进地板/支撑物是**竖向**问题, 由
+                # ground_floating_objects / reseat 修 (改 z)。本函数只改 XY,
+                # 对竖向穿模无能为力 —— 不跳过会一直找不到解而白跑满 max_iter
+                # (实测 151: cabinet_3 陷进 floor 13%, 推 40 次仍报 2 对)。
+                if "floor" in f"{ca}".lower() or "floor" in f"{cb}".lower():
+                    skip_pairs.add((i, j))
+                    continue
+                r = _penetration(i, j)
                 if r > worst_ratio:
                     worst, worst_ratio = (i, j), r
         if worst is None:
@@ -418,6 +471,16 @@ def separate_object_penetrations(all_instances, refined_relations, verbose=True,
         # 不该由分离环节用"把物体推出棋盘"来偿还。
         xa["T"] = Ta
         xb["T"] = Tb
+        # 同步平移缓存, 后续迭代才能看到新的位置
+        _shift = np.array([dx * push_step, dy * push_step, 0.0])
+        _verts[i] = _verts[i] + _shift
+        _ctr[i] = _ctr[i] + _shift
+        _bb[i] = _bb[i] + _shift
+        _verts[j] = _verts[j] - _shift
+        _ctr[j] = _ctr[j] - _shift
+        _bb[j] = _bb[j] - _shift
+        _meshes[i].apply_translation(_shift)
+        _meshes[j].apply_translation(-_shift)
         n_sep += 1
         if verbose and n_sep <= 12:
             print(f"      [sep] {na} ↔ {nb}: 穿模 {worst_ratio*100:.1f}% → 各推 "
@@ -1093,9 +1156,97 @@ def dump_placement_audit(all_instances, refined_relations, placement_strategies=
     n_bad = sum(1 for r in objects
                 if r["status"] in ("floating", "sunken", "severe_penetration",
                                    "no_supporter_found"))
+    # ── 两两 AABB 穿模检查 ──
+    # 为什么必须补进 audit: 原 audit 只检查 z 向 gap, 完全不看 xy 重叠。
+    # 实测 002_C1_Bowl-s4: audit 报 {'ok': 9} (ok 率 1.0), 但实际有 7 处真实穿模
+    #   pillow_0/pillow_1 互相插入
+    #   pillow_1/blanket_0、pillow_3/blanket_0 枕头插进被子
+    #   blanket_0/hat_0 互相插入
+    #   bed_0/bed_1、floor_0/floor_1 重复实例重叠
+    # "ok 率 1.0" 因此是**不可信指标**, 会让下游 (以及我自己) 误以为场景正确。
+    # 判据: 交叠体积 / 较小者体积 > 10% 且绝对交叠 > 1e-5 m³。
+    # 注意不排除"物体 vs 它的支撑物": 正常贴合时 gap=0, 交叠体积为 0; 只有
+    # 真陷进支撑物才会产生交叠 —— 那本来就该报出来。
+    _names = [r["name"] for r in objects]
+    _vols = {}
+    for r in objects:
+        _bb = bounds[r["name"]]
+        _vols[r["name"]] = float(np.prod(np.maximum(_bb[1] - _bb[0], 1e-9)))
+
+    # mesh 级互穿判定: AABB 重叠只是**候选**, 必须再验证顶点真的插进对方内部。
+    # 为什么必须有这一层: 实测 002_C1_Bowl-s4 里 pillow_1 压在 blanket_0 上,
+    # 两者 AABB 交叠 20% —— 但枕头坐在被子上时 AABB 必然重叠, mesh 却并不互穿。
+    # 只用 AABB 会把"正常堆叠"误报成穿模 (7 对里有 4 对是这种假阳性)。
+    # 判据: 一方顶点落在另一方内部的**体积占比** > 10%。
+    def _mesh_of(_n):
+        _c, _i = index[_n]
+        _m = all_instances[_c][_i]["original_mesh"].copy()
+        _m.apply_transform(np.asarray(all_instances[_c][_i]["T"], float))
+        return _m
+
+    def _inside_frac(_mA, _mB):
+        """A 的顶点落在 B 内部的比例 (双向取大)。"""
+        _best = 0.0
+        for _src, _dst in ((_mA, _mB), (_mB, _mA)):
+            try:
+                _v = np.asarray(_src.vertices, float)
+                if len(_v) == 0:
+                    continue
+                if len(_v) > 800:                      # 抽样, 控制耗时
+                    _v = _v[np.linspace(0, len(_v) - 1, 800).astype(int)]
+                # 顶点沿自身中心缩 0.5% 再判 contains:
+                #   · 完全重合的盒子 → 顶点被推入对方内部, 能检出 ✅
+                #   · 贴合面接触     → 顶点缩离对方, 不算穿模 ✅
+                # 不收缩时 contains 对边界点返回 False, 会漏掉 100% 重合的情形。
+                _c = np.asarray(_src.vertices, float).mean(axis=0)
+                _v = _v + (_c - _v) * 0.005
+                _ins = _dst.contains(_v)
+                _best = max(_best, float(np.mean(_ins)))
+            except Exception:
+                continue
+        return _best
+
+    pen_pairs = []
+    pen_of = {n: [] for n in _names}
+    for _i in range(len(_names)):
+        for _j in range(_i + 1, len(_names)):
+            _a, _b = _names[_i], _names[_j]
+            _ba, _bb2 = bounds[_a], bounds[_b]
+            _lo = np.maximum(_ba[0], _bb2[0])
+            _hi = np.minimum(_ba[1], _bb2[1])
+            _inter = float(np.prod(np.clip(_hi - _lo, 0.0, None)))
+            if _inter <= 1e-5:
+                continue
+            _frac = _inter / max(min(_vols[_a], _vols[_b]), 1e-9)
+            if _frac <= 0.10:                          # AABB 都不重叠, 无需细查
+                continue
+            try:
+                _infrac = _inside_frac(_mesh_of(_a), _mesh_of(_b))
+            except Exception:
+                _infrac = _frac                          # 退化: 用 AABB 比例
+            if _infrac <= 0.10:
+                continue                                 # AABB 重叠但 mesh 不互穿 → 正常堆叠
+            pen_pairs.append({
+                "a": _a, "b": _b,
+                "overlap_frac": round(_frac, 3),
+                "inside_frac": round(_infrac, 3),
+                "overlap_vol": round(_inter, 6),
+            })
+            pen_of[_a].append(f"{_b}(内插{_infrac*100:.0f}%)")
+            pen_of[_b].append(f"{_a}(内插{_infrac*100:.0f}%)")
+
+    for r in objects:
+        r["penetrations"] = pen_of.get(r["name"], [])
+        # 只在原本 ok 的情况下降级, 不覆盖更严重的 floating/sunken
+        if r["penetrations"] and r["status"] == "ok":
+            r["status"] = "penetrating"
+    n_bad = sum(1 for r in objects if r["status"] != "ok")
+
     audit = {
         "n_objects": len(objects),
         "n_problem": n_bad,
+        "n_penetration_pairs": len(pen_pairs),
+        "penetration_pairs": pen_pairs,
         "gap_tol": gap_tol,
         "n_by_status": {s: sum(1 for r in objects if r["status"] == s)
                         for s in sorted({r["status"] for r in objects})},
