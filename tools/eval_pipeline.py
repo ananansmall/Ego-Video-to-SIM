@@ -338,6 +338,7 @@ def _silhouette_iou(D, inst, pre_am, opt_frames, wp=None):
                 float(np.mean(iou_s)))
     if not res:
         return None, None
+    res["_mean"] = round(float(np.mean([x for x in res.values() if isinstance(x, float)])), 3)
     for k in ("raw", "trans", "trans_scale"):
         vals = [x for x in layered[k].values() if isinstance(x, float)]
         layered[k]["_mean"] = round(float(np.mean(vals)), 3) if vals else None
