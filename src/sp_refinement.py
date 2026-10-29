@@ -1450,3 +1450,190 @@ def refine_attached_to_wall_object(object_info, walls_info, camera_pos=None):
     new_pos = object_info["T"][:3, 3].copy()
     print(f"      [attached_wall] wall_axis={wall_axis}, pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return object_info
+
+
+def fix_orphan_instances(all_instances, refined_relations, verbose=True,
+                         max_dist=1.0, gap_tol=0.05, z_ok_tol=0.05):
+    """5.25 收敛循环之后: 孤儿实例处理 (VGGT 相对定位错的兜底, T5)。
+
+    两类孤儿, 判据纯几何:
+
+      ① "脱锚的贴附": 关系为 "supported by X" (X 具名实例), 竖向已贴合
+         (|gap| < gap_tol, gap = 物体底面 z - 支撑物顶面 z), 但 xy 足迹与
+         X 的重叠恰好为 0 —— 物体和支撑物在水平方向完全脱开。
+         实测 002: pillow_2 在 x=[4.55,5.10], 而床在 x=[-0.94,1.82],
+         水平重叠 0%, 相距 3~5m。
+         → 沿 xy 夹回 X 的范围内 (与 recenter_edge_objects 同一套 clamp:
+           物体中心 clamp 进"支撑物范围 内缩物体半宽"后的区间, 支撑物比
+           物体还小时退化为对齐支撑物中心), z 保持不动。
+         为什么不像 recenter 那样设 max_shift 护栏: recenter 的 0.35m 上限
+         会把本函数要修的 3~5m 案例直接跳过 (它防的是"支撑物范围异常",
+         而 |gap|<gap_tol + 重叠=0 两个条件已锁定"关系成立、位置错"),
+         触发条件本身就是护栏。
+
+      ② "离群的幽灵": 关系为 "supported by floor/ground", 底面 z 正常
+         (|min_z| ≤ z_ok_tol, 即已正常落地), 但水平位置距场景中心超过
+         max_dist —— VGGT 相对定位错的典型产物: 一个"实例"被丢到离整个
+         场景几米外, 它不是摆放错, 是重建幻觉。
+         → 标记 orphan (写进返回的 report, 不静默消失), 从 all_instances
+           中剔除; 关系串里引用了被剔除实例的, 回退 "supported by floor"。
+         场景中心用各实例 xy 中心的**中位数**而不是均值: 单个 5m 外的幽灵
+         会把均值拉偏 5/N 米 (实例少时足以把真物体也误判成离群), 中位数对
+         离群稳健。实例总数 < 4 时无法稳健地定义"离群", 全部保留。
+         底面 z 不正常的远处实例不动 —— 那是坐标系未对齐, 该由落地补正/
+         audit 暴露, 而不是当垃圾删掉。
+
+    Args:
+        all_instances: {category: [instance_info, ...]}, 原地修改 (① 改 T,
+            ② 可能删元素并重建)
+        refined_relations: {实例名: 关系}, 原地修改 (② 剔除后按旧下标重映射)
+        max_dist: ② 判定 orphan 的水平距离阈值 (米)
+        gap_tol: ① 认定"竖向已贴合"的 |gap| 上限 (米)
+        z_ok_tol: ② 认定"底面 z 正常"的 |min_z| 上限 (米)
+    Returns:
+        (all_instances, refined_relations, report)
+        report: {"clamped": [...], "orphans": [...], "repointed": [...],
+                 "n_clamped": int, "n_removed": int, "scene_center": [x, y]}
+    """
+    import numpy as _np
+
+    report = {"clamped": [], "orphans": [], "repointed": [],
+              "n_clamped": 0, "n_removed": 0, "scene_center": None}
+    index = _instance_index(all_instances)
+    if not index:
+        return all_instances, refined_relations, report
+
+    def _bounds_of(info):
+        m = info["original_mesh"].copy()
+        m.apply_transform(_np.asarray(info["T"], dtype=float))
+        return m.bounds
+
+    def _rel_of(name, cat):
+        return str(refined_relations.get(name, "")
+                   or refined_relations.get(cat, "") or "")
+
+    # ── ① 具名支撑物: 竖向贴合但 xy 足迹完全脱开 → 横向夹回支撑物范围 ──
+    bounds = {n: _bounds_of(all_instances[c][i]) for n, (c, i) in index.items()}
+    for name, (cat, idx) in index.items():
+        kind, sup = _parse_supporter(_rel_of(name, cat))
+        if kind != "named" or not sup or sup == name or sup not in index:
+            continue
+        info = all_instances[cat][idx]
+        b, sb = bounds[name], bounds[sup]
+        gap = float(b[0, 2]) - float(sb[1, 2])
+        ov = _xy_overlap_ratio(b, sb)
+        if abs(gap) >= gap_tol or ov > 0:
+            continue
+        cx = (b[0][0] + b[1][0]) / 2.0
+        cy = (b[0][1] + b[1][1]) / 2.0
+        obj_hw = (b[1][0] - b[0][0]) / 2.0
+        obj_hh = (b[1][1] - b[0][1]) / 2.0
+        lo_x, hi_x = sb[0][0] + obj_hw, sb[1][0] - obj_hw
+        lo_y, hi_y = sb[0][1] + obj_hh, sb[1][1] - obj_hh
+        scx = (sb[0][0] + sb[1][0]) / 2.0
+        scy = (sb[0][1] + sb[1][1]) / 2.0
+        tx = min(max(cx, lo_x), hi_x) if lo_x <= hi_x else scx
+        ty = min(max(cy, lo_y), hi_y) if lo_y <= hi_y else scy
+        dx, dy = tx - cx, ty - cy
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            continue
+        T = _np.asarray(info["T"], dtype=float).copy()
+        T[0, 3] += dx
+        T[1, 3] += dy
+        info["T"] = T
+        bounds[name] = _bounds_of(info)   # 后续实例与 ② 必须看到新位置
+        _dist = float(_np.hypot(dx, dy))
+        report["n_clamped"] += 1
+        report["clamped"].append({
+            "name": name, "supporter": sup, "gap": round(gap, 4),
+            "shift_xy": [round(dx, 4), round(dy, 4)], "shift": round(_dist, 4),
+        })
+        if verbose:
+            print(f"      [orphan] {name}: 与支撑物 {sup} gap={gap:+.4f}m 但 xy 重叠 0% "
+                  f"(相距 {_dist:.2f}m) → 横向夹回 (平移 ({dx:+.3f},{dy:+.3f})m, z 不动)",
+                  flush=True)
+
+    # ── ② floor/ground 且底面 z 正常但远离场景中心 → orphan, 剔除 ──
+    bounds = {n: _bounds_of(all_instances[c][i]) for n, (c, i) in index.items()}
+    centers = {n: ((b[0][0] + b[1][0]) / 2.0, (b[0][1] + b[1][1]) / 2.0)
+               for n, b in bounds.items()}
+    if len(centers) >= 4:
+        _cen = _np.median(_np.asarray(list(centers.values()), dtype=float), axis=0)
+        report["scene_center"] = [round(float(_cen[0]), 4), round(float(_cen[1]), 4)]
+        orphans = []
+        for name in sorted(centers):
+            cat, idx = index[name]
+            rel = _rel_of(name, cat)
+            if not rel.startswith("supported by "):
+                continue
+            if rel[len("supported by "):].strip().lower() not in ("floor", "ground"):
+                continue
+            b = bounds[name]
+            min_z = float(b[0, 2])
+            if abs(min_z) > z_ok_tol:
+                continue        # 底面 z 不正常 → 坐标系问题, 不删 (交给落地/audit)
+            d = float(_np.hypot(centers[name][0] - _cen[0],
+                                centers[name][1] - _cen[1]))
+            if d <= max_dist:
+                continue
+            orphans.append({"name": name, "category": cat,
+                            "min_z": round(min_z, 4),
+                            "dist_to_center": round(d, 4),
+                            "max_dist": max_dist})
+            if verbose:
+                print(f"      [orphan] {name}: floor 关系、底面 z={min_z:+.4f}m 正常, "
+                      f"但距场景中心 {d:.2f}m > {max_dist:.2f}m → 标记 orphan 剔除",
+                      flush=True)
+        report["orphans"] = orphans
+
+        if orphans:
+            _removed = {o["name"] for o in orphans}
+            # 先把引用了被剔除实例的关系回退 floor。必须在重映射**之前**做:
+            # 删掉 pillow_1 后原 pillow_2 会前移成新 pillow_1, 旧名字会串号。
+            for _n, _r in list(refined_relations.items()):
+                if isinstance(_r, str) and _r.startswith("supported by "):
+                    _sup = _r[len("supported by "):].strip()
+                    if _sup in _removed:
+                        refined_relations[_n] = "supported by floor"
+                        report["repointed"].append(
+                            {"name": _n, "old": _r, "new": "supported by floor"})
+                        if verbose:
+                            print(f"      [orphan] {_n}: 支撑物 {_sup} 已被剔除 "
+                                  f"→ 关系回退 supported by floor", flush=True)
+            # 剔除 + 索引重映射 (同 resolve_orphan_wall_relations: 删同一类别
+            # 中间的元素会让后面的序号前移, 必须按旧下标分区后重建, 避免关系
+            # 名与实例错位)。
+            _by_cat = {}
+            for _n in _removed:
+                _c, _i = index[_n]
+                _by_cat.setdefault(_c, set()).add(_i)
+            _new_instances = {}
+            _old2new = {}
+            for _c, _lst in all_instances.items():
+                _keep = [j for j in range(len(_lst))
+                         if j not in _by_cat.get(_c, set())]
+                if not _keep:
+                    continue
+                _new_instances[_c] = [_lst[j] for j in _keep]
+                for _new_i, _old_i in enumerate(_keep):
+                    _old2new[(_c, _old_i)] = f"{_c}_{_new_i}"
+            _new_rel = {}
+            for _n, _r in refined_relations.items():
+                _hit = None
+                for (_c, _i), _new_name in _old2new.items():
+                    if _n == f"{_c}_{_i}":
+                        _hit = _new_name
+                        break
+                if _hit is not None:
+                    _new_rel[_hit] = _r
+                elif _n in _new_instances:   # 类别级关系 (键是类别名)
+                    _new_rel[_n] = _r
+                # 其余 (被剔除的实例名) 丢弃
+            all_instances = _new_instances
+            refined_relations = _new_rel
+            report["n_removed"] = len(orphans)
+            if verbose:
+                print(f"      [orphan] 共剔除 {len(orphans)} 个离群实例 "
+                      f"({', '.join(sorted(_removed))})", flush=True)
+
+    return all_instances, refined_relations, report

@@ -461,6 +461,58 @@ def propagate_in_video(predictor, session_id):
 
     return outputs_per_frame
 
+def _uniform_seed_frames(n_total, hints, count=8):
+    """挑 count 个播种帧: 全时段均匀网格 ∪ VLM 提示帧, 数量超限时按分位抽样。
+
+    为什么从"取前 4 个 VLM 关键帧"扩成 8 个均匀帧 (T4①):
+      旧逻辑 _seed_cands[:4] 有两个洞 ——
+      (a) VLM 关键帧在时间上常聚簇 (实测 weixin 的关键帧集中在中后段),
+          视频前段完全无播种, 物体前段跟丢了就没有任何帧能接力;
+      (b) 帧太少, 小物体只在少数帧上跟得住, 错过一个就整段缺失。
+      实测同一 weixin 视频的耳机盒: wx4 偶尔被救回, wx5/wx9/wxA/wxC 全部
+      为 0 —— 多播种 + box 兜底能"偶尔"救回但不保证。把播种帧均匀铺满
+      全时段 (首帧 0 + 末帧 N-1 + 中间等距), 任何时间段物体可见都有播种
+      帧兜住, 结果才稳定。
+
+    Args:
+        n_total: 视频总帧数 (取自 session 图像); None 时只能依赖 hints。
+        hints: VLM 检出该类别的关键帧号 (segment_and_track._seed_frames)。
+        count: 需要的播种帧数。
+    Returns:
+        升序帧号列表 (长度 ≤ count, 恒含首帧 0)。
+    """
+    if count <= 1:
+        return [0]
+    pool = {0}
+    if n_total and n_total > 1:
+        _step = (n_total - 1) / float(count - 1)
+        for _i in range(count):
+            pool.add(int(round(_i * _step)))
+    _lim = n_total if n_total else None
+    for _s in (hints or []):
+        try:
+            _s = int(_s)
+        except (TypeError, ValueError):
+            continue
+        if _s > 0 and (_lim is None or _s < _lim):
+            pool.add(_s)
+    pool = sorted(pool)
+    if len(pool) <= count:
+        return pool
+    # 数量超限 → 按分位抽样, 保首尾; VLM 提示帧贴近网格点时自然保留。
+    _idx = [int(round(_i * (len(pool) - 1) / float(count - 1)))
+            for _i in range(count)]
+    _out = []
+    for _i in _idx:
+        if not _out or pool[_i] != _out[-1]:
+            _out.append(pool[_i])
+    return _out
+
+
+# 二次兜底用的播种帧数 (比首轮的 8 更多; 只对"只产出 1~4 帧短轨迹"的框重试一次)
+_SECOND_PASS_SEEDS = 12
+
+
 def _box_fallback_segment(category, video_predictor, session_id, box_provider,
                           verbose=True, max_boxes=3, frame_hw=None, world_points=None):
     """文本提示切不出时的 box 兜底: 用外部给的框重新提示 SAM3 视频跟踪。
@@ -469,6 +521,14 @@ def _box_fallback_segment(category, video_predictor, session_id, box_provider,
       - 只在文本提示返回 0 结果时才调用, 已经能切出的类别完全不受影响
       - box_provider 抛异常 / 返回空 / 超时, 一律静默返回 [], 退化成原行为
       - 最多试 max_boxes 个框, 避免单类别拖慢整条管线
+
+    稳定性三件套 (T4):
+      ① 播种帧 8 个均匀铺满全时段 (_uniform_seed_frames), 不再只取前 4 个
+         VLM 关键帧;
+      ② 所有播种帧产出的轨迹全部合并而非择优, 交给下游 self_category_
+         deduplicate 去重;
+      ③ 首轮只产出 1~4 帧短轨迹的框, 用更多播种帧 (_SECOND_PASS_SEEDS=12)
+         二次重试一次, 新轨迹并入返回 (原短轨迹保留, 二次也失败时不变差)。
 
     Returns:
         与 segment_and_track 同结构; 兜底失败时为 []
@@ -486,12 +546,14 @@ def _box_fallback_segment(category, video_predictor, session_id, box_provider,
         return []
 
     # SAM3 视频模型的 bounding_boxes 用像素坐标 [x1, y1, x2, y2]
+    n_total = None
     try:
         frame0 = video_predictor._get_session(session_id)["state"].get("images")
         if frame0 is not None and len(frame0) > 0:
             import numpy as _np
             _a = _np.asarray(frame0[0])
             H, W = _a.shape[-3], _a.shape[-2]
+            n_total = len(frame0)     # 总帧数: 均匀播种与早停判据都要用
         else:
             H = W = None
     except Exception:
@@ -504,174 +566,234 @@ def _box_fallback_segment(category, video_predictor, session_id, box_provider,
     if not H or not W:
         H, W = 480, 854
 
-    best = []
-    for bi, b in enumerate(boxes01[:max_boxes]):
-        if not (isinstance(b, (list, tuple)) and len(b) == 4):
+    _hints = []
+    for _s in (getattr(segment_and_track, '_seed_frames', None) or []):
+        try:
+            _hints.append(int(_s))
+        except (TypeError, ValueError):
             continue
+
+    def _parse_box(b):
         x1, y1, x2, y2 = [float(v) for v in b]
         if H and W and max(x1, y1, x2, y2) <= 1.5:   # 归一化 → 像素
             x1, x2 = x1 * W, x2 * W
             y1, y2 = y1 * H, y2 * H
-        if x2 <= x1 or y2 <= y1:
-            continue
-        # 播种帧: 不只第 0 帧。
-        # 只播第 0 帧的问题: 物体在开头可能很小/被遮挡/模糊, SAM3 视频模型从
-        # 第 0 帧播种后一路跟丢。实测 weixin_v9: 7 个物体类别全部文本切不出,
-        # box 兜底取到了框但从 frame 0 播种仍然 0 目标。
-        # 改为在"VLM 确实看到过该物体"的关键帧上播种 (见 _seed_frames),
-        # 取覆盖帧数最多的那次。没有候选帧时才退回第 0 帧。
-        _seed_cands = [s for s in (getattr(segment_and_track, '_seed_frames',
-                                           None) or []) if s > 0]
-        _seed_cands = _seed_cands[:4] or [0]
-        _seg_outs = []            # 所有播种帧产出的 propagate 结果 (全部保留)
-        _best_ids = set()         # 仅用于日志统计
-        for _sf in _seed_cands:
-            try:
-                video_predictor.handle_request(
-                    request=dict(type="reset_session", session_id=session_id))
-                video_predictor.handle_request(request=dict(
-                    type="add_prompt", session_id=session_id, frame_index=_sf,
-                    bounding_boxes=[[x1, y1, x2, y2]], bounding_box_labels=[1]))
-                outputs = propagate_in_video(video_predictor, session_id)
-            except Exception as e:
-                if verbose:
-                    print(f"    [box兜底] {category} 框{bi} 帧{_sf}: SAM3 报错 "
-                          f"({type(e).__name__}: {str(e)[:50]}), 换下一帧", flush=True)
-                continue
-            if not outputs:
-                continue
-            _ids = set()
-            for fr in outputs.keys():
-                _ids.update(outputs[fr].get('out_obj_ids', []))
-            if not _ids:
-                continue
-            if verbose and len(_seed_cands) > 1:
-                print(f"    [box兜底] {category} 框{bi} 帧{_sf} 播种 → "
-                      f"{len(_ids)} 个目标", flush=True)
-            # ── 合并而非择优 ──
-            # 原来每个框只保留"覆盖帧最多"的那一次播种。问题是: 小物体在不同
-            # 播种帧上跟出的是**不同时间段**的片段 —— 实测 weixin 的 earbud case,
-            # 帧 31 播种只覆盖 29~38, 帧 35 播种只覆盖 30~38, 而第一次跑
-            # (wx4) 确实从帧 15 就开始跟。取"最多"的那一次就把其它段丢了,
-            # 于是同一物体时有时无 (wx4 有 mask, wx5 完全没有) —— 分割结果
-            # 不确定, 直接导致交互检测与首帧选择反复失败。
-            # 现在把所有播种帧产出的轨迹全部合并, 交给下游 self_category_
-            # deduplicate 去重 (它按点云重叠判定, 同一物体的不同时间段会
-            # 被正确合并, 不会产生重复实例)。
-            _seg_outs.append(outputs)
-            # 提前停止: 覆盖率已过半就不必再试其余播种帧。
-            # 每次播种都要跑一遍完整 propagate (80 帧约 14s), 4 个候选帧就是
-            # ~56s/框; Stage2 有十几个框时这是主要耗时来源。
-            _tot_frames = max(outputs.keys()) + 1 if outputs else 0
-            if _tot_frames and len(_ids) > 0.5 * _tot_frames:
-                break
+        return x1, y1, x2, y2
 
-        if not _seg_outs:
-            # ── 最后兜底: 把框当矩形 mask 直接用 ──
-            # 为什么需要: box provider (6.8) 给出的框是准的 (实测 weixin_v6:
-            # 框 [0.305,0.555,0.445,0.645] 精确落在黑色耳机盒上, 红框画在帧上
-            # 与物体完全重合), 但 SAM3 视频模型即使拿到精确框也可能产出 0 个
-            # 目标 —— 框只有 67x77 像素, 小于视频模型的跟踪门限。
-            # 此时框本身已经携带了"物体在哪、有多大"的全部信息, 直接栅格化成
-            # 矩形 mask 即可, 不需要再依赖 SAM3。代价是 mask 是矩形而非精确
-            # 轮廓, 但比"物体整个丢失"好得多 —— 下游 SAM3D 用的是同一帧的
-            # 图像, mesh 形状由 SAM3D 决定, 不受 mask 形状影响。
-            if verbose:
-                print(f"    [box兜底] {category} 框{bi}: SAM3 有框也切不出 → "
-                      f"直接用矩形 mask (位置/尺寸来自该框)", flush=True)
-            # mask 必须是 VGGT 帧尺寸 (world_points 的 H,W), 不是 session
-            # 图像尺寸 —— SAM3 原生 mask 就是 (688,384), 与 world_points 对齐;
-            # 用错尺寸会被下游按形状不匹配直接丢掉 (实测 wx7: 造了 (480,854)
-            # 的矩形 mask, 结果 earbud case 实例数仍是 0)。
-            if frame_hw:
-                _H, _W = int(frame_hw[0]), int(frame_hw[1])
-            elif H and W:
-                _H, _W = int(H), int(W)
-            else:
-                _H = _W = None
-            if not _H or not _W:
+    def _run_pass(seed_frames, box_indices):
+        """对 box_indices 里每个框在 seed_frames 上逐帧播种, 全部产出合并。
+
+        Returns:
+            {框下标: [实例轨迹, ...]} (实例轨迹 = [{frame_id, mask}, ...])
+        """
+        results = {}
+        for bi in box_indices:
+            x1, y1, x2, y2 = _parse_box(boxes01[bi])
+            if x2 <= x1 or y2 <= y1:
+                results[bi] = []
                 continue
-            # 框 -> VGGT 帧 mask 的坐标映射。难点: VGGT 帧与 session 图像不只
-            # 是缩放, 还差 90° 旋转 (实测 weixin: 关键帧 480x854 横, VGGT 的
-            # color/world_points 是 688x384 竖)。直接按比例缩放会把框映射到
-            # 完全错误的位置, mask 落在空白上, 反投影点云全无效, 实例被当空
-            # 实例丢掉。做法: 4 个朝向都生成矩形 mask, 用"反投影出的有效 VGGT
-            # 点数"自校验 —— 正确朝向落在真实物体上(有深度), 错误朝向落在
-            # 背景/画面外。可测量, 不依赖对旋转方向的假设。
-            _ow, _oh = float(W or 854), float(H or 480)
-            _n = (x1 / _ow, y1 / _oh, x2 / _ow, y2 / _oh)
-            _cands = {
-                'r0':   (_n[0] * _W, _n[1] * _H, _n[2] * _W, _n[3] * _H),
-                'r90':  ((1 - _n[3]) * _W, _n[0] * _H,
-                         (1 - _n[1]) * _W, _n[2] * _H),
-                'r180': ((1 - _n[2]) * _W, (1 - _n[3]) * _H,
-                         (1 - _n[0]) * _W, (1 - _n[1]) * _H),
-                'r270': (_n[1] * _W, (1 - _n[2]) * _H,
-                         _n[3] * _W, (1 - _n[0]) * _H),
-            }
-            _best_mask, _best_score = None, -1.0
-            _wp = np.asarray(world_points) if world_points is not None else None
-            for _a, _b, _c, _d in _cands.values():
-                _bx1, _by1 = max(0, int(min(_a, _c))), max(0, int(min(_b, _d)))
-                _bx2, _by2 = min(_W, int(max(_a, _c))), min(_H, int(max(_b, _d)))
-                if _bx2 <= _bx1 or _by2 <= _by1:
+            # 播种帧: 不只第 0 帧, 而是 _uniform_seed_frames 给出的均匀帧组
+            # (T4①, 首轮 8 个)。只播第 0 帧的问题: 物体在开头可能很小/被遮挡/
+            # 模糊, SAM3 视频模型从第 0 帧播种后一路跟丢。实测 weixin_v9:
+            # 7 个物体类别全部文本切不出, box 兜底取到了框但从 frame 0 播种
+            # 仍然 0 目标。
+            _seg_outs = []            # 所有播种帧产出的 propagate 结果 (全部保留)
+            for _sf in seed_frames:
+                try:
+                    video_predictor.handle_request(
+                        request=dict(type="reset_session", session_id=session_id))
+                    video_predictor.handle_request(request=dict(
+                        type="add_prompt", session_id=session_id, frame_index=_sf,
+                        bounding_boxes=[[x1, y1, x2, y2]], bounding_box_labels=[1]))
+                    outputs = propagate_in_video(video_predictor, session_id)
+                except Exception as e:
+                    if verbose:
+                        print(f"    [box兜底] {category} 框{bi} 帧{_sf}: SAM3 报错 "
+                              f"({type(e).__name__}: {str(e)[:50]}), 换下一帧", flush=True)
                     continue
-                _m = np.zeros((_H, _W), dtype=bool)
-                _m[_by1:_by2, _bx1:_bx2] = True
-                # 判据: 深度起伏 (z 的标准差)。正确朝向落在凸出桌面的物体上,
-                # 深度有明显起伏; 错误朝向落在平坦桌面上, 深度几乎不变。
-                # 实测 weixin: r0=0.0068 / r270=0.0038 / r180=0.0025 / r90=0.0011,
-                # 正确朝向 (r0) 的起伏是错误朝向的 6 倍, 可稳定区分。
-                # (不能用"有效点比例": VGGT 填满全帧, 四个朝向都是 1.000。)
-                if _wp is not None and _wp.ndim >= 3 and _wp.shape[0] > 0:
-                    _p = _wp[0][_m]
-                    _p = _p[np.isfinite(_p).all(axis=-1)]
-                    _score = float(_p[:, 2].std()) if len(_p) > 4 else -1.0
-                else:
-                    _score = float(_m.sum())
-                if _score > _best_score:
-                    _best_score, _best_mask = _score, _m
-            if _best_mask is None:
-                continue
-            # ── 矩形收缩 ──
-            # VLM 给的框是"外接框", 比物体本身大一圈; 直接栅格化会把框内的
-            # **背景点**也包进来。小物体坐在大平面上时后果严重: 实测 wx7 的
-            # earbud case 兜底矩形面积 3762px (真实物体约 1500px), 框内包含
-            # 桌面点 → 与 table 点云重叠率达 0.604, 超过官方跨类 OR@0.5 阈值
-            # → 耳机盒被并进桌子, 整个物体消失。
-            # 这里把矩形向中心收缩 25% (保留中心 75%), 排除框边缘的背景。
-            _ys, _xs = np.where(_best_mask)
-            if len(_ys) > 8:
-                _cy0, _cy1 = _ys.min(), _ys.max()
-                _cx0, _cx1 = _xs.min(), _xs.max()
-                _ky = int((_cy1 - _cy0) * 0.125)
-                _kx = int((_cx1 - _cx0) * 0.125)
-                _tight = np.zeros_like(_best_mask)
-                _tight[_cy0 + _ky:_cy1 - _ky + 1, _cx0 + _kx:_cx1 - _kx + 1] = True
-                if _tight.sum() > 8:
-                    _best_mask = _tight
-            _mask = _best_mask
-            # 注意结构: _split_instances 返回的是"实例列表", 每项是"帧字典列表"。
-            # 这里必须同样返回 [[{frame_id,mask}, ...]] (一个实例, 多帧),
-            # 不能返回扁平的 [{frame_id,mask}, ...] —— 那样下游 self_category_
-            # deduplicate 会把每个帧字典当成一个实例迭代, 直接 TypeError
-            # (实测 wx9: 矩形 mask 造对了但 earbud case 实例数仍是 0)。
-            res = [[{'frame_id': int(_sf), 'mask': _mask.copy()}
-                    for _sf in _seed_cands]]
-            if res:
-                best.extend(res)
-            continue
+                if not outputs:
+                    continue
+                _ids = set()
+                for fr in outputs.keys():
+                    _ids.update(outputs[fr].get('out_obj_ids', []))
+                if not _ids:
+                    continue
+                if verbose and len(seed_frames) > 1:
+                    print(f"    [box兜底] {category} 框{bi} 帧{_sf} 播种 → "
+                          f"{len(_ids)} 个目标", flush=True)
+                # ── 合并而非择优 (T4②) ──
+                # 小物体在不同播种帧上跟出的是**不同时间段**的片段 —— 实测
+                # weixin 的 earbud case, 帧 31 播种只覆盖 29~38, 帧 35 播种
+                # 只覆盖 30~38, 而第一次跑 (wx4) 确实从帧 15 就开始跟。取
+                # "最多"的那一次就把其它段丢了, 于是同一物体时有时无 (wx4 有
+                # mask, wx5 完全没有) —— 分割结果不确定, 直接导致交互检测与
+                # 首帧选择反复失败。现在把所有播种帧产出的轨迹全部合并, 交给
+                # 下游 self_category_deduplicate 去重 (它按点云重叠判定, 同一
+                # 物体的不同时间段会被正确合并, 不会产生重复实例)。
+                _seg_outs.append(outputs)
+                # 提前停止: 首个播种帧已覆盖**全时段**八成以上, 就不必再试其余
+                # 播种帧。每次播种都要跑一遍完整 propagate (80 帧约 14s), 8~12
+                # 个播种帧不设早停时单框要 2~3 分钟, Stage2 有十几个框时没法
+                # 接受。
+                # 判据必须是"有 mask 的帧数 / 视频总帧数", 旧实现的两个量都错:
+                #   · len(_ids) 是 obj_id 个数, 单框提示恒为 1, 永远小于
+                #     0.5*总帧数 → 早停从未生效过 (每个框都白白跑满全部播种帧);
+                #   · max(outputs.keys())+1 当总帧数, 跟踪在第 3 帧就死时它得
+                #     到 3, 覆盖率虚高成 100%。
+                # 阈值取 0.8 而非 0.5: 覆盖六成就停会把"中段断掉又重现"的物体
+                # 的后段丢掉 —— 那正是 T4 要救的场景; 只有确实跟得好 (≥80%)
+                # 才值得省下其余播种帧。n_total 拿不到时宁可跑满也不早停。
+                if n_total and outputs:
+                    _cov = sum(1 for fr in outputs.keys()
+                               if len(outputs[fr].get('out_obj_ids', [])) > 0)
+                    if _cov > 0.8 * n_total:
+                        break
 
-        if verbose:
-            print(f"    [box兜底] {category} 框{bi}: 文本切不出 → box 切出 "
-                  f"{len(_seg_outs)} 段轨迹, 合并  ✅ (播种帧 {_seed_cands})",
-                  flush=True)
-        # 复用主流程的实例切分逻辑: 多段播种结果各切各的, 合并后由去重收口
-        res = []
-        for _o in _seg_outs:
-            res.extend(_split_instances(_o))
-        if res:
-            best.extend(res)
+            if not _seg_outs:
+                # ── 最后兜底: 把框当矩形 mask 直接用 ──
+                # 为什么需要: box provider (6.8) 给出的框是准的 (实测 weixin_v6:
+                # 框 [0.305,0.555,0.445,0.645] 精确落在黑色耳机盒上, 红框画在帧上
+                # 与物体完全重合), 但 SAM3 视频模型即使拿到精确框也可能产出 0 个
+                # 目标 —— 框只有 67x77 像素, 小于视频模型的跟踪门限。
+                # 此时框本身已经携带了"物体在哪、有多大"的全部信息, 直接栅格化成
+                # 矩形 mask 即可, 不需要再依赖 SAM3。代价是 mask 是矩形而非精确
+                # 轮廓, 但比"物体整个丢失"好得多 —— 下游 SAM3D 用的是同一帧的
+                # 图像, mesh 形状由 SAM3D 决定, 不受 mask 形状影响。
+                if verbose:
+                    print(f"    [box兜底] {category} 框{bi}: SAM3 有框也切不出 → "
+                          f"直接用矩形 mask (位置/尺寸来自该框)", flush=True)
+                # mask 必须是 VGGT 帧尺寸 (world_points 的 H,W), 不是 session
+                # 图像尺寸 —— SAM3 原生 mask 就是 (688,384), 与 world_points 对齐;
+                # 用错尺寸会被下游按形状不匹配直接丢掉 (实测 wx7: 造了 (480,854)
+                # 的矩形 mask, 结果 earbud case 实例数仍是 0)。
+                if frame_hw:
+                    _H, _W = int(frame_hw[0]), int(frame_hw[1])
+                elif H and W:
+                    _H, _W = int(H), int(W)
+                else:
+                    _H = _W = None
+                if not _H or not _W:
+                    results[bi] = []
+                    continue
+                # 框 -> VGGT 帧 mask 的坐标映射。难点: VGGT 帧与 session 图像不只
+                # 是缩放, 还差 90° 旋转 (实测 weixin: 关键帧 480x854 横, VGGT 的
+                # color/world_points 是 688x384 竖)。直接按比例缩放会把框映射到
+                # 完全错误的位置, mask 落在空白上, 反投影点云全无效, 实例被当空
+                # 实例丢掉。做法: 4 个朝向都生成矩形 mask, 用"反投影出的有效 VGGT
+                # 点数"自校验 —— 正确朝向落在真实物体上(有深度), 错误朝向落在
+                # 背景/画面外。可测量, 不依赖对旋转方向的假设。
+                _ow, _oh = float(W or 854), float(H or 480)
+                _n = (x1 / _ow, y1 / _oh, x2 / _ow, y2 / _oh)
+                _cands = {
+                    'r0':   (_n[0] * _W, _n[1] * _H, _n[2] * _W, _n[3] * _H),
+                    'r90':  ((1 - _n[3]) * _W, _n[0] * _H,
+                             (1 - _n[1]) * _W, _n[2] * _H),
+                    'r180': ((1 - _n[2]) * _W, (1 - _n[3]) * _H,
+                             (1 - _n[0]) * _W, (1 - _n[1]) * _H),
+                    'r270': (_n[1] * _W, (1 - _n[2]) * _H,
+                             _n[3] * _W, (1 - _n[0]) * _H),
+                }
+                _best_mask, _best_score = None, -1.0
+                _wp = np.asarray(world_points) if world_points is not None else None
+                for _a, _b, _c, _d in _cands.values():
+                    _bx1, _by1 = max(0, int(min(_a, _c))), max(0, int(min(_b, _d)))
+                    _bx2, _by2 = min(_W, int(max(_a, _c))), min(_H, int(max(_b, _d)))
+                    if _bx2 <= _bx1 or _by2 <= _by1:
+                        continue
+                    _m = np.zeros((_H, _W), dtype=bool)
+                    _m[_by1:_by2, _bx1:_bx2] = True
+                    # 判据: 深度起伏 (z 的标准差)。正确朝向落在凸出桌面的物体上,
+                    # 深度有明显起伏; 错误朝向落在平坦桌面上, 深度几乎不变。
+                    # 实测 weixin: r0=0.0068 / r270=0.0038 / r180=0.0025 / r90=0.0011,
+                    # 正确朝向 (r0) 的起伏是错误朝向的 6 倍, 可稳定区分。
+                    # (不能用"有效点比例": VGGT 填满全帧, 四个朝向都是 1.000。)
+                    if _wp is not None and _wp.ndim >= 3 and _wp.shape[0] > 0:
+                        _p = _wp[0][_m]
+                        _p = _p[np.isfinite(_p).all(axis=-1)]
+                        _score = float(_p[:, 2].std()) if len(_p) > 4 else -1.0
+                    else:
+                        _score = float(_m.sum())
+                    if _score > _best_score:
+                        _best_score, _best_mask = _score, _m
+                if _best_mask is None:
+                    results[bi] = []
+                    continue
+                # ── 矩形收缩 ──
+                # VLM 给的框是"外接框", 比物体本身大一圈; 直接栅格化会把框内的
+                # **背景点**也包进来。小物体坐在大平面上时后果严重: 实测 wx7 的
+                # earbud case 兜底矩形面积 3762px (真实物体约 1500px), 框内包含
+                # 桌面点 → 与 table 点云重叠率达 0.604, 超过官方跨类 OR@0.5 阈值
+                # → 耳机盒被并进桌子, 整个物体消失。
+                # 这里把矩形向中心收缩 25% (保留中心 75%), 排除框边缘的背景。
+                _ys, _xs = np.where(_best_mask)
+                if len(_ys) > 8:
+                    _cy0, _cy1 = _ys.min(), _ys.max()
+                    _cx0, _cx1 = _xs.min(), _xs.max()
+                    _ky = int((_cy1 - _cy0) * 0.125)
+                    _kx = int((_cx1 - _cx0) * 0.125)
+                    _tight = np.zeros_like(_best_mask)
+                    _tight[_cy0 + _ky:_cy1 - _ky + 1, _cx0 + _kx:_cx1 - _kx + 1] = True
+                    if _tight.sum() > 8:
+                        _best_mask = _tight
+                _mask = _best_mask
+                # 注意结构: _split_instances 返回的是"实例列表", 每项是"帧字典列表"。
+                # 这里必须同样返回 [[{frame_id,mask}, ...]] (一个实例, 多帧),
+                # 不能返回扁平的 [{frame_id,mask}, ...] —— 那样下游 self_category_
+                # deduplicate 会把每个帧字典当成一个实例迭代, 直接 TypeError
+                # (实测 wx9: 矩形 mask 造对了但 earbud case 实例数仍是 0)。
+                res = [[{'frame_id': int(_sf), 'mask': _mask.copy()}
+                        for _sf in seed_frames]]
+                if res:
+                    results[bi] = res
+                else:
+                    results[bi] = []
+                continue
+
+            if verbose:
+                print(f"    [box兜底] {category} 框{bi}: 文本切不出 → box 切出 "
+                      f"{len(_seg_outs)} 段轨迹, 合并  ✅ (播种帧 {seed_frames})",
+                      flush=True)
+            # 复用主流程的实例切分逻辑: 多段播种结果各切各的, 合并后由去重收口
+            res = []
+            for _o in _seg_outs:
+                res.extend(_split_instances(_o))
+            results[bi] = res
+        return results
+
+    _n_boxes = min(len(boxes01), max_boxes)
+    box_indices = [bi for bi in range(_n_boxes)
+                   if isinstance(boxes01[bi], (list, tuple)) and len(boxes01[bi]) == 4]
+
+    # ── 首轮: 8 个播种帧均匀铺满全时段 (T4①) ──
+    _seeds_1 = _uniform_seed_frames(n_total, _hints, count=8)
+    first = _run_pass(_seeds_1, box_indices)
+
+    best = []
+    for bi in box_indices:
+        best.extend(first.get(bi, []))
+
+    # ── 二次兜底 (T4③): 只产出 1~4 帧短轨迹的框, 换更多播种帧重试一次 ──
+    # 短轨迹说明 SAM3 在该框上刚播下就跟丢了 (小物体低于跟踪门限的典型表现),
+    # 8 个帧全失败可能只是运气差; 用 12 个更密的播种帧再试一次, 新轨迹直接
+    # 并入 (保持"合并而非择优"语义, 下游去重收口), 原短轨迹保留 —— 二次也
+    # 失败时至少不比现在差。整个函数最多重试这一次, 不递归。
+    _short_boxes = sorted(bi for bi in box_indices
+                          if any(1 <= len(t) <= 4 for t in first.get(bi, [])))
+    if _short_boxes:
+        _seeds_2 = _uniform_seed_frames(n_total, _hints, count=_SECOND_PASS_SEEDS)
+        if len(_seeds_2) > len(_seeds_1):
+            if verbose:
+                print(f"    [box兜底] {category}: {len(_short_boxes)} 个框只产出 "
+                      f"1~4 帧短轨迹 → 换 {len(_seeds_2)} 个播种帧二次重试", flush=True)
+            second = _run_pass(_seeds_2, _short_boxes)
+            for bi in _short_boxes:
+                _extra = second.get(bi, [])
+                if _extra:
+                    first[bi] = first.get(bi, []) + _extra
+                    best.extend(_extra)
+        elif verbose:
+            print(f"    [box兜底] {category}: 有 1~4 帧短轨迹但拿不到更多播种帧, "
+                  f"跳过二次重试", flush=True)
     return best
 
 
