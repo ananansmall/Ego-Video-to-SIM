@@ -154,6 +154,38 @@ def eval_scene(D, verbose=True):
             out["M6_mean_frames"] = round(
                 float(np.mean([v["n_frames"] for v in cov.values()])), 1)
 
+    # ── M7 首帧正确率: 有 pick 的动态实例中, 初始帧 < pick 帧 的占比 ──
+    tj_p = os.path.join(D, "dynamic_pointclouds", "trajectory_info.json")
+    pp_p = os.path.join(D, "pick_place_frames.json")
+    if os.path.isfile(tj_p) and os.path.isfile(pp_p):
+        try:
+            tj = json.load(open(tj_p))
+            pp = json.load(open(pp_p))
+            ratio = float(pp.get("frame_ratio") or 1.0) or 1.0
+            n_have, n_ok = 0, 0
+            per = []
+            for key, tr in tj.items():
+                evs = [e for e in pp.get("interactions", [])
+                       if e.get("instance_name") == key]
+                if not evs:
+                    continue
+                n_have += 1
+                first_vis = min(tr["visible_frames"]) if tr.get("visible_frames") else None
+                anchor = None
+                # 与 mainv3 初始帧决策一致: 首次可见帧即锚点 (三级策略的兜底层)
+                anchor = first_vis
+                first_pick = min(e["pick_frame"] for e in evs) / ratio
+                ok = anchor is not None and anchor < first_pick - 0.5
+                n_ok += 1 if ok else 0
+                per.append({"instance": key, "anchor": anchor,
+                            "first_pick_slot": round(first_pick, 1), "pre_pick": ok})
+            out["M7_first_frame"] = {"n_with_pick": n_have, "n_ok": n_ok,
+                                     "rate": round(n_ok / max(n_have, 1), 2),
+                                     "per_instance": per,
+                                     "pass": bool(n_have == 0 or n_ok == n_have)}
+        except Exception as e:
+            out["M7_err"] = f"{type(e).__name__}: {e}"
+
     # world_points 只在 _pre_dedup_masks.pkl 里, M3/M2 分层诊断共用, 只载入一次
     wp = None
     if pre_am:
@@ -413,6 +445,9 @@ def main():
         print(f"   M4 摆放: {r.get('M4_by_status','N/A')} ok率={r.get('M4_ok_rate','N/A')}")
         print(f"   M5 穿模: {r.get('M5_n_penetration','N/A')} {r.get('M5_pairs','')}")
         print(f"   M6 采样帧: 最少 {r.get('M6_min_frames','N/A')} 帧, 平均 {r.get('M6_mean_frames','N/A')} 帧")
+    m7 = r.get("M7_first_frame")
+    if m7:
+        print(f"   M7 首帧正确率: {m7['n_ok']}/{m7['n_with_pick']} (rate {m7['rate']})")
 
     if args.json:
         json.dump(rows, open(args.json, "w"), ensure_ascii=False, indent=2, default=str)
