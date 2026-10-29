@@ -76,6 +76,10 @@ def _synth_legs(info):
     return {"original_mesh": merged, "T": np.eye(4)}, top_old, new_top
 
 
+def _up_z(info):
+    return float((np.asarray(info["T"])[:3, :3] @ np.array([0, 1, 0.0]))[2])
+
+
 def _scale_prior_fallback(info, category, report):
     """尺度先验回退: 小物体尺度偏离先验 >2.5x 或 <0.4x 时缩放到先验。
 
