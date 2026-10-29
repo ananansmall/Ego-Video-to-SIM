@@ -2758,7 +2758,13 @@ def generate_scene_json(category_registry, output_path):
 # VLM 模型加载
 # ============================================================
 
+_VLM_CACHE = {}
+
 def load_vlm_model(checkpoint_path):
+    ck = os.path.abspath(checkpoint_path or "")
+    if ck in _VLM_CACHE:
+        print(f"   ♻️ VLM 复用进程内缓存: {ck}", flush=True)
+        return _VLM_CACHE[ck]
     """
     加载VLM模型和处理器
 
@@ -2766,6 +2772,9 @@ def load_vlm_model(checkpoint_path):
       - Qwen3.5/Qwen3.6-27B-FP8 (AutoModelForImageTextToText)
       - Qwen2.5-VL/Qwen3-VL 系列
       - 通用 AutoModelForCausalLM 兜底
+
+    进程内单例: 同一 checkpoint 重复调用直接返回缓存 (实测一次加载 3~6 分钟,
+    管线里 Stage1/2.5/3.5/6 各自调用 —— 不缓存则每阶段多烧一次加载)。
 
     FP8 量化模型由 transformers >= 4.45 自动识别 (config.json 含 quantization_config)
 
@@ -2832,6 +2841,7 @@ def load_vlm_model(checkpoint_path):
     model.eval()
 
     print(f"✅ 模型加载完成! 设备: {model.device}", flush=True)
+    _VLM_CACHE[ck] = (model, processor)
     return model, processor
 
 
