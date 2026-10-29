@@ -1317,7 +1317,10 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                             # 如果还没创建 T，先创建；如果有平移，复用已创建的 T
                             if not needs_adjust:
                                 T = instance_info["T"].copy()
+                            # 绕物体当前世界质心旋转 (门禁替换的 T=identity 世界网格
+                            # 若直接左乘 R_pca 会绕世界原点转, 物体飞到场景另一侧)
                             T[:3, :3] = R_pca @ T[:3, :3]
+                            T[:3, 3] = R_pca @ T[:3, 3] + (initial_centroid - R_pca @ initial_centroid)
                             needs_adjust = True
                             rot_applied = True
 
