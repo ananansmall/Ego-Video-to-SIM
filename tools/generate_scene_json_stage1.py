@@ -563,6 +563,65 @@ def maximum_coverage_sampling(voxel_sets, K):
     return sorted(selected)
 
 
+def supplement_rare_voxel_frames(voxel_sets, selected, extra_rare_frames=4):
+    """
+    T1: 关键帧稀有体素补帧
+
+    问题: 贪心最大覆盖是"广角优先" —— 小物体 (如 10cm 耳机盒) 占的体素少,
+    对覆盖率的增益永远排不进 top-K, 因此从不进入 VLM 视野。
+
+    改法: 在贪心选完 K 帧之后,
+      ① 统计每个体素被多少帧看到: rarity(v) = 1 / count(v)
+      ② 每个未选帧的得分 = Σ rarity(v), v 取该帧的"新增体素"
+         (即未被已选帧覆盖的体素 —— 广角帧已覆盖的部分不得分)
+      ③ 按得分补 extra_rare_frames 帧 (排除已选帧), 追加到返回列表。
+        得分为 0 的帧不补 (它不含任何已选帧没见过的体素, 补了浪费 VLM 调用)。
+
+    参数:
+        voxel_sets: 每帧的体素集合 (compute_voxel_sets 的输出)
+        selected: 贪心已选中的帧索引列表
+        extra_rare_frames: 最多补几帧
+    返回:
+        已选帧 + 稀有补帧 的并集 (sorted)
+    """
+    selected_set = set(int(f) for f in selected)
+    n_frames = len(voxel_sets)
+
+    if extra_rare_frames <= 0 or n_frames <= len(selected_set):
+        return sorted(selected_set)
+
+    candidates = [f for f in range(n_frames) if f not in selected_set]
+    if not candidates:
+        return sorted(selected_set)
+
+    # ① 每个体素被多少帧看到
+    voxel_count = Counter()
+    for vs in voxel_sets:
+        voxel_count.update(vs)
+
+    # 已选帧覆盖的体素
+    covered = set()
+    for f in selected_set:
+        covered.update(voxel_sets[f])
+
+    # ② 每个未选帧的得分 = 该帧新增体素的稀有度之和
+    frame_scores = {}
+    for f in candidates:
+        new_voxels = voxel_sets[f] - covered
+        frame_scores[f] = sum(1.0 / voxel_count[v] for v in new_voxels)
+
+    # ③ 按得分取 top extra_rare_frames (同分按帧号升序, 保证确定性)
+    ranked = sorted(candidates, key=lambda f: (-frame_scores[f], f))
+    extras = [f for f in ranked[:extra_rare_frames] if frame_scores[f] > 0.0]
+
+    if extras:
+        _detail = ", ".join(f"#{f}={frame_scores[f]:.2f}" for f in extras)
+        print(f"   🎯 稀有体素补帧: 追加 {len(extras)} 帧 [{_detail}] "
+              f"(rarity=1/该体素被看的帧数)", flush=True)
+
+    return sorted(selected_set | set(extras))
+
+
 def extract_frames_by_vggt_sampling(extrinsics, world_points, world_points_conf, max_frames=10):
     """
     基于VGGT点云的3D空间覆盖采样，选择关键帧
@@ -629,6 +688,13 @@ def extract_frames_by_vggt_sampling(extrinsics, world_points, world_points_conf,
 
     print(f"   🎯 运行贪心最大覆盖算法 (目标{max_frames}帧)...", flush=True)
     keyframe_indices = maximum_coverage_sampling(voxel_sets, max_frames)
+
+    # T1: 稀有体素补帧 —— 贪心覆盖只保证"面积", 保证不了"稀有内容"。
+    # 小物体占的体素少、广角帧永远优先, 在这里按体素稀有度补 extra 帧,
+    # 让小物体至少有机会进入 VLM 视野。
+    keyframe_indices = supplement_rare_voxel_frames(
+        voxel_sets, keyframe_indices, extra_rare_frames=4
+    )
 
     return sorted(keyframe_indices)
 
@@ -1441,6 +1507,141 @@ def build_object_instances(all_detections, vggt_results, total_video_frames=0,
 CLIP_MERGE_THRESHOLD = 0.90
 
 
+def _vote_canonical_name(candidate_names, exclude=FILTER_CATEGORIES):
+    """
+    T2: 频次投票选规范名
+
+    同一物体在不同帧被 VLM 叫不同名字 (实测: 一个黑方块 10 帧被叫
+    button/pebble/cube/case/cabinet/charger/earbud case/mouse...),
+    不能再靠"第一个出现的名字"当规范名。组内每个候选名按出现次数计票,
+    top-1 作为规范名; 同义词表 merge_synonyms 先归一化再计票 (可选叠加:
+    "mug"/"cup" 这类先合成一票仓, 避免票被同义词分走)。
+
+    泛指词 (FILTER_CATEGORIES: "object"/"thing"/...) 不参与计票 —— 否则
+    泛指名票数一高就会当选, 物体在 Step 7 被当场景结构过滤掉, 真名反而丢失。
+    若组内全是泛指词, 退回不排除的计票 (下游反正会过滤)。
+
+    平票规则: Counter.most_common 对同票数保持首次出现顺序 (Python 3.7+
+    稳定排序), 即"最早被叫到的名字"优先 —— 确定性, 且首帧通常是看得最清的帧。
+
+    参数:
+        candidate_names: 组内候选名列表 (可重复, 每次出现算一票)
+        exclude: 不参与计票的名称集合 (merge_synonyms 标准形比较)
+    返回:
+        规范名 (merge_synonyms 标准形); 空列表返回 None
+    """
+    std_names = []
+    for n in candidate_names:
+        if n is None:
+            continue
+        n = str(n).lower().strip()
+        if not n:
+            continue
+        std_names.append(merge_synonyms(n))
+    if not std_names:
+        return None
+    counts = Counter(std_names)
+    if exclude:
+        meaningful = Counter({k: v for k, v in counts.items() if k not in exclude})
+        if meaningful:
+            counts = meaningful
+    return counts.most_common(1)[0][0]
+
+
+def _merge_objects_by_position_with_voting(unique_objects, centroid_dist_thre):
+    """
+    T2: 同 3D 位置组内多候选名 → 频次投票合并成一物一类
+
+    deduplicate_objects 先按名字分组, 同一物体被叫不同名字时会留在不同
+    组里 (一物多类)。这里用 centroid_dist_thre (原先收了参数但从未使用)
+    把 3D 质心贴近的不同名物体聚成一组, 组内做跨帧命名投票:
+      - 每个成员的候选名按其 instance_count (背后支撑的帧数) 加权计票
+      - top-1 作为整组规范名
+      - instance_count 累加, 质心取组内中位数
+
+    聚类用"种子吸收"而非单链: 每组以第一个成员的质心为种子, 后续成员
+    只与种子比较 —— 避免 A-B-C 链式把整个房间聚成一组。
+
+    参数:
+        unique_objects: deduplicate_objects 第一轮 (按名分组) 的输出
+        centroid_dist_thre: 3D质心距离阈值（米）
+    返回:
+        合并后的物体列表
+    """
+    if not unique_objects:
+        return unique_objects
+
+    n = len(unique_objects)
+    used = [False] * n
+    groups = []
+
+    for i in range(n):
+        if used[i]:
+            continue
+        c_i = unique_objects[i].get("centroid")
+        group = [i]
+        if c_i is not None:
+            used[i] = True
+            c_i = np.asarray(c_i, dtype=float)
+            for j in range(i + 1, n):
+                if used[j]:
+                    continue
+                c_j = unique_objects[j].get("centroid")
+                if c_j is None:
+                    continue
+                if np.linalg.norm(c_i - np.asarray(c_j, dtype=float)) <= centroid_dist_thre:
+                    group.append(j)
+                    used[j] = True
+        groups.append(group)
+
+    if len(groups) == n:
+        return unique_objects  # 无任何位置重叠, 原样返回
+
+    merged = []
+    for group in groups:
+        if len(group) == 1:
+            merged.append(unique_objects[group[0]])
+            continue
+
+        members = [unique_objects[i] for i in group]
+        # 跨帧命名投票: 每个候选名按其背后的实例(帧)数计票
+        candidate_names = []
+        for m in members:
+            candidate_names.extend(
+                [m["name"]] * max(int(m.get("instance_count", 1)), 1)
+            )
+        canonical = _vote_canonical_name(candidate_names)
+        if canonical is None:
+            canonical = members[0]["name"]
+
+        # 以票仓最大的成员为载体, 换上投票出的规范名
+        base = max(members, key=lambda m: max(int(m.get("instance_count", 1)), 1)).copy()
+        base["name"] = canonical
+        base["instance_count"] = sum(
+            max(int(m.get("instance_count", 1)), 1) for m in members
+        )
+
+        centroids = [
+            np.asarray(m["centroid"], dtype=float)
+            for m in members if m.get("centroid") is not None
+        ]
+        if centroids:
+            base["centroid"] = np.median(centroids, axis=0)
+
+        merged.append(base)
+
+        _weighted = Counter()
+        for m in members:
+            _weighted[merge_synonyms(str(m["name"]).lower().strip())] += max(
+                int(m.get("instance_count", 1)), 1)
+        _vote_str = ", ".join(f"'{k}'x{v}" for k, v in _weighted.most_common())
+        print(f"   🗳️  3D位置组 (≤{centroid_dist_thre}m) 命名投票: {_vote_str} "
+              f"→ '{canonical}' ({len(members)}类并1类, "
+              f"{base['instance_count']}个实例)", flush=True)
+
+    return merged
+
+
 def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRESHOLD, clip_matcher=None):
     """
     基于CLIP语义匹配 + SYNONYM_MAP的联合去重
@@ -1449,10 +1650,13 @@ def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRES
       1. SYNONYM_MAP精确匹配: "mug"→"cup", "sofa"→"couch" 等
       2. CLIP语义相似度: 文本相似度 >= 0.85 视为同义 (如 "trash can" ≈ "garbage can")
       3. 名称标准化: 去复数、小写等
+      4. 3D位置聚合 + 跨帧命名投票 (T2): 同一物体在不同帧被叫不同名字时,
+         按名分组会把它们留在不同组 (一物多类)。最后用 centroid_dist_thre
+         把 3D 质心贴近的物体聚成一组, 组内按出现次数投票选规范名。
 
     参数:
         object_instances: build_object_instances的输出
-        centroid_dist_thre: 3D质心距离阈值（米），仅用于非同名物体
+        centroid_dist_thre: 3D质心距离阈值（米），用于跨名物体的3D位置聚合
         clip_matcher: CLIPSemanticMatcher实例（可选，无则仅用SYNONYM_MAP）
     返回:
         去重后的唯一物体列表
@@ -1523,6 +1727,16 @@ def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRES
         if len(instances) > 1:
             frame_indices = [inst['frame_idx'] for inst in instances]
             print(f"   🔄 合并: '{std_name}' {len(instances)}个实例 → 1个 (帧: {frame_indices})", flush=True)
+
+    # T2: 跨帧命名投票 —— 同 3D 位置组内多候选名, 频次投票选规范名,
+    # 消除"一物多类" (实测一个黑方块被 10 帧叫出 10 个名字 → 10 个类别)。
+    n_before_position_merge = len(unique_objects)
+    unique_objects = _merge_objects_by_position_with_voting(
+        unique_objects, centroid_dist_thre
+    )
+    if len(unique_objects) < n_before_position_merge:
+        print(f"   🗳️  3D位置聚合+命名投票: {n_before_position_merge} 类 → "
+              f"{len(unique_objects)} 类 (合并同位置异名物体)", flush=True)
 
     print(f"\n📊 去重后剩余 {len(unique_objects)} 个唯一物体类别\n", flush=True)
     return unique_objects
