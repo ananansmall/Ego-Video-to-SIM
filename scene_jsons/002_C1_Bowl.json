@@ -1,8 +1,8 @@
 {
   "bed": "supported by floor",
-  "bowl": "supported by other objects",
-  "pillow": "supported by other objects",
-  "blanket": "supported by other objects",
-  "hat": "supported by other objects",
-  "toy": "supported by other objects"
+  "pillow": "supported by bed",
+  "blanket": "supported by bed",
+  "hat": "supported by bed",
+  "toy": "supported by other objects",
+  "bowl": "supported by other objects"
 }
