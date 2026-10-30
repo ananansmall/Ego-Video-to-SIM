@@ -125,12 +125,22 @@ def eval_scene(D, verbose=True):
         out["M4_err"] = "no placement_audit.json"
 
     # ── M5 穿模 ──
+    # 必须复用 dump_placement_audit 的判据 (AABB 候选 + mesh contains 验证)。
+    # 本脚本原来自己算 AABB 交叠, 会把"枕头压在被子上"这类正常堆叠误报成
+    # 穿模 —— 实测 002 报 7 对、151 报 13 对、wxD 报 3 对, 而 audit 的
+    # mesh 级结论全是 0。两套判据不一致会让指标失去可比性。
     try:
-        n, pairs = _penetration_pairs(inst)
-        out["M5_n_penetration"] = n
-        out["M5_pairs"] = pairs[:8]
+        from src.sp_refinement import dump_placement_audit
+        _a = dump_placement_audit(inst, rel, output_dir=None, verbose=False)
+        out["M5_n_penetration"] = int(_a.get("n_penetration_pairs", 0))
+        out["M5_pairs"] = [f"{p['a']}/{p['b']}(内插{100*p.get('inside_frac',0):.0f}%)"
+                           for p in (_a.get("penetration_pairs") or [])][:8]
+        # 一致性守卫: 若 audit 与本地 AABB 口径差异过大, 明确标出来
+        _n_abb, _ = _penetration_pairs(inst)
+        if _n_abb != out["M5_n_penetration"]:
+            out["M5_aabb_candidates"] = _n_abb
     except Exception as e:
-        out["M5_err"] = f"{type(e).__name__}"
+        out["M5_err"] = f"{type(e).__name__}: {str(e)[:60]}"
 
     # ── M6 采样帧覆盖率（需要 _pre_dedup_masks.pkl）──
     pre = os.path.join(D, "_pre_dedup_masks.pkl")

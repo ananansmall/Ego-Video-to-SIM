@@ -1560,7 +1560,20 @@ def fix_orphan_instances(all_instances, refined_relations, verbose=True,
     if len(centers) >= 4:
         _cen = _np.median(_np.asarray(list(centers.values()), dtype=float), axis=0)
         report["scene_center"] = [round(float(_cen[0]), 4), round(float(_cen[1]), 4)]
-        orphans = []
+        # ── 尺度相对阈值 + 大物体保护 (P0-a) ──
+        # 原实现用绝对 max_dist=1.0m 判"离群幽灵"。但 VGGT 是相对尺度, 而大型
+        # 家具天然离"实例中心中位数"很远 —— 实测 002-namedrel: 真实的 bed_0
+        # (2.7m 宽的床) 距中位数中心仅 1.17m, 就超过 1.0m 被判幽灵**删掉了**,
+        # 直接导致 M4 ok 率 1.0 → 0.14。
+        # 与 Stage4 ICP / MANIPULABLE_MAX_EXTENT / 交互位移 0.08m 是同一类错:
+        # 绝对阈值用在相对坐标系里。
+        #
+        # 修正为"统计离群"判据 (尺度无关), 再叠一条大物体硬保护:
+        #   ① 距离阈值 = max(绝对下限, 中位距离 + 3×1.4826×MAD)
+        #      —— 只有真正孤零零甩在外面的极值才超线; 中位数/MAD 对单个极值
+        #         本身不敏感 (床 1.17m 在众多数米内的正常分布中不算离群)。
+        #   ② 物体自身水平跨度 > 全场最大实例跨度的 30% → 是家具, 硬保护不删。
+        _cands = []
         for name in sorted(centers):
             cat, idx = index[name]
             rel = _rel_of(name, cat)
@@ -1569,17 +1582,45 @@ def fix_orphan_instances(all_instances, refined_relations, verbose=True,
             if rel[len("supported by "):].strip().lower() not in ("floor", "ground"):
                 continue
             b = bounds[name]
-            min_z = float(b[0, 2])
-            if abs(min_z) > z_ok_tol:
+            if abs(float(b[0, 2])) > z_ok_tol:
                 continue        # 底面 z 不正常 → 坐标系问题, 不删 (交给落地/audit)
-            d = float(_np.hypot(centers[name][0] - _cen[0],
-                                centers[name][1] - _cen[1]))
-            if d <= max_dist:
+            _cands.append((name, cat, b,
+                           float(_np.hypot(centers[name][0] - _cen[0],
+                                           centers[name][1] - _cen[1]))))
+        _all_spans = [max(float(b[1][0] - b[0][0]), float(b[1][1] - b[0][1]))
+                      for b in bounds.values()]
+        _max_span = max(_all_spans) if _all_spans else 0.0
+        _ds = _np.asarray([c[3] for c in _cands], dtype=float)
+        if len(_ds) >= 3:
+            _dmed = float(_np.median(_ds))
+            _dmad = float(_np.median(_np.abs(_ds - _dmed)))
+            _eff_dist = max(max_dist, _dmed + 3.0 * 1.4826 * max(_dmad, 1e-6))
+        else:
+            _dmed, _dmad = (float(_np.median(_ds)) if len(_ds) else 0.0), 0.0
+            _eff_dist = max(max_dist, _dmed + 1.0)
+        report["orphan_eff_dist"] = round(_eff_dist, 4)
+        report["dist_median"] = round(_dmed, 4)
+        report["dist_mad"] = round(_dmad, 4)
+        report["max_instance_span"] = round(_max_span, 4)
+        orphans = []
+        for name, cat, b, d in _cands:
+            # ② 大物体硬保护: 家具天然远离中心, 不能当幽灵删
+            _own = max(float(b[1][0] - b[0][0]), float(b[1][1] - b[0][1]))
+            if _max_span > 1e-6 and _own > 0.30 * _max_span:
+                report.setdefault("kept_large", []).append(
+                    {"name": name, "own_span": round(_own, 4),
+                     "max_span": round(_max_span, 4)})
+                if verbose:
+                    print(f"      [orphan] {name}: 水平跨度 {_own:.2f}m > 全场最大 "
+                          f"{_max_span:.2f}m 的 30% → 是家具, 不按幽灵剔除",
+                          flush=True)
+                continue
+            if d <= _eff_dist:
                 continue
             orphans.append({"name": name, "category": cat,
-                            "min_z": round(min_z, 4),
+                            "min_z": round(float(b[0, 2]), 4),
                             "dist_to_center": round(d, 4),
-                            "max_dist": max_dist})
+                            "max_dist": _eff_dist})
             if verbose:
                 print(f"      [orphan] {name}: floor 关系、底面 z={min_z:+.4f}m 正常, "
                       f"但距场景中心 {d:.2f}m > {max_dist:.2f}m → 标记 orphan 剔除",
@@ -1629,6 +1670,45 @@ def fix_orphan_instances(all_instances, refined_relations, verbose=True,
                 elif _n in _new_instances:   # 类别级关系 (键是类别名)
                     _new_rel[_n] = _r
                 # 其余 (被剔除的实例名) 丢弃
+
+            # ── 支撑物引用重写 (P0-b) ──
+            # 上面只重映射了关系的**键** (实例名), 但没有改**值**里的支撑物引用。
+            # 删除同一类别的靠前元素会让后面的实例前移, 于是名字变了:
+            #   bed_0 被删 → 原 bed_1 重编号为 bed_0
+            #   但 pillow_0..3 / blanket_0 / hat_0 的关系里**仍写着 "bed_1"**
+            #   → 指向一个已不存在的实例 → audit 全部判 unsupported。
+            # 实测 002-namedrel: M4 ok 率从 1.0 掉到 0.14 (6 个 unsupported),
+            # 而 docstring 承诺的"引用被剔除实例的回退 floor"只在删除前处理了
+            # 直接指向被删者的情形, 覆盖不到"重编号"这一种。
+            _name_remap = {f"{_c}_{_oi}": _nn
+                           for (_c, _oi), _nn in _old2new.items()}
+            _existing = {f"{_c}_{i}" for _c, _lst in _new_instances.items()
+                         for i in range(len(_lst))}
+            for _n, _r in list(_new_rel.items()):
+                if not (isinstance(_r, str) and _r.startswith("supported by ")):
+                    continue
+                _sup = _r[len("supported by "):].strip()
+                if _sup.lower() in ("floor", "ground", "wall") or not _sup:
+                    continue
+                if _sup in _existing:
+                    continue                      # 引用仍有效, 不动
+                _new_sup = _name_remap.get(_sup)
+                if _new_sup and _new_sup in _existing:
+                    _new_rel[_n] = f"supported by {_new_sup}"
+                    report.setdefault("repointed", []).append(
+                        {"name": _n, "old": _r, "new": _new_rel[_n]})
+                    if verbose:
+                        print(f"      [orphan] {_n}: 支撑物重编号 {_sup} → "
+                              f"{_new_sup}", flush=True)
+                else:
+                    # 支撑物确实消失了 → 回退 floor, 不留悬空引用
+                    _new_rel[_n] = "supported by floor"
+                    report.setdefault("repointed", []).append(
+                        {"name": _n, "old": _r, "new": "supported by floor"})
+                    if verbose:
+                        print(f"      [orphan] {_n}: 支撑物 {_sup} 已不存在 → "
+                              f"关系回退 supported by floor", flush=True)
+
             all_instances = _new_instances
             refined_relations = _new_rel
             report["n_removed"] = len(orphans)
