@@ -650,6 +650,27 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
         )
         all_masks[category] = deduplicated_category_masks
 
+    # ── mask 质量过滤: 剔除贴画面边缘的退化细条 ──
+    # 为什么必须在跨类去重**之前**: 这类伪影 mask 会和真实物体的 mask 重复
+    # (同一个像素区域被标成两个类别), 如果先跨类合并, 它会先把好实例并掉,
+    # 之后再删就晚了。
+    # 实测 wx7/wxD: chair[0] 与 table[2] 是同一块 72x539 的竖条, 紧贴画面左边缘,
+    # 那是相机边缘的伪影而不是物体 —— 被打上 chair/table 两个标签, 合并后成为
+    # "一把椅子"的一部分, 用户看到椅子上多出一片 flap。
+    # 判据 (纯形状, 与类别无关): 长短边比 > 6 且贴画面边界 且短边 < 画面短边 20%。
+    # 阈值取 6 而非 4 的原因: 实测 2chair 的**真椅子** bbox 是 118x535 (比值 4.5),
+    # 用 4 会把它误删; 6 只命中 wx7 那条 72x539 (7.5) 的伪影。
+    try:
+        from src.object_segmentation import filter_degenerate_masks
+        _n_before = sum(len(v) for v in all_masks.values())
+        all_masks = filter_degenerate_masks(all_masks, verbose=True)
+        _n_after = sum(len(v) for v in all_masks.values())
+        if _n_after < _n_before:
+            print(f"   🧹 mask 质量过滤: {_n_before} → {_n_after} 个实例 "
+                  f"(剔除 {_n_before - _n_after} 个边缘伪影)", flush=True)
+    except Exception as _e:
+        print(f"   ⚠️ mask 质量过滤失败 (不影响主流程): {_e}", flush=True)
+
     # 跨类去重 — 先加载 CLIP 用于 appearance feature 比较
     print(f"   [Stage 2] 加载 CLIP 模型用于跨类合并...", flush=True)
     try:

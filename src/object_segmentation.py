@@ -1002,3 +1002,67 @@ def segment_and_track(category, video_predictor, session_id, box_provider=None,
                 final_results.append(instance_track)
 
     return final_results
+
+def filter_degenerate_masks(all_masks, verbose=True,
+                            max_aspect=6.0, max_thin_frac=0.20):
+    """剔除"贴画面边缘的退化细条" mask。
+
+    为什么需要: SAM3 会在画面边界处产出细长条的伪影 mask (实际是镜头边缘、
+    遮挡物边缘或背景条纹), 然后被打上某个物体的类别标签。它和真实物体的
+    mask 往往**完全重合**(同一像素区域被标成两个类别), 跨类去重会把它们合并,
+    于是真实物体上多出一片"翅膀"。
+
+    实测 wx7 / wxD:
+        chair[0] 与 table[2] 是同一块 72x539 的竖条 (2D IoU 0.995),
+        紧贴画面左边缘 (bbox x0=0), 长短边比 7.5。
+        合并进椅子后, 椅子多出一片 flap, 且 SAM3D 用它构建出丝状结构。
+
+    判据 (纯形状, 与类别名无关):
+        ① 长短边比 > max_aspect (默认 6)
+        ② bbox 至少一边贴画面边界
+        ③ 短边 < 画面短边的 max_thin_frac (默认 20%)
+    三条同时满足才剔除 —— 单独任一条都会误伤真实的高瘦物体
+    (实测 2chair 的真椅子 bbox 118x535, 比值 4.5, 不满足①, 不受影响)。
+
+    Args:
+        all_masks: {category: [instance, ...]}, instance = [{frame_id, mask}, ...]
+        verbose: 打印剔除明细
+        max_aspect: 长短边比阈值
+        max_thin_frac: 短边相对画面短边的上限
+    Returns:
+        过滤后的新 dict (不原地修改)
+    """
+    import numpy as _np
+
+    out = {}
+    dropped = []
+    for cat, instances in all_masks.items():
+        keep = []
+        for i, inst in enumerate(instances):
+            if not inst:
+                continue
+            # 用该实例面积最大的一帧做判定 (最能代表它的形状)
+            big = max(inst, key=lambda x: int(_np.asarray(x["mask"]).sum()))
+            mk = _np.asarray(big["mask"]).astype(bool)
+            if mk.ndim != 2 or not mk.any():
+                continue
+            H, W = mk.shape
+            ys, xs = _np.where(mk)
+            x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+            bw, bh = x1 - x0 + 1, y1 - y0 + 1
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            touch = (x0 == 0) or (y0 == 0) or (x1 == W - 1) or (y1 == H - 1)
+            thin = (min(bw, bh) / max(min(W, H), 1)) < max_thin_frac
+            if aspect > max_aspect and touch and thin:
+                dropped.append((f"{cat}[{i}]", f"{bw}x{bh}", round(aspect, 1),
+                                int(mk.sum())))
+                continue
+            keep.append(inst)
+        if keep:
+            out[cat] = keep
+
+    if verbose and dropped:
+        for name, box, asp, area in dropped:
+            print(f"      [mask过滤] {name}: bbox {box} 长宽比 {asp} 面积 {area} "
+                  f"→ 边缘伪影, 剔除", flush=True)
+    return out
