@@ -19,8 +19,8 @@ This approach:
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-from stage4.renderer import MeshRenderer
-from stage4.umeyama import umeyama_alignment, umeyama_alignment_ransac, decompose_similarity_transform
+from archive.stage4.renderer import MeshRenderer
+from archive.stage4.umeyama import umeyama_alignment, umeyama_alignment_ransac, decompose_similarity_transform
 
 
 def project_world_to_pixel(pts_world, extrinsic, intrinsic):

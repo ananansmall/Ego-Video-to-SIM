@@ -972,11 +972,11 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
     print("=" * 70, flush=True)
     _s4_start = time.time()
 
-    from stage4.run_alignment import (
+    from archive.stage4.run_alignment import (
         create_depth_based_masks,
         compute_optimal_frame_ids,
     )
-    from stage4.combined_alignment import refine_single_instance_combined
+    from archive.stage4.combined_alignment import refine_single_instance_combined
 
     # 使用VGGT原始世界点云和置信度 (论文方法，不再重新计算/禁用置信度)
     world_points = vggt_prediction_results['world_points']

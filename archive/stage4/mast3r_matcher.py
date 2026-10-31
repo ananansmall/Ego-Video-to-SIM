@@ -213,7 +213,7 @@ class MASt3RMatcher:
             vggt_pts: (M, 3) 3D points from VGGT (in world coordinates)
             conf: (M,) confidence scores
         """
-        from stage4.projection_alignment import unproject_depth_to_world
+        from archive.stage4.projection_alignment import unproject_depth_to_world
 
         mask_ren = depth_rendered > 0
         if mask_ren.sum() < 30:

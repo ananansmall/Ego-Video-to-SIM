@@ -33,15 +33,15 @@ Our implementation supports two modes:
 
 import numpy as np
 import trimesh
-from stage4.renderer import MeshRenderer
-from stage4.umeyama import decompose_similarity_transform, umeyama_alignment_ransac
-from stage4.projection_alignment import (
+from archive.stage4.renderer import MeshRenderer
+from archive.stage4.umeyama import decompose_similarity_transform, umeyama_alignment_ransac
+from archive.stage4.projection_alignment import (
     projection_based_alignment,
     compute_depth_iou,
     compute_depth_accuracy,
     unproject_depth_to_world,
 )
-from stage4.icp_optimization import icp_fine_tuning
+from archive.stage4.icp_optimization import icp_fine_tuning
 
 
 def _try_import_mast3r():
@@ -74,7 +74,7 @@ def _mast3r_phase_a(mesh, current_T, world_points, world_points_conf,
       4. Umeyama + RANSAC to estimate rigid transform
       5. IoU-gated acceptance
     """
-    from stage4.mast3r_matcher import MASt3RMatcher
+    from archive.stage4.mast3r_matcher import MASt3RMatcher
 
     num_frames = len(extrinsics)
     eval_frames = np.linspace(0, num_frames - 1, min(8, num_frames), dtype=int)

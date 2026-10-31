@@ -406,12 +406,10 @@ def run_stage4(scene_dir, vggt_data, all_instances, args, categories_and_relatio
         with open(s1_candidates[0], 'r') as f:
             categories_and_relations = json.load(f)
 
-    from stage4.run_alignment import (
-        reconstruct_world_points,
-        create_depth_based_masks,
-        compute_optimal_frame_ids,
+    # ⛔ Stage 4 已永久禁用, 不再 import 任何 stage4 模块 (已归档 archive/stage4)。
+    raise RuntimeError(
+        "Stage 4 (ICP 视觉-空间对齐) 已永久禁用, 不要调用。"
     )
-    from stage4.combined_alignment import refine_single_instance_combined
 
     vggt = {
         'depths': vggt_data['depths'],
@@ -626,7 +624,7 @@ def main(args):
     if do_stage4:
         vggt_data = load_vggt_results(scene_dir, files)
         if vggt_data.get('depths') and vggt_data.get('extrinsics') and vggt_data.get('intrinsic') is not None:
-            from stage4.run_alignment import reconstruct_world_points
+            from src.scene_io import reconstruct_world_points
             world_pts = reconstruct_world_points(vggt_data['depths'], vggt_data['extrinsics'], vggt_data['intrinsic'])
             vggt_data['world_points'] = world_pts
             vggt_data['world_points_conf'] = np.ones_like(vggt_data['depths'], dtype=np.float32)

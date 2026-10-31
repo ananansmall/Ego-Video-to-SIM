@@ -1427,16 +1427,14 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
     返回:
         对齐后的 all_instances
     """
-    print("\n" + "=" * 70, flush=True)
-    print("🚀 Stage 4: 迭代视觉-空间对齐", flush=True)
-    print("=" * 70, flush=True)
-    _s4_start = time.time()
-
-    from stage4.run_alignment import (
-        create_depth_based_masks,
-        compute_optimal_frame_ids,
+    # ⛔ Stage 4 已永久禁用 (不要使用)。main() 里已强制 args.enable_stage4=False,
+    # 本函数不应被调用; 这里直接抛错, 避免有人绕过开关后跑到一半才失败。
+    # 依赖也随之移除 —— 不再 import 任何 stage4 模块 (代码已归档到 archive/stage4)。
+    raise RuntimeError(
+        "Stage 4 (ICP 视觉-空间对齐) 已永久禁用, 不要调用。"
+        "原因见 mainv3.main() 里的禁用说明 (绝对米制 ICP 阈值对相对尺度的 "
+        "VGGT 输出无意义, 小物体迭代数学上无效)。"
     )
-    from stage4.combined_alignment import refine_single_instance_combined
 
     # 使用VGGT原始世界点云和置信度 (论文方法，不再重新计算/禁用置信度)
     world_points = vggt_prediction_results['world_points']

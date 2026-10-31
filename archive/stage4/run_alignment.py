@@ -105,7 +105,7 @@ def load_vggt_results(input_path):
 
 def reconstruct_world_points(depths, extrinsics, intrinsic):
     """Reconstruct world_points from depth maps + camera params (VGGT convention)."""
-    from stage4.projection_alignment import unproject_depth_to_world
+    from archive.stage4.projection_alignment import unproject_depth_to_world
 
     H, W = depths.shape[1], depths.shape[2]
     world_points = np.zeros((len(depths), H, W, 3), dtype=np.float32)
@@ -169,7 +169,7 @@ def load_scene_instances(input_path):
 
 def create_depth_based_masks(all_instances, depths, extrinsics, intrinsic, world_points):
     """Create per-instance masks by rendering + depth comparison."""
-    from stage4.renderer import MeshRenderer
+    from archive.stage4.renderer import MeshRenderer
     H, W = depths.shape[1], depths.shape[2]
     num_frames = len(depths)
     renderer = MeshRenderer(intrinsic, W, H)
@@ -359,7 +359,7 @@ Examples:
         print("  Mode: MASt3R (paper method, requires GPU)")
     else:
         print("  Mode: Depth-based matching (no MASt3R)")
-    from stage4.combined_alignment import refine_single_instance_combined
+    from archive.stage4.combined_alignment import refine_single_instance_combined
 
     # 计算总实例数
     total_instances = 0

@@ -111,13 +111,13 @@ def main():
     args = ap.parse_args()
 
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-    from stage4.run_alignment import load_vggt_results, load_scene_instances
-    from stage4.renderer import MeshRenderer
-    from stage4.projection_alignment import compute_depth_iou
+    from src.scene_io import load_vggt_results, load_scene_instances
+    from archive.stage4.renderer import MeshRenderer
+    from archive.stage4.projection_alignment import compute_depth_iou
 
     D = args.scene
     # 兼容旧命名: 早期产物是 final_scene.glb / final_scene_stage5.glb,
-    # 而 stage4.load_scene_instances 只认 final_scene_basic.glb。
+    # 而 archive.stage4.load_scene_instances 只认 final_scene_basic.glb。
     # 缺就顺链到一个存在的同名产物, 不改动原始文件。
     _basic = os.path.join(D, "final_scene_basic.glb")
     if not os.path.isfile(_basic):

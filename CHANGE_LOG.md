@@ -4,6 +4,31 @@
 
 ---
 
+## [2026-10-30 18:10] - Stage 4 视觉-空间对齐归档
+
+### Changed
+- `stage4/` → `archive/stage4/`（`git mv`，保留历史）：`combined_alignment` / `icp_optimization` /
+  `mast3r_matcher` / `projection_alignment` / `umeyama` / `run_alignment` / `renderer` 及其两份设计文档
+- 全仓导入改为 `archive.stage4.*`：`mainv3.py`、`mainv2.py`、`tools/eval_pipeline.py`、
+  `tools/run_post_pipeline.py`、`tools/fix_orientation_by_iou.py`、`scripts/test_stage4_alignment.py`
+  以及 `archive/stage4/` 内部 5 个模块，全仓已无裸 `stage4.` 导入
+- `archive/__init__.py` 新增（使归档目录仍可作为包导入）
+- `README.md` 中 ICP 阈值说明的路径同步为 `archive/stage4/icp_optimization.py`
+
+### 说明
+- mainv3 早在 10-30 的 `args.enable_stage4 = False` 中已永久禁用 Stage4，本次只是把代码目录归档，
+  不改任何管线行为；`run_stage4()` 保留为死代码（不再被调用）
+- **保留可用**：`archive/stage4/renderer.py`（MeshRenderer）与 `run_alignment.load_vggt_results`
+  仍是 `tools/eval_pipeline.py` / `fix_orientation_by_iou.py` 的渲染与加载依赖
+- 验证：6 个改动文件 `py_compile` 通过；冒烟脚本用 `archive.stage4` 载入 VGGT 结果并渲染
+  `output_v3/wxD-fast/final_scene_stage5.glb` 成功（mask 1229 px）
+
+### ⚠️ Docs to Review
+- `docs/design/STAGE5_SUMMARY.md` 仍以 `stage4/` 指代"起点用途"的输出，如需精确应改为 `archive/stage4/`
+- `docs/pipeline/mainv2_technical_doc.md` 大量描述 `--enable_stage4` 行为，现该参数在 mainv3 已被忽略
+
+---
+
 ## [2026-10-25 23:59] - v0.4 快照: 重力可见化 + 位置对齐默认开启 + 感知/摆放链路 20+ 处修复
 
 ### 管线行为变更 (默认路径)

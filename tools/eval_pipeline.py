@@ -268,6 +268,39 @@ def _attribution(iou_raw, iou_trans, iou_ts):
     }
 
 
+def _load_cam(D):
+    """从产物目录直接读相机参数, 不依赖任何外部模块。
+
+    产物里已有: intrinsic.txt (3x3) / extrinsics/<frame>.txt (4x4) /
+    color/<frame>.jpg。帧数取 extrinsics 与 color 的较小者。
+    返回 (K, exts [N,4,4], H, W); 缺文件时返回 None。
+    """
+    import cv2
+    ki = os.path.join(D, "intrinsic.txt")
+    edir = os.path.join(D, "extrinsics")
+    cdir = os.path.join(D, "color")
+    if not (os.path.isfile(ki) and os.path.isdir(edir) and os.path.isdir(cdir)):
+        return None
+    try:
+        K = np.loadtxt(ki, dtype=float)
+        efs = sorted([f for f in os.listdir(edir) if f.endswith(".txt")],
+                     key=lambda x: int(os.path.splitext(x)[0]))
+        cfs = sorted([f for f in os.listdir(cdir) if f.endswith((".jpg", ".png"))],
+                     key=lambda x: int(os.path.splitext(x)[0]))
+        n = min(len(efs), len(cfs))
+        if n == 0:
+            return None
+        exts = np.stack([np.loadtxt(os.path.join(edir, f), dtype=float)
+                         for f in efs[:n]])
+        im = cv2.imread(os.path.join(cdir, cfs[0]))
+        if im is None:
+            return None
+        H, W = im.shape[:2]
+        return K, exts, H, W
+    except Exception:
+        return None
+
+
 def _silhouette_iou(D, inst, pre_am, opt_frames, wp=None):
     """类别级：该类所有 mesh 在最优帧渲染并集 vs 真实 mask 并集。
 
@@ -284,15 +317,13 @@ def _silhouette_iou(D, inst, pre_am, opt_frames, wp=None):
     if not pre_am:
         return None, None
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-    from stage4.run_alignment import load_vggt_results
-    from stage4.renderer import MeshRenderer
+    # 相机参数直接读产物文件, 不再依赖旧的 stage4 模块 (Stage 4 已永久废弃)。
+    from tools.silhouette_renderer import MeshRenderer
 
-    v = load_vggt_results(D)
-    if v is None:
+    _cam = _load_cam(D)
+    if _cam is None:
         return None, None
-    K = np.asarray(v["intrinsic"], float)
-    exts = np.asarray(v["extrinsics"], float)
-    H, W = np.asarray(v["depths"])[0].shape
+    K, exts, H, W = _cam
     ren = MeshRenderer(K, W, H)
 
     res = {}

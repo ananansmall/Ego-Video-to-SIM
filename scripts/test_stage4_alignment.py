@@ -209,8 +209,8 @@ def prepare_test_data(replica_dir, scene_name, output_dir, max_frames,
     # ── 计算初始对齐质量 ──
     print(f"\n=== 初始对齐质量 ===")
     os.environ['PYOPENGL_PLATFORM'] = 'egl'
-    from stage4.renderer import MeshRenderer
-    from stage4.projection_alignment import compute_depth_accuracy, compute_depth_iou
+    from archive.stage4.renderer import MeshRenderer
+    from archive.stage4.projection_alignment import compute_depth_accuracy, compute_depth_iou
 
     renderer = MeshRenderer(intrinsic, depth_m.shape[1], depth_m.shape[0])
 

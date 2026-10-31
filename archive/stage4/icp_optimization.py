@@ -17,9 +17,9 @@ Algorithm (per iteration):
 import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
-from stage4.renderer import MeshRenderer
-from stage4.umeyama import umeyama_alignment_ransac, decompose_similarity_transform
-from stage4.projection_alignment import compute_depth_iou, compute_depth_accuracy
+from archive.stage4.renderer import MeshRenderer
+from archive.stage4.umeyama import umeyama_alignment_ransac, decompose_similarity_transform
+from archive.stage4.projection_alignment import compute_depth_iou, compute_depth_accuracy
 
 
 def icp_fine_tuning(mesh, current_T, world_points, world_points_conf, depths,
