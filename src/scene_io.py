@@ -115,13 +115,55 @@ def load_vggt_results(input_path):
 
 def reconstruct_world_points(depths, extrinsics, intrinsic):
     """Reconstruct world_points from depth maps + camera params (VGGT convention)."""
-    from archive.stage4.projection_alignment import unproject_depth_to_world
 
     H, W = depths.shape[1], depths.shape[2]
     world_points = np.zeros((len(depths), H, W, 3), dtype=np.float32)
 
     for i, (d, ext) in enumerate(zip(depths, extrinsics)):
         world_points[i] = unproject_depth_to_world(d, ext, intrinsic)
+
+    return world_points
+
+
+def unproject_depth_to_world(depth_map, extrinsic, intrinsic):
+    """
+    2D->3D: Unproject depth map to world coordinates (vectorized).
+
+    Uses the SAME convention as VGGT's depth_to_world_coords_points:
+      x_cam = (u - cx) * depth / fx
+      y_cam = (v - cy) * depth / fy
+      z_cam = depth
+      cam_to_world = inv(extrinsic)
+      world = cam_to_world @ cam
+
+    No FLIP matrix needed - consistent with VGGT internal geometry.py.
+
+    Args:
+        depth_map: (H, W) depth in meters
+        extrinsic: (4, 4) VGGT camera extrinsic
+        intrinsic: (3, 3) camera intrinsic
+
+    Returns:
+        world_points: (H, W, 3) world coordinates
+    """
+    H, W = depth_map.shape
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+    u_grid, v_grid = np.meshgrid(np.arange(W), np.arange(H))
+
+    valid = depth_map > 1e-6
+
+    x_cam = np.where(valid, (u_grid - cx) * depth_map / fx, 0)
+    y_cam = np.where(valid, (v_grid - cy) * depth_map / fy, 0)
+    z_cam = np.where(valid, depth_map, 0)
+
+    pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(depth_map)], axis=-1)
+
+    c2w = np.linalg.inv(extrinsic)
+
+    pts_world = (c2w @ pts_cam.reshape(-1, 4).T).T[:, :3]
+    world_points = pts_world.reshape(H, W, 3)
 
     return world_points
 

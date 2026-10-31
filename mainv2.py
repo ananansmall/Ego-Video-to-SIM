@@ -972,11 +972,8 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
     print("=" * 70, flush=True)
     _s4_start = time.time()
 
-    from archive.stage4.run_alignment import (
-        create_depth_based_masks,
-        compute_optimal_frame_ids,
-    )
-    from archive.stage4.combined_alignment import refine_single_instance_combined
+    # ⛔ Stage 4 已永久禁用 (mainv2 为历史版本, 仅作兼容保留)
+    raise RuntimeError("Stage 4 (ICP 视觉-空间对齐) 已永久禁用, 不要调用。")
 
     # 使用VGGT原始世界点云和置信度 (论文方法，不再重新计算/禁用置信度)
     world_points = vggt_prediction_results['world_points']

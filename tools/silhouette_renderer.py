@@ -200,3 +200,34 @@ def compute_mean_mask_iou(rendered_masks, real_masks):
     for ren_m, real_m in zip(rendered_masks, real_masks):
         ious.append(compute_mask_iou(ren_m, real_m))
     return np.mean(ious) if ious else 0.0
+
+
+def compute_depth_iou(mesh, T, depths, extrinsics, renderer, sample_frames, tol=0.15):
+    """Compute depth-consistent Mask IoU across views.
+
+    For each view, the "VGGT mask" is defined as pixels where VGGT depth
+    is within `tol` of the rendered depth (not just depth > 0, which would
+    cover the entire image and make IoU degenerate to coverage rate).
+
+    IoU = (mask_ren ∩ mask_close) / (mask_ren ∪ mask_close)
+    where mask_close = |depth_ren - depth_vggt| / depth_vggt < tol
+    """
+    ious = []
+    for f in sample_frames:
+        _, depth_ren, mask_ren = renderer.render_mesh(mesh, T, extrinsics[f])
+        depth_real = depths[f]
+        overlap = mask_ren & (depth_real > 1e-6)
+        if overlap.sum() == 0:
+            ious.append(0.0)
+            continue
+        rel_diff = np.abs(depth_ren[overlap] - depth_real[overlap]) / np.maximum(depth_real[overlap], 1e-6)
+        close_pixels = np.zeros_like(mask_ren)
+        close_pixels[overlap] = rel_diff < tol
+        intersection = (mask_ren & close_pixels).sum()
+        union = (mask_ren | close_pixels).sum()
+        if union == 0:
+            ious.append(0.0)
+        else:
+            ious.append(float(intersection) / float(union))
+    return np.mean(ious) if ious else 0.0
+

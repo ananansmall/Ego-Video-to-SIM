@@ -112,8 +112,7 @@ def main():
 
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     from src.scene_io import load_vggt_results, load_scene_instances
-    from archive.stage4.renderer import MeshRenderer
-    from archive.stage4.projection_alignment import compute_depth_iou
+    from tools.silhouette_renderer import MeshRenderer, compute_depth_iou
 
     D = args.scene
     # 兼容旧命名: 早期产物是 final_scene.glb / final_scene_stage5.glb,
