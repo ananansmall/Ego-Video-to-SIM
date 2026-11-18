@@ -2,6 +2,12 @@
 
 从第一人称操作视频到机器人仿真的项目集合。将 HaWoR 手部重建与 RAS 场景重建融合，实现人手操作到 R1 机器人仿真的完整映射。
 
+## Real2SimGripper 源码下载
+
+[直接下载 Real2SimGripper 50ee6bf 源码 ZIP](https://raw.githubusercontent.com/ananansmall/Ego-Video-to-SIM/main/downloads/Real2SimGripper-50ee6bf.zip) · [浏览主仓里的源码目录](vendor/Real2SimGripper/)
+
+ZIP 解压后直接得到 Real2SimGripper 目录，可从其他电脑匿名下载。公开版包含 R1 跟踪、仿真、示例脚本和文本配置。数据、模型权重和运行产物需要另行准备。文件范围、路径替换和来源见[导出清单](vendor/Real2SimGripper/SOURCE_EXPORT.json)。
+
 ## 快速开始
 
 ```bash

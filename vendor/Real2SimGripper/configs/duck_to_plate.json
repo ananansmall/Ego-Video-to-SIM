@@ -1,0 +1,229 @@
+{
+  "_comment": "任务配置文件 —— 换任务只改这个文件, 不用改代码。所有输入路径/物体/轨迹窗口/放置目标/机器人标定/仿真参数都集中在这里。",
+  "task_id": "duck_to_plate_001",
+  "description": "把粉色小鸭从桌面抓起, 搬运, 放到蓝色圆盘上 (来自 7.mp4 第一视角视频)",
+  "scene": {
+    "glb": "/path/to/workspace/traj_data_min/ras/7_vggt_omega/final_scene.glb",
+    "table_z": 0.74,
+    "table_size": [
+      1.2,
+      0.7
+    ],
+    "table_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "background_wall": [
+      3.0,
+      0.6,
+      1.5
+    ]
+  },
+  "object": {
+    "_comment": "被抓/被放的主体。geom = final_scene.glb 里的几何名",
+    "geom": "geometry_4",
+    "name": "pink_duck",
+    "mass_kg": 0.04,
+    "friction": 1.0,
+    "linear_damping": 0.5,
+    "angular_damping": 5.0,
+    "spawn_xy": [
+      0.0,
+      -0.18
+    ],
+    "_spawn_comment": "spawn_xy = 物体在 RoboTwin 桌面系的落定 xy (z 由 table_z + 半高 自动算)"
+  },
+  "target": {
+    "_comment": "放置目标。null = 纯跟随人手, 不做放置修正",
+    "geom": "geometry_8",
+    "name": "blue_plate",
+    "collision": true,
+    "reach_frac": 0.0,
+    "_reach_comment": "落点从盘心(0)朝机器人方向挪到盘内(1); 盘心常超出左臂可达范围"
+  },
+  "hand_traj": {
+    "mano_npz": "/path/to/workspace/traj_data_min/hawor/7a/reconstruction/mano_ras_reconstruction_0_113.npz",
+    "arm": "left",
+    "window": [
+      18,
+      108
+    ],
+    "_window_comment": "有效轨迹帧范围(含端点), 对应 mano 的 valid_left",
+    "contacts": [
+      {
+        "_comment": "接触段: [close_f, open_f]。多个即多次抓放(如 pick→place→pick→place)",
+        "close_f": 48,
+        "open_f": 92
+      }
+    ],
+    "grasp_orient": "data",
+    "_grasp_orient_comment": "data = 接近轴取 腕→接触指尖, 开合轴取 拇指-食指; vertical = 旧版强制垂直+窄边",
+    "grasp_tilt_max": 90.0,
+    "grasp_fin": "data",
+    "grasp_carry_blend": 0
+  },
+  "camera": {
+    "extrinsics_dir": "/path/to/workspace/traj_data_min/ras/7_vggt_omega/extrinsics",
+    "intrinsic": "/path/to/workspace/traj_data_min/ras/7_vggt_omega/intrinsic.txt",
+    "ego_video": "/path/to/workspace/7.mp4",
+    "fpv_forward_offset": 0.25,
+    "_fpv_comment": "FPV 相机沿视线前移量: 真实相机在人脸前方, 不前移会被 R1 头部挡住"
+  },
+  "robot": {
+    "name": "r1",
+    "urdf": "/tmp/GalaxeaManipSim/galaxea_sim/assets/r1/robot.urdf",
+    "base_xy": [
+      0.3,
+      -0.38
+    ],
+    "base_xy_search_range": [
+      -0.35,
+      0.45,
+      -0.72,
+      -0.36
+    ],
+    "_base_comment": "base_xy 由 agent 搜出; 约束: 桌子 x∈[-0.6,0.6], 桌腿 y=±0.30±0.025 → 须 |y|>0.325",
+    "working_arm": "left",
+    "non_working_arm_park": [
+      -1.0,
+      0.6,
+      -0.4,
+      -0.5,
+      0.0,
+      0.0
+    ],
+    "gripper": {
+      "pad_fwd": 0.0369,
+      "_pad_comment": "gripper_link → pad 中心, 沿局部 +x; 换夹爪必须重标",
+      "open_q": 0.05,
+      "hold_q": 0.0302,
+      "_q_comment": "手指为 prismatic, 限位 [0, 0.05]; 内距 = 0.017 + 2.22*q (仅 R1 成立)",
+      "stiffness": 1000.0,
+      "damping": 200.0
+    },
+    "base_mode": "fixed",
+    "_base_mode_comment": "fixed = 基座整段不动(pick-place)；follow = 底盘跟随手部(大范围移动)。follow 时 pipeline.run() 调度到 large_range_track 的 WBC 求解器, 不再走 build_episode。"
+  },
+  "sim": {
+    "dt": 0.004,
+    "control_hz": 10,
+    "collision": {
+      "mode": "coacd",
+      "_mode_comment": "none = 单凸壳(原默认); coacd = 凸分解(多凸包, 接触更真)",
+      "max_depenetration_velocity": 1.0,
+      "_depenetr_comment": "SAPIEN 默认 1e32(无限); COACD 凸包外扩 ~2mm 会把物体弹飞 29 米, 必须限制",
+      "_threshold_comment": "不设 threshold —— 实测(2026-10-19) SAPIEN 的 do_coacd 用 preprocess_resolution=30(coacd 库默认 50), 粗粒度预处理下 threshold 对本网格不是约束: 传 0.05/0.10/0.20 清缓存后全都得到 8 个凸包。故该参数是无效魔法数字, 去掉。",
+      "_precision_knobs": "真正影响碰撞精度的是 preprocess_resolution / mcts_nodes / mcts_iterations (SAPIEN 默认 30/20/150); 需要更细时可显式传 decomposition_params"
+    },
+    "props_collision": false,
+    "_props_comment": "false = 7 个摆设道具纯视觉无碰撞(简化); true = 全部带碰撞(更真, 但可能被重建误差卡住)",
+    "lighting": {
+      "ambient": 0.9,
+      "directional_dir": [
+        0.3,
+        0.4,
+        -1.0
+      ],
+      "directional_intensity": 0.4,
+      "shadow": true
+    },
+    "material": {
+      "metallic": 0.0,
+      "roughness": 0.85
+    }
+  },
+  "ik": {
+    "pos_weight": 3000.0,
+    "app_weight": 2.0,
+    "fin_weight": 1.0,
+    "reg_weight": 0.05,
+    "max_iters": 1500,
+    "grad_step": 0.0001,
+    "descend_step": 0.4,
+    "diverge_cost": 1.0,
+    "_diverge_comment": "cost 超过该值视为解到限位角, 保持上一帧解",
+    "max_qvel": 0.12,
+    "max_qacc": 0.04,
+    "max_qjerk": 0.015
+  },
+  "render": {
+    "width": 480,
+    "height": 360,
+    "gif_duration_ms": 80,
+    "mp4_fps": 12,
+    "cameras": {
+      "front": {
+        "eye": [
+          1.05,
+          -1.02,
+          1.19
+        ],
+        "target": [
+          0.0,
+          -0.3,
+          0.95
+        ],
+        "fovy": 45
+      },
+      "side": {
+        "eye": [
+          -1.05,
+          -0.34,
+          1.16
+        ],
+        "target": [
+          0.0,
+          -0.3,
+          0.95
+        ],
+        "fovy": 45
+      },
+      "chest": {
+        "eye": [
+          0.0,
+          -0.34,
+          1.42
+        ],
+        "target": [
+          0.0,
+          -0.05,
+          0.8
+        ],
+        "fovy": 60
+      }
+    }
+  },
+  "verifier": {
+    "knock_thr": 0.04,
+    "lift_thr": 0.05,
+    "slip_thr": 0.07,
+    "land_thr": 0.06,
+    "follow_thr": 0.1
+  },
+  "demonstration_ground_truth": {
+    "_comment": "创新点1: 从真实视频提取的人类示范真值(归一化 鸭-盘 相对位置末段均值)。提取方法见 docs/05 §2。",
+    "source": "7.mp4 颜色分割(品红=鸭, 青蓝=盘) + 最大连通域 + 盘尺寸归一化",
+    "normalised_offset": [
+      -0.06,
+      0.06
+    ],
+    "robustness": "F108-112 严格阈值 [-0.042,+0.042] std 0.005; 多组阈值 x∈[-0.11,-0.04] y∈[+0.02,+0.11]"
+  },
+  "tuning": {
+    "ik_seeds": 16,
+    "_ik_seeds_comment": "IK 种子数: fast=4 (agent 搜索默认), balanced=8, accurate=16 (验收默认); 三档精度须按实测比较",
+    "_comment": "调参项(会被 agent 搜索覆盖)。这些值来自 2026-10-18 的 agent 搜索 + base_x/y 扫描, 是当前实测最优。",
+    "time_scale": 3.0,
+    "_ts_comment": "慢放重定时: 参考轨迹重采样到更密帧, 逐控制步增量更小, PD 更易跟上。实测 ts 1→3 使搬运子段误差 25.8→13.7mm",
+    "place_hover": 0.07,
+    "_ph_comment": "放置对中悬停高度(盘面之上)。实测 0.10→0.07 使 follow_max 101.4→81.1mm(悬停越低, 下探行程越短)",
+    "d_hover": 0.13,
+    "_dh_comment": "抓取侧对中插入的悬停高度(鸭顶之上)",
+    "ctrl_win": 5,
+    "ctrl_passes": 2,
+    "joint_win": 7,
+    "joint_passes": 1,
+    "_smooth_comment": "平滑窗口/遍数"
+  }
+}

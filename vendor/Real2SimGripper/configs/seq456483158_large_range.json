@@ -1,0 +1,82 @@
+{
+  "_comment": "大范围移动任务（视频 456483158，右手）。base_mode=follow —— 底盘跟随手部，走 large_range_track 的 WBC 求解器（底盘 dx/dy/yaw 与臂关节联合求解），不走 build_episode。",
+  "task_id": "seq456483158_large_range",
+  "description": "从 720x1280 竖屏第一视角视频 456483158.mp4 (300帧) 提取右手轨迹，R1 大范围跟随仿真",
+  "robot": {
+    "name": "r1",
+    "urdf": "/tmp/GalaxeaManipSim/galaxea_sim/assets/r1/robot.urdf",
+    "base_mode": "follow",
+    "_mode_comment": "follow: 底盘跟随手部水平投影（track_base），需要 WBC 全身求解",
+    "working_arm": "right"
+  },
+  "sim": {
+    "collision": {
+      "mode": "coacd",
+      "max_depenetration_velocity": 1.0
+    },
+    "props_collision": false,
+    "lighting": {
+      "ambient": 0.9,
+      "directional_dir": [
+        0.3,
+        0.4,
+        -1.0
+      ],
+      "directional_intensity": 0.4,
+      "shadow": true
+    },
+    "material": {
+      "metallic": 0.0,
+      "roughness": 0.85
+    }
+  },
+  "large_range": {
+    "_comment": "传给 cb_large_range_sim.main() 的选项。WBC 参数全部留空 -> auto_wbc_params 稳健基准（w_base=3.0 w_bcont=5.0 base_range=1.0），所有轨迹共用，不针对本条调参。",
+    "stride": 1,
+    "ik_only": false,
+    "base_smooth": null,
+    "wbc": true,
+    "w_base": null,
+    "w_bcont": null,
+    "base_range": null,
+    "w_ori": null,
+    "use_yaw": true,
+    "smooth": false,
+    "_traj_comment": "轨迹 npz，由 hawor_to_traj.py 从 HaWoR 产出转换。需含 pos/rot/grip/valid(/R_c2w/t_c2w)。",
+    "traj_npz": "/path/to/Real2SimGripper/results/large_range/seq456483158/hand_traj.npz",
+    "name": "seq456483158",
+    "_source_comment": "轨迹来源记录（HaWoR 产出目录）",
+    "hawor_dir": "/path/to/workspace/456483158",
+    "hand": "right",
+    "_hawor_note": "注意：world_space_res.pth 全是 NaN/0（HaWoR 该项失败），可用轨迹在 tracks_0_300/model_joints.npy 的 hand[1]（hand[0] 全零）+ SLAM/*.npz。hawor_to_traj.py --hand right 即正确路径。"
+  },
+  "_verified": {
+    "_comment": "2026-10-23 实测（auto WBC 参数，零调参）",
+    "n_frames": 300,
+    "base_travel_m": 0.9694,
+    "base_step_max_mm": 17.7,
+    "ik_pos_err_mm": {
+      "mean": 0.93,
+      "p95": 3.49,
+      "max": 4.53
+    },
+    "ik_ori_err_deg": {
+      "mean": 0.01,
+      "max": 0.06
+    },
+    "phys_vs_ik_pos_mm": {
+      "mean": 3.1,
+      "p95": 7.6,
+      "max": 14.3
+    },
+    "phys_vs_ik_ori_deg": {
+      "mean": 0.78,
+      "max": 8.39
+    },
+    "limit_viol_frames": 0,
+    "tight_frames_lt5deg": 0,
+    "jump_frames": 0,
+    "phys_secs": 13.3,
+    "_known_issue": "F100-130 有一次 IK 分支切换，位置误差瞬时到 14mm、姿态到 8.4deg，之后恢复"
+  }
+}

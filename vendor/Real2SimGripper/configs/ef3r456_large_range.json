@@ -1,0 +1,79 @@
+{
+  "_comment": "大范围移动任务（456483158 视频右手，**EgoFound3R 数据链**）。与 seq456483158（HaWoR 链）同一段视频, 轨迹来自 EgoFound3R 世界系米制手部重建（场景相对运动, 由 _scratch/ef3r_to_targets.py 转换）。w_ori=1.0: 2026-10-25 权重实验结论 —— EF3R 链在默认 w_ori=10 下 IK mean 12.4mm 且 j5/j6 贴限 (115/300 帧 <5°), 调到 1.0 后 IK mean 5.67mm / <5°帧 30, 代价姿态 0.12°→7.72° (远在平行夹爪抓取容差内)。权衡曲线见 docs/10_控制算法与跟随误差.md。",
+  "task_id": "ef3r456_large_range",
+  "description": "456483158 视频 EgoFound3R 链 → R1 大范围跟随仿真 (部署导向: w_ori=1.0)",
+  "robot": {
+    "name": "r1",
+    "urdf": "/tmp/GalaxeaManipSim/galaxea_sim/assets/r1/robot.urdf",
+    "base_mode": "follow",
+    "_mode_comment": "follow: 底盘跟随手部水平投影（track_base_se2），需要 WBC 全身求解",
+    "working_arm": "right"
+  },
+  "sim": {
+    "collision": {
+      "mode": "coacd",
+      "max_depenetration_velocity": 1.0
+    },
+    "props_collision": false,
+    "lighting": {
+      "ambient": 0.9,
+      "directional_dir": [
+        0.3,
+        0.4,
+        -1.0
+      ],
+      "directional_intensity": 0.4,
+      "shadow": true
+    },
+    "material": {
+      "metallic": 0.0,
+      "roughness": 0.85
+    }
+  },
+  "large_range": {
+    "_comment": "w_ori=1.0 是本链的部署导向选择 (位置精度+关节裕度优先); 其余 WBC 参数留空走 auto。",
+    "stride": 1,
+    "ik_only": false,
+    "base_smooth": null,
+    "wbc": true,
+    "w_base": null,
+    "base_range": null,
+    "w_ori": 1.0,
+    "grip_mode": "data",
+    "_grip_comment": "data=逐帧跟人手张合(连续,最忠实); states=状态机离散(闭合@LIFT起/张开@RELEASED起, 稳定抗噪)。两模式 IK 完全相同, 对比图 results/large_range/ef3r456_grip_modes.png",
+    "use_yaw": true,
+    "smooth": false,
+    "_traj_comment": "EgoFound3R 产物转换的轨迹 npz (ef3r_to_targets.py 产出, pos/rot/grip/valid/R_c2w/t_c2w)",
+    "traj_npz": "/path/to/project_data/mano_ws/EgoFound3R/outputs/pickplace_456483158/ef3r_right_targets.npz",
+    "name": "ef3r456",
+    "_source_comment": "轨迹来源: mano_ws/EgoFound3R/outputs/pickplace_456483158 (arXiv 2610.01210)",
+    "hand": "right"
+  },
+  "_verified": {
+    "_comment": "2026-10-25 实测 (w_ori=1.0, pipeline 全链含渲染)",
+    "n_frames": 300,
+    "ik_pos_err_mm": {
+      "mean": 5.67,
+      "p95": 8.21,
+      "max": 9.41
+    },
+    "ik_ori_err_deg": {
+      "mean": 7.72,
+      "max": 14.24
+    },
+    "phys_pos_err_mm": {
+      "mean": 8.4,
+      "max": 49.5
+    },
+    "tight_frames_lt5deg": 30,
+    "limit_viol_frames": 0,
+    "_baseline_wori10": "IK mean 12.39 / <5°帧 115 / ori 0.12° —— 权衡见 docs/10",
+    "grasp_place": {
+      "object": "黑色耳机 (EF3R 点云实例分割→凸包→PCA 薄轴补厚 24mm, 黑色材质+法线)",
+      "lift_mm": 250,
+      "placed_off_mm": 175,
+      "mode": "抓取跟随 (kinematic follow): LIFT→PLACE 物体刚体跟随 pad 系, RELEASED 落支撑台",
+      "physics_grasp": "WIP: 物理接触抓取受 PD 臂滞后(1:1 回放 110mm)与指爪几何标定限制, 待轨迹重定时"
+    }
+  }
+}

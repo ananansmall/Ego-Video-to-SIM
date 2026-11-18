@@ -55,3 +55,8 @@
 
 - 将 Real2SimGripper 子模块更新到 `50ee6bf`。
 - 总仓 README 新增 [Chairbottle 验收报告](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/REPORT.md) 和对应视频。
+
+## [2026-11-19] 公开 Real2SimGripper 源码下载
+
+- 在 vendor/Real2SimGripper 提供 50ee6bf 的源码快照。在 downloads 提供相同内容的 ZIP，主仓 README 提供下载链接。
+- 校验 ZIP、普通源码目录、Python 语法和 JSON 配置，公开快照排除数据、二进制运行产物和内部记录。

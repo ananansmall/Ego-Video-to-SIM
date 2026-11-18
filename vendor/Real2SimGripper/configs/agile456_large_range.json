@@ -1,0 +1,56 @@
+{
+  "_comment": "大范围移动任务（456483158 视频右手，**AGILE 物理链**）。数据流: EgoFound3R (手+物体点云/交互物体判断/世界系相机轨迹) → AGILE (WiLoR 手部→MoGe 深度→SAM3D 物体网格→FoundationPose 位姿→逐帧手-物接触物理优化) → agile_to_targets.py (SVD 重定向, 与 EF3R 链同一算子) → 本配置跟随抓取。与 ef3r456 (EF3R 直连) 同视频同状态分段, 差异仅在『手部轨迹来源=AGILE 物理优化』与『物体几何=SAM3D mesh (更完整)』。",
+  "task_id": "agile456_large_range",
+  "description": "456483158 视频 AGILE 物理优化链 → R1 大范围跟随仿真 (重定向+跟随抓取)",
+  "robot": {
+    "name": "r1",
+    "urdf": "/tmp/GalaxeaManipSim/galaxea_sim/assets/r1/robot.urdf",
+    "base_mode": "follow",
+    "_mode_comment": "follow: 底盘跟随手部水平投影（track_base_se2），需要 WBC 全身求解",
+    "working_arm": "right"
+  },
+  "sim": {
+    "collision": {
+      "mode": "coacd",
+      "max_depenetration_velocity": 1.0
+    },
+    "props_collision": false,
+    "lighting": {
+      "ambient": 0.9,
+      "directional_dir": [
+        0.3,
+        0.4,
+        -1.0
+      ],
+      "directional_intensity": 0.4,
+      "shadow": true
+    },
+    "material": {
+      "metallic": 0.0,
+      "roughness": 0.85
+    }
+  },
+  "large_range": {
+    "_comment": "WBC 参数与 ef3r456 对齐 (w_ori=1.0 部署导向), 其余走 auto。",
+    "stride": 1,
+    "ik_only": false,
+    "base_smooth": null,
+    "wbc": true,
+    "w_base": null,
+    "base_range": null,
+    "w_ori": 1.0,
+    "grip_mode": "data",
+    "_grip_comment": "data=逐帧跟 AGILE 重定向张合 (物理优化的手-物接触直接体现); states=状态机离散备用 (与 EF3R 链共用 state_labels)",
+    "use_yaw": true,
+    "smooth": false,
+    "_traj_comment": "AGILE 物理优化 MANO 轨迹 → agile_to_targets.py 产出的 targets npz (300 帧上采样, pos/rot/grip/valid/R_c2w/t_c2w/grip_states)",
+    "traj_npz": "/path/to/project_data/mano_ws/AGILE/output/456483158/agile_right_targets_286.npz",
+    "_object_comment": "AGILE SAM3D 物体 mesh + FoundationPose 轨迹 → agile_object.py 产出 (契约同 ef3r_object, 台面/支撑面复用 EF3R 场景拟合)",
+    "object_npz": "/path/to/project_data/mano_ws/EgoFound3R/outputs/pickplace_456483158/object_instance_agile.npz",
+    "_scene_comment": "场景点云仍用 EF3R VGGT 深度云 (两条链同一场景)",
+    "scene_cloud": "/path/to/project_data/mano_ws/EgoFound3R/outputs/pickplace_456483158/pointcloud/scene_cloud.npz",
+    "name": "agile456",
+    "_source_comment": "轨迹来源: mano_ws/AGILE/output/456483158 (aim-uofa/AGILE, 视频驱动手-物交互物理优化)",
+    "hand": "right"
+  }
+}

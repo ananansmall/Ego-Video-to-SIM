@@ -1,0 +1,55 @@
+{
+  "_comment": "大范围移动任务（chairbottle，右手）。与粉鸭任务共享配置 schema，但 base_mode=follow —— 底盘跟随手部，走 large_range_track 的 WBC 求解器（底盘 dx/dy/yaw 与臂关节联合求解），不再走 build_episode。",
+  "task_id": "chairbottle_large_range",
+  "description": "chairbottle 右手大范围移动 → 完整 R1 物理仿真渲染（底盘跟随）",
+  "robot": {
+    "name": "r1",
+    "urdf": "/tmp/GalaxeaManipSim/galaxea_sim/assets/r1/robot.urdf",
+    "base_mode": "follow",
+    "_mode_comment": "follow: 底盘跟随手部水平投影（track_base），需要 WBC 全身求解",
+    "working_arm": "right"
+  },
+  "sim": {
+    "collision": {
+      "mode": "coacd",
+      "max_depenetration_velocity": 1.0
+    },
+    "props_collision": false,
+    "lighting": {
+      "ambient": 0.9,
+      "directional_dir": [
+        0.3,
+        0.4,
+        -1.0
+      ],
+      "directional_intensity": 0.4,
+      "shadow": true
+    },
+    "material": {
+      "metallic": 0.0,
+      "roughness": 0.85
+    }
+  },
+  "large_range": {
+    "_comment": "传给 cb_large_range_sim.main() 的选项；底盘偏置由 comfort_frame() 自动求。WBC 参数留空走 auto 稳健基准（与 seq456 一致, 不针对本条调参）。2026-10-24 实测: 旧显式覆盖 (w_base=20, base_range=0.15) 是 yaw 参考错误时代的束缚; 逐帧手掌朝向参考 + SE(2) 跟随修复后, auto (base_range=1.0) 让底盘自由补位 —— stride2 对比: mean 23.4→6.6mm, 裕度<5°帧 262→42/296。",
+    "stride": 1,
+    "ik_only": false,
+    "base_smooth": null,
+    "wbc": true,
+    "w_base": null,
+    "base_range": null,
+    "w_ori": null,
+    "use_yaw": true,
+    "smooth": false
+  },
+  "render": {
+    "width": 480,
+    "height": 360,
+    "gif_duration_ms": 80
+  },
+  "_data": {
+    "cb_targets": "/path/to/workspace/_scratch/chairbottle/cb_right_targets.npz",
+    "cb_hawor": "/path/to/project_data/mano_ws/output/mano/chairbottle/hawor/reconstruction/hawor_results_0_592.npz",
+    "_note": "路径在 cb_large_range_sim.py 里以常量定义；此处仅记录, 便于日后迁进 JSON"
+  }
+}
