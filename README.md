@@ -4,9 +4,11 @@
 
 ## Real2SimGripper 源码下载
 
-[直接下载 Real2SimGripper 50ee6bf 源码 ZIP](https://raw.githubusercontent.com/ananansmall/Ego-Video-to-SIM/main/downloads/Real2SimGripper-50ee6bf.zip) · [浏览主仓里的源码目录](vendor/Real2SimGripper/)
+[下载最新版源码 ZIP](https://raw.githubusercontent.com/ananansmall/Ego-Video-to-SIM/main/downloads/Real2SimGripper-latest.zip) · [浏览源码](vendor/Real2SimGripper/) · [五样本报告](vendor/Real2SimGripper/examples/r1_multicontact/runs/five-case-review/REPORT.md)
 
-ZIP 解压后直接得到 Real2SimGripper 目录，可从其他电脑匿名下载。公开版包含 R1 跟踪、仿真、示例脚本和文本配置。数据、模型权重和运行产物需要另行准备。文件范围、路径替换和来源见[导出清单](vendor/Real2SimGripper/SOURCE_EXPORT.json)。
+当前公开版包含视频入口、连续物理回放、轨迹误差报告和五样本验收。ZIP 解压后直接得到 Real2SimGripper 目录。运行仿真所需的环境、模型和输入包见[使用说明](vendor/Real2SimGripper/README.md)，文件来源与替换见[快照清单](vendor/Real2SimGripper/SOURCE_EXPORT.json)。
+
+[历史版本 50ee6bf ZIP](https://raw.githubusercontent.com/ananansmall/Ego-Video-to-SIM/main/downloads/Real2SimGripper-50ee6bf.zip)
 
 ## 快速开始
 

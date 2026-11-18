@@ -60,3 +60,8 @@
 
 - 在 vendor/Real2SimGripper 提供 50ee6bf 的源码快照。在 downloads 提供相同内容的 ZIP，主仓 README 提供下载链接。
 - 校验 ZIP、普通源码目录、Python 语法和 JSON 配置，公开快照排除数据、二进制运行产物和内部记录。
+
+## [2026-11-19] 更新 Real2SimGripper 公共源码快照
+
+- 基于 4119071 及工作区改动，更新 vendor/Real2SimGripper 与独立下载 ZIP，包含原片入口、公共回放、轨迹报告、五样本文字证据。
+- Python、Shell 与文本配置通过静态检查，两项接触窗测试及 R1、Stage 0、轨迹报告入口的帮助命令通过。

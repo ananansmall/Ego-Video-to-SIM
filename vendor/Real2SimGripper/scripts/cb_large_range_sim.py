@@ -47,7 +47,7 @@ BASE_SMOOTH_WIN = 9               # 底盘水平轨迹平滑窗口 (0=不平滑)
 # EGO_PITCH_DROP = 0.22             # 近距第一视角视线下俯量
 
 
-def _build_scene():
+def _build_scene(planar_base=False):
     """完整 R1 + 地面 + 远墙 (无静止桌子: 大范围移动任务)。"""
     engine = sapien.Engine()
     scene = rg.setup_scene(engine)
@@ -58,6 +58,29 @@ def _build_scene():
     with TemporaryDirectory(prefix="r1-lr-") as tmp:
         tmp_urdf = os.path.join(tmp, "r1_abs.urdf")
         rg.make_r1_urdf_abs(bp.R1_URDF, tmp_urdf)
+        if planar_base:
+            # Put commanded x/y/yaw inside the articulation so PhysX sees the
+            # base velocity in gripper contacts while keeping roll/z constrained.
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(tmp_urdf)
+            urdf = tree.getroot()
+            children = {joint.find('child').get('link') for joint in urdf.findall('joint')}
+            root_link, = [link.get('name') for link in urdf.findall('link') if link.get('name') not in children]
+            links = ['planar_world', 'planar_x', 'planar_y', root_link]
+            for name in links[:-1]:
+                inertial = ET.SubElement(ET.SubElement(urdf, 'link', name=name), 'inertial')
+                ET.SubElement(inertial, 'mass', value='0.1')
+                ET.SubElement(inertial, 'inertia', ixx='0.001', iyy='0.001', izz='0.001',
+                              ixy='0', ixz='0', iyz='0')
+            for i, (label, axis, kind) in enumerate((('x', '1 0 0', 'prismatic'),
+                                                   ('y', '0 1 0', 'prismatic'),
+                                                   ('yaw', '0 0 1', 'revolute'))):
+                joint = ET.SubElement(urdf, 'joint', name='planar_joint_'+label, type=kind)
+                ET.SubElement(joint, 'parent', link=links[i])
+                ET.SubElement(joint, 'child', link=links[i+1])
+                ET.SubElement(joint, 'axis', xyz=axis)
+                ET.SubElement(joint, 'limit', lower='-20', upper='20', effort='5000', velocity='4')
+            tree.write(tmp_urdf)
         loader = scene.create_urdf_loader()
         loader.fix_root_link = True
         robot = loader.load(tmp_urdf)
@@ -181,7 +204,8 @@ def main(stride=1, ik_only=False, base_smooth=None, wbc=True, torso_wbc=False,
          stiff_scale=1.0, n_local=2, n_rand=1, max_nfev=150,
          targets=CB_TARGETS, name="chairbottle", torso_pitch_deg=None,
          joint_reserve_deg=0.0, base_lead_s=0.0, torso_pitch_guard_deg=0.0,
-         handoff_freeze_frames=0, handoff_at_release=False, ring_place=False):
+         handoff_freeze_frames=0, handoff_at_release=False, ring_place=False,
+         cloud_follow_only=False):
     if not np.isfinite([joint_reserve_deg, base_lead_s]).all() or min(joint_reserve_deg, base_lead_s) < 0:
         raise ValueError("joint reserve and base lead time must be finite and nonnegative")
     if torso_pitch_deg is not None:
@@ -800,6 +824,7 @@ def main(stride=1, ik_only=False, base_smooth=None, wbc=True, torso_wbc=False,
     # 桌) 为准, 场景云沿 sim z (重力) 平移 _dh_scene; 台面网格同 Shift。
     _dh_scene = 0.0
     registered_scene = False
+    cloud_visual = None
     if scene_cloud and os.path.exists(scene_cloud):
         sc = np.load(scene_cloud)
         P_sc, C_sc = sc["points"], sc["colors"]
@@ -888,7 +913,11 @@ def main(stride=1, ik_only=False, base_smooth=None, wbc=True, torso_wbc=False,
             bb.add_box_visual(sapien.Pose(p=list(p_)),
                               half_size=[_vox/2]*3,
                               material=(float(c_[0]), float(c_[1]), float(c_[2])))
-        bb.build(name="ef3r_scene_cloud")
+        cloud_actor = bb.build(name="ef3r_scene_cloud")
+        if cloud_follow_only:
+            import sapien.render as render
+            cloud_visual = next((c for c in cloud_actor.get_components()
+                                 if isinstance(c, render.RenderBodyComponent)), None)
         print(f"  场景点云视觉: {len(Pv)} 体素 ({_vox*1000:.0f}mm, geo 对齐+鬼影滤除)")
     # ---- 被抓物体 (EgoFound3R 点云拟合的凸包实例, 可选) ----
     # geo 对齐三步: ①M 轴变换 (EF3R y-up → sim z-up, 与 ef3r_to_targets 同一变换)
@@ -1364,10 +1393,16 @@ def main(stride=1, ik_only=False, base_smooth=None, wbc=True, torso_wbc=False,
 
     def render4(k):
         update_cams(k)
+        if cloud_visual is not None:
+            cloud_visual.visibility = 0.0
         scene.update_render()
-        for c in cams:
+        imgs = []
+        for i, c in enumerate(cams):
+            if i == 3 and cloud_visual is not None:
+                cloud_visual.visibility = 1.0
+                scene.update_render()
             c.take_picture()
-        imgs = [(np.clip(c.get_picture("Color")[:, :, :3], 0, 1) * 255).astype(np.uint8) for c in cams]
+            imgs.append((np.clip(c.get_picture("Color")[:, :, :3], 0, 1) * 255).astype(np.uint8))
         return np.concatenate([np.concatenate(imgs[:2], axis=1),
                                np.concatenate(imgs[2:4], axis=1)], axis=0)
 
@@ -1924,6 +1959,7 @@ def main(stride=1, ik_only=False, base_smooth=None, wbc=True, torso_wbc=False,
     np.savez(os.path.join(LR_RESULTS_DIR, f"{name}_exec_trace.npz"),
              base=_exec_base, q=_exec_q, qdim=_qdim, obj=_exec_obj,
              grip=_exec_grip, cmd_base=_cmd_base, phys_err=phys_err,
+             pad_target=pad_p, pad_actual=phys_p, gripper_rotation_target=rot,
              q_target=np.asarray(arm[:N]), grip_target=np.asarray(grip_exec[:N, 0]),
              frame=np.arange(N), fps=_fps_src, contact_impulses_Ns=_contact_impulses,
              contact_names=np.array(["finger1", "finger2", "support", "ground"]),

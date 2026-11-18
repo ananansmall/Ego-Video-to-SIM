@@ -450,6 +450,12 @@ def ring_approach(pad, hold_start, place_start, release, center, top, radius, ha
     return plan
 
 
+def progressive_motion_residual(value, knee, radial=False):
+    """Quadratic at small excursions, increasingly costly near the motion envelope."""
+    magnitude = np.linalg.norm(value) if radial else value
+    return value * np.hypot(1., magnitude/knee)
+
+
 def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
                     se2_pose, fk_pad, w_pos=10.0, w_ori=10.0,
                     w_base=4.0, w_yaw=3.0, base_range=0.35, yaw_max=0.5,
@@ -458,7 +464,10 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
                     w_limit=0.0, limit_margin_deg=12.0, w_posture=0.0,
                     obstacles=None, w_obs=0.0, obs_margin=0.06,
                     escape_thr=100.0, escape_n=24, max_nfev=150,
-                    diff_step=1e-4, seed=0, ref_yaw=None, q_neutral=None, torso_pitch=None):
+                    diff_step=1e-4, seed=0, ref_yaw=None, q_neutral=None, torso_pitch=None,
+                    initial_state=None, initial_seed=None, optimize_continuity=False,
+                    secondary_tgt=None, yaw_step_max=None, acceleration_weight=0.,
+                    hand_task_scales=None, progressive_body_motion=False):
     """全身 IK: 每帧把 [底盘 x, y, yaw + 臂 6 关节] 放进**同一个**有界最小二乘。
 
     动机 (解耦方案的根因): 之前底盘按启发式跟随、臂关节逐帧解耦, 当手转动范围大时
@@ -475,11 +484,65 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
         变成"把底盘拉向 ref_yaw[k]" —— 绕圈任务据此让机器人始终正面朝向作业点,
         避免手腕被拧 90° 顶死限位 (实测 chairbottle 152/296 帧裕度 <5° 的根因)。
     返回 (base(N,3)=[dx,dy,yaw绝对角], arm(N,6), pos_err(N,)mm, ori_err(N,)deg)。
+
+    initial_seed 只为首帧提供优化初值，首帧使用完整可行域和指定的 n_rand。
+    initial_state 表示真实的上一帧状态，首帧也受相邻帧步长约束。
+    optimize_continuity 将底盘和关节的实际帧间位移纳入目标，不只用连续性选初值。
+    secondary_tgt accepts aligned opposite-hand goals or None per missing row.
+    sel/lim include both arms, with the torso (if constrained) after the first arm.
+    Returned pose errors are the worse of the active hands per row.
+    progressive_body_motion penalizes large deviations from route velocity,
+    base acceleration and cumulative torso motion more steeply.
     """
     from scipy.optimize import least_squares
     N = len(pad_p)
     nj = len(lim)                          # 关节 DOF (臂 6; 躯干扩展后 10)
     nX = 3 + nj                            # 决策变量 [dx,dy,yaw] + nj 关节
+    if secondary_tgt is not None and len(secondary_tgt) != N:
+        raise ValueError("secondary_tgt must align with the primary pose rows")
+    if secondary_tgt is not None:
+        optimize_continuity = True
+    if yaw_step_max is not None and (not np.isfinite(yaw_step_max) or yaw_step_max <= 0.):
+        raise ValueError("yaw_step_max must be finite and positive, in degrees per row")
+    if not np.isfinite(acceleration_weight) or acceleration_weight < 0.:
+        raise ValueError("acceleration_weight must be finite and nonnegative")
+    if hand_task_scales is None:
+        hand_task_scales = np.ones((N, 2))
+    hand_task_scales = np.asarray(hand_task_scales, float)
+    if (hand_task_scales.shape != (N, 2) or not np.isfinite(hand_task_scales).all()
+            or np.any(hand_task_scales <= 0.)):
+        raise ValueError("hand_task_scales must have two positive finite values per pose row")
+    other_side = "left" if side == "right" else "right"
+    last_motion = None
+    torso = slice(9, 12)  # first three torso joints after planar variables and primary arm
+    if progressive_body_motion:
+        if not optimize_continuity or torso_pitch is None or yaw_step_max is None:
+            raise ValueError("progressive body motion needs continuity, yaw rate and torso limits")
+        translation_knee = base_step_max/2
+        yaw_knee = np.radians(yaw_step_max)/2
+        torso_step_knee = np.radians(joint_step_max)/5
+        torso_angle_knee = np.asarray(torso_pitch)/2
+
+        def base_residual(delta):
+            return np.r_[progressive_motion_residual(delta[:2], translation_knee, radial=True),
+                         progressive_motion_residual(delta[2], yaw_knee)]
+
+    def targets_at(k):
+        yield side, tgt[k]
+        if secondary_tgt is not None and secondary_tgt[k] is not None:
+            yield other_side, secondary_tgt[k]
+
+    def base_reference_delta(k):
+        if not k:
+            return np.zeros(3)
+        return np.array([ref_dx[k]-ref_dx[k-1], ref_dy[k]-ref_dy[k-1], _ry[k]-_ry[k-1]])
+
+    if initial_seed is not None:
+        if initial_state is not None:
+            raise ValueError("Use initial_seed for a new pose or initial_state for a trajectory continuation")
+        initial_seed = np.asarray(initial_seed, dtype=float)
+        if initial_seed.shape != (nX,) or not np.isfinite(initial_seed).all():
+            raise ValueError(f"initial_seed must contain {nX} finite values")
     rng = np.random.default_rng(seed)
     base = np.zeros((N, 3)); arm = np.zeros((N, nj))
     pos_err = np.zeros(N); ori_err = np.zeros(N)
@@ -501,15 +564,15 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
         # 拉向 ref_yaw[k] (绕圈任务让机器人始终正面朝向作业点)。
         yaw = (x[2] + _ry[k]) if use_yaw else 0.0
         robot.set_root_pose(se2_pose(ref_dx[k] + x[0], ref_dy[k] + x[1], yaw))
-        p, R = fk_pad(robot, side, sel, x[3:3+nj])
-        p0, R0 = tgt[k]
-        pe = float(np.linalg.norm(p - p0)) * 1000.0
-        c = (np.trace(R0.T @ R) - 1.0) / 2.0
-        oe = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
-        op = 0.0
-        if obstacles is not None and len(obstacles):
-            _dd = np.linalg.norm(p[:, None] - obstacles[:, :3].T, axis=0) * 1000.0
-            op = float((np.maximum(0.0, (obstacles[:, 3] * 1000 + obs_margin) - _dd) ** 2).sum())
+        pe, oe, op = 0., 0., 0.
+        for hand, (p0, R0) in targets_at(k):
+            p, R = fk_pad(robot, hand, sel, x[3:3+nj])
+            pe = max(pe, float(np.linalg.norm(p - p0)) * 1000.)
+            cosine = (np.trace(R0.T @ R) - 1.) / 2.
+            oe = max(oe, float(np.degrees(np.arccos(np.clip(cosine, -1., 1.)))))
+            if obstacles is not None and len(obstacles):
+                distances = np.linalg.norm(p[:, None] - obstacles[:, :3].T, axis=0) * 1000.
+                op += float((np.maximum(0., obstacles[:, 3]*1000 + obs_margin - distances)**2).sum())
         return pe, oe, op
 
     def frame_bounds(k, prev):
@@ -535,12 +598,38 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
             # 关键: x[0],x[1] 是「相对启发式跟随参考 ref 的偏移」, 不是底盘绝对位置。
             # 只约束偏移步长时, ref 自身每帧跳 54mm 会直接传到总位置 (实测底盘 80mm/帧
             # 超出 50 设定)。故把 ref 的帧间增量补偿进来, 约束的是**总位置**步长。
-            _dref = (ref_dx[k] - ref_dx[k - 1]) if a == 0 else (ref_dy[k] - ref_dy[k - 1])
+            ref = ref_dx if a == 0 else ref_dy
+            _dref = ref[k] - ref[k - 1] if k else 0.0
             blo[a] = max(lo[a], prev[a] - _bs - _dref)
             bhi[a] = min(hi[a], prev[a] + _bs - _dref)
+        if use_yaw and yaw_step_max is not None:
+            center = prev[2] - base_reference_delta(k)[2]
+            yaw_step = np.radians(yaw_step_max)
+            blo[2] = max(lo[2], center - yaw_step)
+            bhi[2] = min(hi[2], center + yaw_step)
+        if optimize_continuity:
+            # A reference envelope can outrun the platform. Preserve the
+            # actual step window while catching up to the reference.
+            widths = [_bs, _bs]
+            if use_yaw and yaw_step_max is not None:
+                widths.append(np.radians(yaw_step_max))
+            centers = prev[:3] - base_reference_delta(k)
+            for j, half in enumerate(widths):
+                if blo[j] >= bhi[j]:
+                    stop = np.clip(0., centers[j]-half+1e-6, centers[j]+half-1e-6)
+                    blo[j], bhi[j] = stop-1e-6, stop+1e-6
         qlo = np.radians(joint_step_max)
         blo[3:3+nj] = np.maximum(lim[:, 0], prev[3:3+nj] - qlo)
         bhi[3:3+nj] = np.minimum(lim[:, 1], prev[3:3+nj] + qlo)
+        # Robustness: a fast reference combined with a lagged previous state can
+        # cross the bounds (station-envelope routes move the window each frame).
+        # Keep a minimal interval around prev instead of crashing the fit; the
+        # frame then solves with degraded tracking rather than aborting the run.
+        crossed = blo > bhi
+        if crossed.any():
+            val = np.clip(prev[crossed], lo[crossed], hi[crossed])
+            blo[crossed] = val - 1e-5
+            bhi[crossed] = val + 1e-5
         return blo, bhi
 
     # 关节限位裕度: 贴近限位时给软惩罚, 避免"贴死限位后只能靠翻分支脱困"。
@@ -552,13 +641,16 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
         return np.concatenate([below, above])
 
     def fit(resid, seed_x, blo, bhi, nfev):
+        if optimize_continuity and not use_yaw:
+            blo, bhi = blo.copy(), bhi.copy()
+            blo[2], bhi[2] = -1e-8, 1e-8
         if torso_pitch is None:
-            return least_squares(resid, np.clip(seed_x, blo + 1e-4, bhi - 1e-4),
+            inset = 0. if optimize_continuity else 1e-4
+            return least_squares(resid, np.clip(seed_x, blo + inset, bhi - inset),
                                  bounds=(blo, bhi), method="trf", xtol=1e-8, ftol=1e-8,
                                  max_nfev=nfev, diff_step=diff_step).x
 
         # WBC vector is [base x/y/yaw, arm 1..6, torso 1..4].
-        torso = slice(9, 12)
         qlo, qhi = blo[torso], bhi[torso]
         seed_x = seed_x.copy()
         seed_x[torso] = torso_pitch_coordinates(seed_x[torso], qlo, qhi, torso_pitch, encode=True)
@@ -596,19 +688,49 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
                 yaw = (x[2] + _ry[k]) if use_yaw else 0.0
                 robot.set_root_pose(se2_pose(ref_dx[k] + x[0], ref_dy[k] + x[1], yaw))
                 p, R = fk_pad(robot, side, sel, x[3:3+nj])
-                parts = [w_pos * (p - p0), w_ori * (R - R0).reshape(-1),
+                primary_scale, secondary_scale = hand_task_scales[k]
+                parts = [primary_scale*w_pos*(p-p0), primary_scale*w_ori*(R-R0).reshape(-1),
                          w_base * np.array([x[0], x[1]]),
                          w_limit * limit_barrier(x[3:3+nj]),
                          w_posture * (x[3:3+nj] - q_pref)]
                 parts.append(np.array([w_yaw * x[2]]) if use_yaw else np.zeros(1))
+                if optimize_continuity and prev is not None:
+                    motion = x - prev
+                    motion[:3] += base_reference_delta(k)
+                    parts.extend([w_bcont*motion[:3], w_cont*motion[3:]])
+                    if progressive_body_motion:
+                        # Keep planned travel available. Penalize corrections to
+                        # the route, and measure torso excursions at the links.
+                        correction = x[:3]-prev[:3]
+                        parts.extend([w_bcont*base_residual(correction),
+                                      w_cont*progressive_motion_residual(
+                                          torso_link_pitch(motion[torso]), torso_step_knee),
+                                      w_posture*progressive_motion_residual(
+                                          torso_link_pitch(x[torso]), torso_angle_knee)])
+                    if acceleration_weight and last_motion is not None:
+                        change = motion - last_motion
+                        if progressive_body_motion:
+                            parts.extend([acceleration_weight*w_bcont*base_residual(change[:3]),
+                                          acceleration_weight*w_cont*progressive_motion_residual(
+                                              torso_link_pitch(change[torso]), torso_step_knee/2)])
+                        else:
+                            parts.append(acceleration_weight*w_bcont*change[:3])
+                        parts.append(acceleration_weight*w_cont*change[3:])
+                if secondary_tgt is not None and secondary_tgt[k] is not None:
+                    p2, R2 = fk_pad(robot, other_side, sel, x[3:3+nj])
+                    target_p, target_R = secondary_tgt[k]
+                    parts.extend([secondary_scale*w_pos*(p2-target_p), secondary_scale*w_ori*(R2-target_R).reshape(-1)])
                 if obstacles is not None and len(obstacles):
                     # 碰撞感知: pad + 肘 (link3) 双点主动避让 (进入优化目标,
                     # 否则规划穿障, 物理臂撞上被顶 —— pad 远离障碍但肘扫过
                     # 的实测 127mm 残差来源)
                     _pts = [p]
-                    _el = robot.find_link_by_name(f"{side}_arm_link3")
-                    if _el is not None:
-                        _pts.append(np.asarray(_el.get_pose().p, float))
+                    if secondary_tgt is not None and secondary_tgt[k] is not None:
+                        _pts.append(p2)
+                    for hand, _ in targets_at(k):
+                        elbow = robot.find_link_by_name(f"{hand}_arm_link3")
+                        if elbow is not None:
+                            _pts.append(np.asarray(elbow.get_pose().p, float))
                     for _pt in _pts:
                         _dd = np.linalg.norm(_pt[:, None] - obstacles[:, :3].T,
                                              axis=0) * 1000.0
@@ -618,9 +740,9 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
 
             x = fit(resid, s0, blo, bhi, nfev)
             pe, oe, op = eval_x(x, k)
-            s = (pe + w_ori * oe + w_obs * op if torso_pitch is None
+            s = (pe + w_ori * oe + w_obs * op if torso_pitch is None and not optimize_continuity
                  else 1000.0 * np.linalg.norm(resid(x)) / w_pos)
-            if prev is not None:
+            if prev is not None and not optimize_continuity:
                 # 臂连续性: 封顶以允许必要时换冗余分支 (不封顶时一次 180° 翻转
                 # 罚 540, 会压过 260mm+ 跟踪误差 -> 贴限位, 实测 307mm 误差)。
                 cont_arm = w_cont * float(np.degrees(np.abs(x[3:3+nj] - prev[3:3+nj])).max())
@@ -641,7 +763,12 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
                 return best, best_pair                         # 已足够好, 跳过全局随机
         # 首帧无热启动: 必须给足随机种子与迭代 (只给 1 个起点时实测落到贴限位
         # 坏分支, 误差 1043mm 并连锁触发第二帧 144° 翻转)。仅此一帧, 代价可忽略。
-        if prev is None:
+        if prev is None and k == 0 and initial_seed is not None:
+            pe, oe = _try(initial_seed, max_nfev)
+            if pe < 1.0 and oe < 1.0:
+                return best, best_pair
+            n_r, nfev = n_rand, max_nfev
+        elif prev is None:
             if torso_pitch is not None:
                 _try(np.r_[0.0, 0.0, 0.0, q_pref], max_nfev)
             n_r, nfev = max(8, n_rand), max(400, max_nfev)
@@ -676,7 +803,7 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
                 best_pe, best = pe, x
         return best, best_pe
 
-    x0, (pos_err[0], ori_err[0]) = solve_best(0, None)
+    x0, (pos_err[0], ori_err[0]) = solve_best(0, initial_state)
     base[0] = [ref_dx[0] + x0[0], ref_dy[0] + x0[1],
                (x0[2] + _ry[0]) if use_yaw else 0.0]
     arm[0] = x0[3:3+nj]
@@ -688,7 +815,7 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
         xk, (pe_k, oe_k) = solve_best(k, prev)
         # The legacy escape objective drops posture/obstacle terms. The constrained
         # solve already tries local and random starts when tracking is poor.
-        if torso_pitch is None and pe_k > escape_thr:
+        if torso_pitch is None and not optimize_continuity and pe_k > escape_thr:
             xe, pe_e = solve_escape(k, prev)
             if pe_e < pe_k * 0.5:      # 明显改善才采纳, 避免误伤
                 xk, pe_k = xe, pe_e
@@ -698,6 +825,7 @@ def solve_wbc_track(robot, side, sel, lim, ref_dx, ref_dy, tgt, pad_p,
         base[k] = [ref_dx[k] + xk[0], ref_dy[k] + xk[1],
                    (xk[2] + _ry[k]) if use_yaw else 0.0]
         arm[k] = xk[3:3+nj]
+        last_motion = np.r_[base[k]-base[k-1], arm[k]-arm[k-1]]
         prev_xw = xk[2] if use_yaw else 0.0
     if n_escape:
         print(f"    [WBC] 卡死逃逸触发 {n_escape} 帧 (位置误差 > {escape_thr:.0f}mm)")
