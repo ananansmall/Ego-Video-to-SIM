@@ -51,3 +51,7 @@
 - 文件完整性: ✓ 所有新增文件已复制到目标仓库
 - 目录结构: ✓ tri_model_physics/ 完整 (不含 output/__pycache__)
 - 代码一致性: ✓ hand_track/ 与 dex-retargeting 版本一致
+## [2026-11-18] 更新 Real2SimGripper 验收入口
+
+- 将 Real2SimGripper 子模块更新到 `50ee6bf`。
+- 总仓 README 新增 [Chairbottle 验收报告](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/REPORT.md) 和对应视频。

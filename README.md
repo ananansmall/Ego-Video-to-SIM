@@ -24,6 +24,15 @@ python 00_run_pipeline.py --hawor-dir <path> --ras-dir <path>
 | [combination/](combination/) | 完整仿真管线：场景对齐 → SAPIEN 渲染 → 物理仿真 → 视频对齐 |
 | [pv_retargeting/](pv_retargeting/) | PV 重定向：R1 机器人手部跟踪与单臂跟随 |
 
+## R1 Chairbottle 验收
+
+本次报告和媒体随 [Real2SimGripper 子模块](https://github.com/ananansmall/Real2SimGripper/tree/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827) 发布。使用有子仓访问权限的 GitHub 账号打开文件。
+
+- [Chairbottle 统一验收报告](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/REPORT.md)
+- [整段黑红四视图](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/moving_views_joint_seat/moving_views.mp4)
+- [独立机器人第一视角](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/moving_views_joint_seat/r1_body_fpv.mp4)
+- [独立右腕](https://github.com/ananansmall/Real2SimGripper/blob/50ee6bfe2983bb3bdafe34eb5b1ef599a92f3827/examples/r1_multicontact/runs/pixel-umi-ear-20261118/moving_views_joint_seat/r1_wrist_fpv.mp4)
+
 ## 依赖
 
 ### 本地依赖 (libs/)
